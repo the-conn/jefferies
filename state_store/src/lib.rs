@@ -95,14 +95,11 @@ impl RedisStateStore {
     } else {
       url.to_string()
     };
-    let cfg = deadpool_redis::Config {
-      url: Some(full_url),
-      pool: Some(deadpool_redis::PoolConfig {
-        max_size: pool_size,
-        ..Default::default()
-      }),
+    let mut cfg = deadpool_redis::Config::from_url(full_url);
+    cfg.pool = Some(deadpool_redis::PoolConfig {
+      max_size: pool_size,
       ..Default::default()
-    };
+    });
     let pool = cfg
       .create_pool(Some(deadpool_redis::Runtime::Tokio1))
       .map_err(|e| StateStoreError::Store(e.to_string()))?;
