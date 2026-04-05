@@ -11,5 +11,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-redis = { workspace = true }
 deadpool-redis = { workspace = true }

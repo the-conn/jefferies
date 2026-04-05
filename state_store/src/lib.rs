@@ -32,7 +32,7 @@ pub struct LeaseData {
 #[derive(Debug, Error)]
 pub enum StateStoreError {
   #[error("Redis error: {0}")]
-  Redis(#[from] redis::RedisError),
+  Redis(#[from] deadpool_redis::redis::RedisError),
   #[error("Pool error: {0}")]
   Pool(#[from] deadpool_redis::PoolError),
   #[error("Serialization error: {0}")]
@@ -111,7 +111,7 @@ impl RedisStateStore {
 
   pub async fn ping(&self) -> Result<(), StateStoreError> {
     let mut conn = self.pool.get().await?;
-    let _: String = redis::cmd("PING").query_async(&mut conn).await?;
+    let _: String = deadpool_redis::redis::cmd("PING").query_async(&mut conn).await?;
     Ok(())
   }
 }
@@ -128,7 +128,7 @@ impl StateStore for RedisStateStore {
     let key = state_key(run_id);
     let value = serde_json::to_string(state)?;
 
-    let script = redis::Script::new(
+    let script = deadpool_redis::redis::Script::new(
       r#"
             local current = redis.call('GET', KEYS[1])
             if current == false then
@@ -162,7 +162,7 @@ impl StateStore for RedisStateStore {
   async fn load_run(&self, run_id: &str) -> Result<Option<RunState>, StateStoreError> {
     let mut conn = self.pool.get().await?;
     let key = state_key(run_id);
-    let value: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
+    let value: Option<String> = deadpool_redis::redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
     match value {
       Some(json) => Ok(Some(serde_json::from_str(&json)?)),
       None => Ok(None),
@@ -172,7 +172,7 @@ impl StateStore for RedisStateStore {
   async fn delete_run(&self, run_id: &str) -> Result<(), StateStoreError> {
     let mut conn = self.pool.get().await?;
     let key = state_key(run_id);
-    let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
+    let _: i64 = deadpool_redis::redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
     Ok(())
   }
 
@@ -185,7 +185,7 @@ impl StateStore for RedisStateStore {
     let mut conn = self.pool.get().await?;
     let key = lease_key(run_id);
 
-    let script = redis::Script::new(
+    let script = deadpool_redis::redis::Script::new(
       r#"
             local existing = redis.call('GET', KEYS[1])
             if existing ~= false then
@@ -219,7 +219,7 @@ impl StateStore for RedisStateStore {
     let mut conn = self.pool.get().await?;
     let key = lease_key(run_id);
 
-    let script = redis::Script::new(
+    let script = deadpool_redis::redis::Script::new(
       r#"
             local current = redis.call('GET', KEYS[1])
             if current == false then
@@ -248,7 +248,7 @@ impl StateStore for RedisStateStore {
   async fn release_lease(&self, run_id: &str) -> Result<(), StateStoreError> {
     let mut conn = self.pool.get().await?;
     let key = lease_key(run_id);
-    let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
+    let _: i64 = deadpool_redis::redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
     Ok(())
   }
 
@@ -256,7 +256,7 @@ impl StateStore for RedisStateStore {
     let mut conn = self.pool.get().await?;
     let pattern = "jefferies:run:*:state";
 
-    let keys: Vec<String> = redis::cmd("KEYS")
+    let keys: Vec<String> = deadpool_redis::redis::cmd("KEYS")
       .arg(pattern)
       .query_async(&mut conn)
       .await?;
@@ -269,7 +269,7 @@ impl StateStore for RedisStateStore {
       }
       let run_id = parts[2];
 
-      let value: Option<String> = redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+      let value: Option<String> = deadpool_redis::redis::cmd("GET").arg(key).query_async(&mut conn).await?;
       let Some(json) = value else { continue };
 
       let Ok(state): Result<RunState, _> = serde_json::from_str(&json) else {
@@ -282,7 +282,7 @@ impl StateStore for RedisStateStore {
       }
 
       let lease_k = lease_key(run_id);
-      let lease_exists: bool = redis::cmd("EXISTS")
+      let lease_exists: bool = deadpool_redis::redis::cmd("EXISTS")
         .arg(&lease_k)
         .query_async(&mut conn)
         .await
