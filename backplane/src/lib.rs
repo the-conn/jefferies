@@ -15,7 +15,7 @@ pub enum BackplaneEvent {
 #[derive(Debug, Error)]
 pub enum BackplaneError {
   #[error("AMQP error: {0}")]
-  Amqp(#[from] lapin::Error),
+  Amqp(#[from] deadpool_lapin::lapin::Error),
   #[error("Pool error: {0}")]
   Pool(#[from] deadpool_lapin::PoolError),
   #[error("Serialization error: {0}")]
@@ -80,7 +80,7 @@ impl RabbitmqBackplane {
     run_id: &str,
     event: &BackplaneEvent,
   ) -> Result<(), BackplaneError> {
-    use lapin::{BasicProperties, options::*};
+    use deadpool_lapin::lapin::{BasicProperties, options::*};
 
     let conn = self.pool.get().await?;
     let channel = conn.create_channel().await?;
@@ -88,7 +88,7 @@ impl RabbitmqBackplane {
     channel
       .exchange_declare(
         JEFFERIES_EXCHANGE,
-        lapin::ExchangeKind::Topic,
+        deadpool_lapin::lapin::ExchangeKind::Topic,
         ExchangeDeclareOptions {
           durable: true,
           ..Default::default()
@@ -138,7 +138,7 @@ impl Backplane for RabbitmqBackplane {
     &self,
     run_id: &str,
   ) -> Result<Box<dyn RunSubscription + Send>, BackplaneError> {
-    use lapin::options::*;
+    use deadpool_lapin::lapin::options::*;
 
     let conn = self.pool.get().await?;
     let channel = conn.create_channel().await?;
@@ -146,7 +146,7 @@ impl Backplane for RabbitmqBackplane {
     channel
       .exchange_declare(
         JEFFERIES_EXCHANGE,
-        lapin::ExchangeKind::Topic,
+        deadpool_lapin::lapin::ExchangeKind::Topic,
         ExchangeDeclareOptions {
           durable: true,
           ..Default::default()
@@ -193,7 +193,7 @@ impl Backplane for RabbitmqBackplane {
 }
 
 struct RabbitmqSubscription {
-  consumer: lapin::Consumer,
+  consumer: deadpool_lapin::lapin::Consumer,
 }
 
 #[async_trait]
@@ -206,13 +206,13 @@ impl RunSubscription for RabbitmqSubscription {
         Some(Ok(delivery)) => {
           if let Ok(event) = serde_json::from_slice::<BackplaneEvent>(&delivery.data) {
             let _ = delivery
-              .ack(lapin::options::BasicAckOptions::default())
+              .ack(deadpool_lapin::lapin::options::BasicAckOptions::default())
               .await;
             return Some(event);
           } else {
             warn!("Failed to deserialize backplane event");
             let _ = delivery
-              .nack(lapin::options::BasicNackOptions::default())
+              .nack(deadpool_lapin::lapin::options::BasicNackOptions::default())
               .await;
           }
         }

@@ -11,5 +11,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
-lapin = { workspace = true }
 deadpool-lapin = { workspace = true }
