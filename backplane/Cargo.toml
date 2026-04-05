@@ -10,6 +10,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-futures-util = "0.3"
-lapin = "2.5"
-deadpool-lapin = { version = "0.12" }
+futures-util = { workspace = true }
+lapin = { workspace = true }
+deadpool-lapin = { workspace = true }
