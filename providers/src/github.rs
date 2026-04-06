@@ -6,7 +6,6 @@ use axum::{
   extract::State,
   http::{HeaderMap, StatusCode},
 };
-use coordinator::start_coordinator;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::EncodingKey;
 use octocrab::{
@@ -201,20 +200,32 @@ async fn start_pr_pipelines(
 async fn launch_coordinator_for_pipeline(pipeline: &Pipeline, state: Arc<ProviderState>) {
   let run_id = Uuid::new_v4().to_string();
   let pipeline_arc = Arc::new(pipeline.clone());
-  let (sender, handle) = start_coordinator(
+
+  let handle = coordinator::start_coordinator(
     run_id.clone(),
     pipeline_arc,
     state.config.clone(),
     state.dispatcher.clone(),
-  );
-  state.registry.register(run_id.clone(), sender).await;
+    state.state_store.clone(),
+    state.backplane.clone(),
+  )
+  .await;
+
+  let Some(handle) = handle else {
+    warn!(
+      run_id,
+      pipeline_name = pipeline.name(),
+      "Failed to acquire lease for new run"
+    );
+    return;
+  };
+
   info!(
     run_id,
     pipeline_name = pipeline.name(),
     "Coordinator launched for pipeline run"
   );
 
-  let registry = state.registry.clone();
   let monitor_run_id = run_id.clone();
   tokio::spawn(async move {
     match handle.await {
@@ -230,7 +241,6 @@ async fn launch_coordinator_for_pipeline(pipeline: &Pipeline, state: Arc<Provide
         warn!(run_id = %monitor_run_id, error = %e, "Coordinator task panicked");
       }
     }
-    registry.deregister(&monitor_run_id).await;
   });
 }
 

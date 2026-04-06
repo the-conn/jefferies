@@ -12,7 +12,9 @@ The platform is built as a distributed state machine where the execution logic i
 * **`app_config`**: Manages layered configuration loading from TOML and environment variables (using `__` as a hierarchy separator).
 * **`providers`**: Handles GitHub-specific integrations, including HMAC-SHA256 webhook validation and repository content discovery.
 * **`pipelines`**: Manages the parsing of `.jefferies/` YAML files and defines the shared state schema for execution tracking.
-* **`coordinator`**: The reactive engine that manages lifecycle leases, fencing tokens, and the "Reaper" task for reclaiming orphaned runs.
+* **`state_store`**: Provides a `StateStore` trait backed by Redis. Persists `RunState` with optimistic concurrency (Lua CAS / version fencing) and manages distributed TTL leases per run for exactly-once coordination.
+* **`backplane`**: Provides a `Backplane` trait backed by RabbitMQ. Replaces in-process MPSC channels with a cluster-wide topic exchange so any server node can route `NodeCompleted` and `Cancel` events to the appropriate coordinator.
+* **`coordinator`**: The reactive engine that acquires and heartbeats a Redis lease, consumes backplane events, persists node-state transitions, and runs the "Reaper" task for reclaiming orphaned runs.
 * **`server`**: A stateless Axum-based interface that handles incoming webhooks and secure status callbacks from execution workers.
 
 ---
@@ -23,7 +25,7 @@ The platform is built as a distributed state machine where the execution logic i
 Instead of following a rigid, linear path, the system maintains a "To-Run" queue in Redis. Whenever a step completes, the **coordinator** immediately identifies and dispatches all downstream nodes whose dependencies have been met.
 
 ### **2. Distributed Resiliency**
-* **Leasing & Fencing:** Every active run is protected by a Redis-backed lease with a TTL. Fencing tokens ensure that only the current, valid coordinator can progress a pipeline, preventing race conditions from "zombie" servers.
+* **Leasing & Fencing:** Every active run is protected by a Redis-backed lease with a TTL. Monotonically increasing fencing tokens ensure that only the current, valid coordinator can write state, preventing race conditions from "zombie" servers.
 * **Self-Healing (The Reaper):** If a server node fails, the Reaper detects the expired lease in Redis and re-enqueues the run for adoption by a healthy node.
 
 ### **3. Jefferies Tubes (Execution Wrapper)**
@@ -45,10 +47,14 @@ The platform requires the following infrastructure to be available in the cluste
 
 ### **Environment Variables**
 ```bash
-# Infrastructure
+# Redis
 JEFFERIES__REDIS__URL=...
 JEFFERIES__REDIS__PASSWORD=...
+
+# RabbitMQ
 JEFFERIES__RABBITMQ__URL=...
+JEFFERIES__RABBITMQ__USER=...
+JEFFERIES__RABBITMQ__PASSWORD=...
 
 # GitHub Integration
 JEFFERIES__GITHUB__APP_ID=...

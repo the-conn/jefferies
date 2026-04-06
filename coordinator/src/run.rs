@@ -1,14 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use pipelines::NodeInfo;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NodeStatus {
-  Pending,
-  Running,
-  Success,
-  Failed,
-}
+pub use state_store::NodeStatus;
 
 pub struct PipelineRun {
   statuses: HashMap<String, NodeStatus>,
@@ -98,6 +91,36 @@ impl PipelineRun {
 
   pub fn statuses(&self) -> &HashMap<String, NodeStatus> {
     &self.statuses
+  }
+
+  pub fn from_run_state(state: &state_store::RunState) -> Self {
+    let statuses = state.statuses.clone();
+    let dependencies = state
+      .dependencies
+      .iter()
+      .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+      .collect();
+    Self {
+      statuses,
+      dependencies,
+    }
+  }
+
+  pub fn to_run_state(
+    &self,
+    version: u64,
+    pipeline: std::sync::Arc<pipelines::Pipeline>,
+  ) -> state_store::RunState {
+    state_store::RunState {
+      version,
+      statuses: self.statuses.clone(),
+      dependencies: self
+        .dependencies
+        .iter()
+        .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+        .collect(),
+      pipeline: (*pipeline).clone(),
+    }
   }
 }
 

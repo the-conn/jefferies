@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+backplane = { workspace = true }
 coordinator = { workspace = true }
 hmac = { workspace = true }
 tokio = { workspace = true }
@@ -15,6 +16,7 @@ app_config = { workspace = true }
 pipelines = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+state_store = { workspace = true }
 tracing = { workspace = true }
 octocrab = { workspace = true }
 thiserror = { workspace = true }

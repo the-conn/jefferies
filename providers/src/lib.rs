@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use app_config::AppConfig;
 use axum::http::HeaderMap;
-use coordinator::{Dispatcher, RunRegistry};
+use backplane::Backplane;
+use coordinator::Dispatcher;
 pub use github::GithubProvider;
+use state_store::StateStore;
 
 pub(crate) fn get_header(headers: &HeaderMap, key: &str) -> String {
   headers
@@ -18,19 +20,22 @@ pub(crate) fn get_header(headers: &HeaderMap, key: &str) -> String {
 #[derive(Clone)]
 pub struct ProviderState {
   pub config: Arc<AppConfig>,
-  pub registry: Arc<RunRegistry>,
+  pub state_store: Arc<dyn StateStore>,
+  pub backplane: Arc<dyn Backplane>,
   pub dispatcher: Arc<dyn Dispatcher>,
 }
 
 impl ProviderState {
   pub fn new(
     config: Arc<AppConfig>,
-    registry: Arc<RunRegistry>,
+    state_store: Arc<dyn StateStore>,
+    backplane: Arc<dyn Backplane>,
     dispatcher: Arc<dyn Dispatcher>,
   ) -> Self {
     Self {
       config,
-      registry,
+      state_store,
+      backplane,
       dispatcher,
     }
   }

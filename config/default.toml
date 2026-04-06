@@ -10,6 +10,16 @@ default_pipeline_timeout_secs = 3600
 default_node_timeout_secs = 600
 fail_fast = true
 
+[redis]
+url = "redis://localhost:6379"
+password = ""
+
+[rabbitmq]
+url = "amqp://user:password@localhost:5672"
+
+[rabbitmq.pool]
+max_size = 16
+
 # NEVER INCLUDE THESE IN A GIT REPO
 # This is meant as a reference and should be set
 # with environment variables in the Jefferies deployment

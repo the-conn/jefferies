@@ -10,3 +10,7 @@ pipelines = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+state_store = { workspace = true }
+backplane = { workspace = true }

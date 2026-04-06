@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use app_config::AppConfig;
 use async_trait::async_trait;
+use backplane::Backplane;
 use pipelines::{NodeInfo, Pipeline};
 use thiserror::Error;
 use tracing::info;
-
-use crate::{message::CoordinatorMessage, registry::RunRegistry};
 
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -33,12 +32,12 @@ pub trait Dispatcher: Send + Sync {
 }
 
 pub struct LogDispatcher {
-  registry: Arc<RunRegistry>,
+  backplane: Arc<dyn Backplane>,
 }
 
 impl LogDispatcher {
-  pub fn new(registry: Arc<RunRegistry>) -> Self {
-    Self { registry }
+  pub fn new(backplane: Arc<dyn Backplane>) -> Self {
+    Self { backplane }
   }
 }
 
@@ -58,25 +57,19 @@ impl Dispatcher for LogDispatcher {
       checkout = node.checkout,
       "Dispatching node"
     );
-    let registry = self.registry.clone();
+    let backplane = self.backplane.clone();
     let run_id = run_id.to_string();
     let node_name = node.name.clone();
     tokio::spawn(async move {
-      if let Err(e) = registry
-        .send(
-          &run_id,
-          CoordinatorMessage::NodeCompleted {
-            node_name: node_name.clone(),
-            success: true,
-          },
-        )
+      if let Err(e) = backplane
+        .publish_node_completed(&run_id, &node_name, true)
         .await
       {
         tracing::warn!(
           run_id,
           node_name,
           error = %e,
-          "LogDispatcher failed to send NodeCompleted"
+          "LogDispatcher failed to publish NodeCompleted"
         );
       }
     });

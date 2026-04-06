@@ -7,21 +7,29 @@ use axum::{
   http::{HeaderMap, StatusCode},
   routing::{get, post},
 };
-use coordinator::{CoordinatorMessage, LogDispatcher, RunRegistry};
+use backplane::RabbitmqBackplane;
+use coordinator::{LogDispatcher, start_reaper};
 use providers::{GithubProvider, ProviderState};
 use serde::Deserialize;
+use state_store::RedisStateStore;
 use thiserror::Error;
 use tokio::signal;
 use tower_http::{
   cors::CorsLayer,
   trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
-use tracing::{Level, info, warn};
+use tracing::{Level, error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum ServerError {
   #[error("Server IO error: {0}")]
   IOError(#[from] std::io::Error),
+  #[error("State store error: {0}")]
+  StateStore(#[from] state_store::StateStoreError),
+  #[error("Backplane error: {0}")]
+  Backplane(#[from] backplane::BackplaneError),
+  #[error("Connection check failed: {0}")]
+  ConnectionFailed(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,26 +105,80 @@ async fn report_node_status(
   Path(run_id): Path<String>,
   Json(update): Json<NodeStatusUpdate>,
 ) -> StatusCode {
-  let message = CoordinatorMessage::NodeCompleted {
-    node_name: update.node_name,
-    success: update.success,
-  };
-  match state.registry.send(&run_id, message).await {
+  match state
+    .backplane
+    .publish_node_completed(&run_id, &update.node_name, update.success)
+    .await
+  {
     Ok(()) => StatusCode::OK,
     Err(e) => {
-      warn!(run_id, error = %e, "Failed to route node status update");
-      StatusCode::NOT_FOUND
+      warn!(run_id, error = %e, "Failed to publish node completed event");
+      StatusCode::INTERNAL_SERVER_ERROR
     }
   }
 }
 
+async fn verify_connections(
+  state_store: &RedisStateStore,
+  backplane: &RabbitmqBackplane,
+  config: &AppConfig,
+) -> Result<(), ServerError> {
+  info!(url = %config.redis_url(), "Checking Redis connection...");
+  if let Err(e) = state_store.ping().await {
+    error!(url = %config.redis_url(), error = %e, "Failed to connect to Redis");
+    return Err(ServerError::ConnectionFailed(format!("Redis: {e}")));
+  }
+  info!(url = %config.redis_url(), "Redis connection successful");
+
+  let scheme =
+    config.rabbitmq_url().split("://").next().ok_or_else(|| {
+      ServerError::ConnectionFailed("Invalid RabbitMQ URL. Missing scheme".into())
+    })?;
+  let host_part = config
+    .rabbitmq_url()
+    .split("@")
+    .last()
+    .unwrap_or(&config.rabbitmq_url());
+  let sanitized_url = match host_part.contains("://") {
+    true => host_part.to_string(),
+    false => format!("{}://{}", scheme, host_part),
+  };
+  info!(url = sanitized_url, "Checking RabbitMQ connection...");
+  if let Err(e) = backplane.ping().await {
+    error!(url = sanitized_url, error = %e, "Failed to connect to RabbitMQ");
+    return Err(ServerError::ConnectionFailed(format!("RabbitMQ: {e}")));
+  }
+  info!(url = sanitized_url, "RabbitMQ connection successful");
+
+  Ok(())
+}
+
 pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
   let shared_config = Arc::new(config);
-  let registry = RunRegistry::new();
-  let dispatcher = Arc::new(LogDispatcher::new(registry.clone()));
+
+  let state_store = Arc::new(RedisStateStore::new(
+    shared_config.redis_url(),
+    shared_config.redis_password(),
+    16,
+  )?);
+
+  let backplane = Arc::new(RabbitmqBackplane::new(&shared_config)?);
+
+  verify_connections(&state_store, &backplane, &shared_config).await?;
+
+  let dispatcher = Arc::new(LogDispatcher::new(backplane.clone()));
+
+  let _reaper = start_reaper(
+    shared_config.clone(),
+    dispatcher.clone(),
+    state_store.clone(),
+    backplane.clone(),
+  );
+
   let state = Arc::new(ProviderState::new(
     shared_config.clone(),
-    registry,
+    state_store,
+    backplane,
     dispatcher,
   ));
 
