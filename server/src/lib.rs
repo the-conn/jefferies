@@ -130,12 +130,25 @@ async fn verify_connections(
   }
   info!(url = %config.redis_url(), "Redis connection successful");
 
-  info!(url = %config.rabbitmq_url(), user = %config.rabbitmq_user(), "Checking RabbitMQ connection...");
+  let scheme =
+    config.rabbitmq_url().split("://").next().ok_or_else(|| {
+      ServerError::ConnectionFailed("Invalid RabbitMQ URL. Missing scheme".into())
+    })?;
+  let host_part = config
+    .rabbitmq_url()
+    .split("@")
+    .last()
+    .unwrap_or(&config.rabbitmq_url());
+  let sanitized_url = match host_part.contains("://") {
+    true => host_part.to_string(),
+    false => format!("{}://{}", scheme, host_part),
+  };
+  info!(url = sanitized_url, "Checking RabbitMQ connection...");
   if let Err(e) = backplane.ping().await {
-    error!(url = %config.rabbitmq_url(), user = %config.rabbitmq_user(), error = %e, "Failed to connect to RabbitMQ");
+    error!(url = sanitized_url, error = %e, "Failed to connect to RabbitMQ");
     return Err(ServerError::ConnectionFailed(format!("RabbitMQ: {e}")));
   }
-  info!(url = %config.rabbitmq_url(), user = %config.rabbitmq_user(), "RabbitMQ connection successful");
+  info!(url = sanitized_url, "RabbitMQ connection successful");
 
   Ok(())
 }
@@ -149,11 +162,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     16,
   )?);
 
-  let backplane = Arc::new(RabbitmqBackplane::new(
-    shared_config.rabbitmq_url(),
-    shared_config.rabbitmq_user(),
-    shared_config.rabbitmq_password(),
-  )?);
+  let backplane = Arc::new(RabbitmqBackplane::new(&shared_config)?);
 
   verify_connections(&state_store, &backplane, &shared_config).await?;
 

@@ -47,8 +47,12 @@ struct RedisConfig {
 #[derive(Debug, Deserialize)]
 struct RabbitmqConfig {
   url: String,
-  user: String,
-  password: String,
+  pool: RabbitmqPoolConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct RabbitmqPoolConfig {
+  max_size: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,11 +134,7 @@ impl AppConfig {
     &self.rabbitmq.url
   }
 
-  pub fn rabbitmq_user(&self) -> &str {
-    &self.rabbitmq.user
-  }
-
-  pub fn rabbitmq_password(&self) -> &str {
-    &self.rabbitmq.password
+  pub fn rabbitmq_pool_max_size(&self) -> usize {
+    self.rabbitmq.pool.max_size
   }
 }

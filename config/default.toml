@@ -15,9 +15,10 @@ url = "redis://localhost:6379"
 password = ""
 
 [rabbitmq]
-url = "amqp://localhost:5672"
-user = "guest"
-password = "guest"
+url = "amqp://user:password@localhost:5672"
+
+[rabbitmq.pool]
+max_size = 16
 
 # NEVER INCLUDE THESE IN A GIT REPO
 # This is meant as a reference and should be set

@@ -239,6 +239,7 @@ dependencies = [
 name = "backplane"
 version = "0.1.0"
 dependencies = [
+ "app_config",
  "async-trait",
  "deadpool-lapin",
  "futures-util",

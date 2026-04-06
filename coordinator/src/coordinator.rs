@@ -465,9 +465,11 @@ mod tests {
       std::env::set_var("JEFFERIES__PIPELINE__FAIL_FAST", "false");
       std::env::set_var("JEFFERIES__REDIS__URL", "redis://localhost:6379");
       std::env::set_var("JEFFERIES__REDIS__PASSWORD", "");
-      std::env::set_var("JEFFERIES__RABBITMQ__URL", "amqp://localhost:5672");
-      std::env::set_var("JEFFERIES__RABBITMQ__USER", "guest");
-      std::env::set_var("JEFFERIES__RABBITMQ__PASSWORD", "guest");
+      std::env::set_var(
+        "JEFFERIES__RABBITMQ__URL",
+        "amqp://guest:guest@localhost:5672",
+      );
+      std::env::set_var("JEFFERIES__RABBITMQ__POOL__MAX_SIZE", "16");
     }
     Arc::new(AppConfig::load().expect("test config"))
   }

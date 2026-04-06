@@ -12,3 +12,4 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 deadpool-lapin = { workspace = true }
+app_config = { workspace = true }

@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use deadpool_redis::{Config, CreatePoolError, PoolConfig, Runtime};
 use pipelines::Pipeline;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -39,6 +40,8 @@ pub enum StateStoreError {
   Serialization(#[from] serde_json::Error),
   #[error("Store error: {0}")]
   Store(String),
+  #[error("Runtime error: {0}")]
+  Runtime(#[from] CreatePoolError),
 }
 
 #[async_trait]
@@ -88,27 +91,39 @@ pub struct RedisStateStore {
 
 impl RedisStateStore {
   pub fn new(url: &str, password: &str, pool_size: usize) -> Result<Self, StateStoreError> {
-    let full_url = if password.is_empty() {
-      url.to_string()
-    } else if url.starts_with("redis://") {
-      format!("redis://:{password}@{}", &url[8..])
-    } else {
-      url.to_string()
-    };
-    let mut cfg = deadpool_redis::Config::from_url(full_url);
-    cfg.pool = Some(deadpool_redis::PoolConfig {
+    let mut conn_info: deadpool_redis::redis::ConnectionInfo = url
+      .parse()
+      .map_err(|e| StateStoreError::Store(format!("URL parse error: {e}")))?;
+
+    if !password.is_empty() {
+      conn_info = conn_info.clone().set_redis_settings(
+        conn_info
+          .clone()
+          .redis_settings()
+          .clone()
+          .set_password(password),
+      )
+    }
+
+    let mut cfg = Config::from_connection_info(conn_info);
+
+    cfg.pool = Some(PoolConfig {
       max_size: pool_size,
       ..Default::default()
     });
+
     let pool = cfg
-      .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+      .create_pool(Some(Runtime::Tokio1))
       .map_err(|e| StateStoreError::Store(e.to_string()))?;
+
     Ok(Self { pool })
   }
 
   pub async fn ping(&self) -> Result<(), StateStoreError> {
     let mut conn = self.pool.get().await?;
-    let _: String = deadpool_redis::redis::cmd("PING").query_async(&mut conn).await?;
+    let _: String = deadpool_redis::redis::cmd("PING")
+      .query_async(&mut conn)
+      .await?;
     Ok(())
   }
 }
@@ -159,7 +174,10 @@ impl StateStore for RedisStateStore {
   async fn load_run(&self, run_id: &str) -> Result<Option<RunState>, StateStoreError> {
     let mut conn = self.pool.get().await?;
     let key = state_key(run_id);
-    let value: Option<String> = deadpool_redis::redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
+    let value: Option<String> = deadpool_redis::redis::cmd("GET")
+      .arg(&key)
+      .query_async(&mut conn)
+      .await?;
     match value {
       Some(json) => Ok(Some(serde_json::from_str(&json)?)),
       None => Ok(None),
@@ -169,7 +187,10 @@ impl StateStore for RedisStateStore {
   async fn delete_run(&self, run_id: &str) -> Result<(), StateStoreError> {
     let mut conn = self.pool.get().await?;
     let key = state_key(run_id);
-    let _: i64 = deadpool_redis::redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
+    let _: i64 = deadpool_redis::redis::cmd("DEL")
+      .arg(&key)
+      .query_async(&mut conn)
+      .await?;
     Ok(())
   }
 
@@ -245,7 +266,10 @@ impl StateStore for RedisStateStore {
   async fn release_lease(&self, run_id: &str) -> Result<(), StateStoreError> {
     let mut conn = self.pool.get().await?;
     let key = lease_key(run_id);
-    let _: i64 = deadpool_redis::redis::cmd("DEL").arg(&key).query_async(&mut conn).await?;
+    let _: i64 = deadpool_redis::redis::cmd("DEL")
+      .arg(&key)
+      .query_async(&mut conn)
+      .await?;
     Ok(())
   }
 
@@ -266,7 +290,10 @@ impl StateStore for RedisStateStore {
       }
       let run_id = parts[2];
 
-      let value: Option<String> = deadpool_redis::redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+      let value: Option<String> = deadpool_redis::redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut conn)
+        .await?;
       let Some(json) = value else { continue };
 
       let Ok(state): Result<RunState, _> = serde_json::from_str(&json) else {

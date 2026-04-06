@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use app_config::AppConfig;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,15 +54,15 @@ pub struct RabbitmqBackplane {
 }
 
 impl RabbitmqBackplane {
-  pub fn new(url: &str, user: &str, password: &str) -> Result<Self, BackplaneError> {
-    let amqp_url = format!(
-      "amqp://{}:{}@{}",
-      user,
-      password,
-      url.trim_start_matches("amqp://")
-    );
+  pub fn new(config: &Arc<AppConfig>) -> Result<Self, BackplaneError> {
+    let url = config.rabbitmq_url();
+    let pool_max_size = config.rabbitmq_pool_max_size();
     let cfg = deadpool_lapin::Config {
-      url: Some(amqp_url),
+      url: Some(url.to_string()),
+      pool: Some(deadpool_lapin::PoolConfig {
+        max_size: pool_max_size,
+        ..Default::default()
+      }),
       ..Default::default()
     };
     let pool = cfg
