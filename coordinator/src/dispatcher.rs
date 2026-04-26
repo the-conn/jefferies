@@ -7,10 +7,14 @@ use pipelines::{NodeInfo, Pipeline};
 use thiserror::Error;
 use tracing::info;
 
+use crate::source_manager::SourceError;
+
 #[derive(Debug, Error)]
 pub enum DispatchError {
   #[error("Dispatch failed: {0}")]
   Failed(String),
+  #[error("Source error: {0}")]
+  Source(#[from] SourceError),
 }
 
 #[async_trait]
@@ -33,11 +37,15 @@ pub trait Dispatcher: Send + Sync {
 
 pub struct LogDispatcher {
   backplane: Arc<dyn Backplane>,
+  _source_manager: Arc<crate::SourceManager>,
 }
 
 impl LogDispatcher {
-  pub fn new(backplane: Arc<dyn Backplane>) -> Self {
-    Self { backplane }
+  pub fn new(backplane: Arc<dyn Backplane>, source_manager: Arc<crate::SourceManager>) -> Self {
+    Self {
+      backplane,
+      _source_manager: source_manager,
+    }
   }
 }
 

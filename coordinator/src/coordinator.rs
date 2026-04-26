@@ -470,6 +470,10 @@ mod tests {
         "amqp://guest:guest@localhost:5672",
       );
       std::env::set_var("JEFFERIES__RABBITMQ__POOL__MAX_SIZE", "16");
+      std::env::set_var("JEFFERIES__S3__ENDPOINT", "http://localhost:9000");
+      std::env::set_var("JEFFERIES__S3__BUCKET", "the-conn-runs");
+      std::env::set_var("JEFFERIES__S3__ACCESS_KEY", "");
+      std::env::set_var("JEFFERIES__S3__SECRET_KEY", "");
     }
     Arc::new(AppConfig::load().expect("test config"))
   }

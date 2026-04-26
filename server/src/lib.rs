@@ -8,7 +8,7 @@ use axum::{
   routing::{get, post},
 };
 use backplane::RabbitmqBackplane;
-use coordinator::{LogDispatcher, start_reaper};
+use coordinator::{LogDispatcher, SourceManager, start_reaper};
 use providers::{GithubProvider, ProviderState};
 use serde::Deserialize;
 use state_store::RedisStateStore;
@@ -166,7 +166,11 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
 
   verify_connections(&state_store, &backplane, &shared_config).await?;
 
-  let dispatcher = Arc::new(LogDispatcher::new(backplane.clone()));
+  let source_manager = Arc::new(SourceManager::new(&shared_config));
+  let dispatcher = Arc::new(LogDispatcher::new(
+    backplane.clone(),
+    source_manager.clone(),
+  ));
 
   let _reaper = start_reaper(
     shared_config.clone(),
@@ -180,6 +184,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     state_store,
     backplane,
     dispatcher,
+    source_manager,
   ));
 
   let addr = format!("{}:{}", shared_config.host(), shared_config.port());

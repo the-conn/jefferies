@@ -5,7 +5,7 @@ use std::sync::Arc;
 use app_config::AppConfig;
 use axum::http::HeaderMap;
 use backplane::Backplane;
-use coordinator::Dispatcher;
+use coordinator::{Dispatcher, SourceManager};
 pub use github::GithubProvider;
 use state_store::StateStore;
 
@@ -23,6 +23,7 @@ pub struct ProviderState {
   pub state_store: Arc<dyn StateStore>,
   pub backplane: Arc<dyn Backplane>,
   pub dispatcher: Arc<dyn Dispatcher>,
+  pub source_manager: Arc<SourceManager>,
 }
 
 impl ProviderState {
@@ -31,12 +32,14 @@ impl ProviderState {
     state_store: Arc<dyn StateStore>,
     backplane: Arc<dyn Backplane>,
     dispatcher: Arc<dyn Dispatcher>,
+    source_manager: Arc<SourceManager>,
   ) -> Self {
     Self {
       config,
       state_store,
       backplane,
       dispatcher,
+      source_manager,
     }
   }
 }

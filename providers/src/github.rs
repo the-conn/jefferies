@@ -167,7 +167,8 @@ async fn start_push_pipelines(
       pipeline_name = pipeline.name(),
       owner, repo, sha, branch, "Pipeline triggered by push event"
     );
-    launch_coordinator_for_pipeline(&pipeline, state.clone()).await;
+    launch_coordinator_for_pipeline(owner, repo, sha, &pipeline, &install_crab, state.clone())
+      .await;
   }
 
   Ok(())
@@ -191,14 +192,40 @@ async fn start_pr_pipelines(
       pipeline_name = pipeline.name(),
       owner, repo, sha, base_branch, "Pipeline triggered by pull request event"
     );
-    launch_coordinator_for_pipeline(&pipeline, state.clone()).await;
+    launch_coordinator_for_pipeline(owner, repo, sha, &pipeline, &install_crab, state.clone())
+      .await;
   }
 
   Ok(())
 }
 
-async fn launch_coordinator_for_pipeline(pipeline: &Pipeline, state: Arc<ProviderState>) {
+async fn launch_coordinator_for_pipeline(
+  owner: &str,
+  repo: &str,
+  sha: &str,
+  pipeline: &Pipeline,
+  install_crab: &Octocrab,
+  state: Arc<ProviderState>,
+) {
   let run_id = Uuid::new_v4().to_string();
+
+  let needs_source = pipeline.node_info().iter().any(|n| n.checkout);
+  if needs_source {
+    if let Err(e) = state
+      .source_manager
+      .upload_source(&run_id, owner, repo, sha, install_crab)
+      .await
+    {
+      warn!(
+        run_id,
+        pipeline_name = pipeline.name(),
+        error = %e,
+        "Failed to upload source tarball; aborting run"
+      );
+      return;
+    }
+  }
+
   let pipeline_arc = Arc::new(pipeline.clone());
 
   let handle = coordinator::start_coordinator(
