@@ -22,6 +22,13 @@ pub enum SourceError {
   S3(String),
   #[error("Presign configuration error: {0}")]
   Presign(String),
+  #[error("Status not found: {0}")]
+  NotFound(String),
+}
+
+#[derive(serde::Deserialize)]
+pub struct NodeOutcome {
+  pub success: bool,
 }
 
 pub struct SourceManager {
@@ -154,6 +161,43 @@ impl SourceManager {
     }
   }
 
+  pub async fn get_node_status(
+    &self,
+    run_id: &str,
+    node_name: &str,
+  ) -> Result<NodeOutcome, SourceError> {
+    let key = status_key(run_id, node_name);
+    match self
+      .s3
+      .get_object()
+      .bucket(&self.bucket)
+      .key(&key)
+      .send()
+      .await
+    {
+      Err(e)
+        if e
+          .as_service_error()
+          .map(|se| se.is_no_such_key())
+          .unwrap_or(false) =>
+      {
+        Err(SourceError::NotFound(format!(
+          "run={run_id} node={node_name}"
+        )))
+      }
+      Err(e) => Err(SourceError::S3(e.to_string())),
+      Ok(output) => {
+        let bytes = output
+          .body
+          .collect()
+          .await
+          .map_err(|e| SourceError::S3(e.to_string()))?
+          .into_bytes();
+        serde_json::from_slice::<NodeOutcome>(&bytes).map_err(|e| SourceError::S3(e.to_string()))
+      }
+    }
+  }
+
   pub async fn cleanup_run(&self, run_id: &str) -> Result<(), SourceError> {
     let prefix = format!("runs/{run_id}/");
 
@@ -216,6 +260,12 @@ fn presign_config() -> Result<PresigningConfig, SourceError> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn test_source_error_not_found_display() {
+    let e = SourceError::NotFound("run=foo node=bar".to_string());
+    assert!(e.to_string().contains("Status not found"));
+  }
 
   #[test]
   fn test_source_key_format() {

@@ -10,4 +10,4 @@ pub use dispatcher::{DispatchError, Dispatcher, LogDispatcher};
 pub use message::CoordinatorMessage;
 pub use reaper::start_reaper;
 pub use run::{NodeStatus, PipelineRun};
-pub use source_manager::{SourceError, SourceManager};
+pub use source_manager::{NodeOutcome, SourceError, SourceManager};

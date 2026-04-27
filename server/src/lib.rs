@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use app_config::AppConfig;
 use axum::{
@@ -10,8 +10,7 @@ use axum::{
 use backplane::RabbitmqBackplane;
 use coordinator::{LogDispatcher, SourceError, SourceManager, start_reaper};
 use providers::{GithubProvider, ProviderState};
-use serde::Deserialize;
-use state_store::RedisStateStore;
+use state_store::RunState;
 use thiserror::Error;
 use tokio::signal;
 use tower_http::{
@@ -34,19 +33,19 @@ pub enum ServerError {
   ConnectionFailed(String),
 }
 
-#[derive(Debug, Deserialize)]
-pub struct NodeStatusUpdate {
-  pub node_name: String,
-  pub success: bool,
-}
-
 fn router(state: Arc<ProviderState>) -> Router {
   let cors = build_cors_layer();
 
   Router::new()
-    .route("/health", get(health))
+    .route("/health/live", get(health_live))
+    .route("/health/ready", get(health_ready))
+    .route(
+      "/api/v1/runs/{run_id}/nodes/{node_name}/poke",
+      post(handle_node_poke),
+    )
+    .route("/api/v1/runs/{run_id}/cancel", post(cancel_pipeline_run))
+    .route("/api/v1/runs/{run_id}/status", get(get_run_status))
     .route("/webhooks/github", post(GithubProvider::handle_webhook))
-    .route("/runs/{run_id}/status", post(report_node_status))
     .layer(cors)
     .layer(
       TraceLayer::new_for_http()
@@ -102,66 +101,46 @@ async fn shutdown_signal() {
   }
 }
 
-async fn report_node_status(
-  State(state): State<Arc<ProviderState>>,
-  Path(run_id): Path<String>,
-  Json(update): Json<NodeStatusUpdate>,
-) -> StatusCode {
-  match state
-    .backplane
-    .publish_node_completed(&run_id, &update.node_name, update.success)
-    .await
-  {
-    Ok(()) => StatusCode::OK,
-    Err(e) => {
-      warn!(run_id, error = %e, "Failed to publish node completed event");
-      StatusCode::INTERNAL_SERVER_ERROR
-    }
-  }
-}
+async fn verify_connections(state: &ProviderState) -> Result<(), ServerError> {
+  info!(url = %state.config.redis_url(), "Checking Redis connection...");
+  state.state_store.ping().await.map_err(|e| {
+    error!(url = %state.config.redis_url(), error = %e, "Failed to connect to Redis");
+    ServerError::ConnectionFailed(format!("Redis: {e}"))
+  })?;
+  info!(url = %state.config.redis_url(), "Redis connection successful");
 
-async fn verify_connections(
-  state_store: &RedisStateStore,
-  backplane: &RabbitmqBackplane,
-  source_manager: &SourceManager,
-  config: &AppConfig,
-) -> Result<(), ServerError> {
-  info!(url = %config.redis_url(), "Checking Redis connection...");
-  if let Err(e) = state_store.ping().await {
-    error!(url = %config.redis_url(), error = %e, "Failed to connect to Redis");
-    return Err(ServerError::ConnectionFailed(format!("Redis: {e}")));
-  }
-  info!(url = %config.redis_url(), "Redis connection successful");
-
-  let scheme =
-    config.rabbitmq_url().split("://").next().ok_or_else(|| {
-      ServerError::ConnectionFailed("Invalid RabbitMQ URL. Missing scheme".into())
-    })?;
-  let host_part = config
+  let scheme = state
+    .config
+    .rabbitmq_url()
+    .split("://")
+    .next()
+    .ok_or_else(|| ServerError::ConnectionFailed("Invalid RabbitMQ URL. Missing scheme".into()))?;
+  let host_part = state
+    .config
     .rabbitmq_url()
     .split("@")
     .last()
-    .unwrap_or(config.rabbitmq_url());
+    .unwrap_or(state.config.rabbitmq_url());
   let sanitized_url = match host_part.contains("://") {
     true => host_part.to_string(),
     false => format!("{}://{}", scheme, host_part),
   };
   info!(url = sanitized_url, "Checking RabbitMQ connection...");
-  if let Err(e) = backplane.ping().await {
+  state.backplane.ping().await.map_err(|e| {
     error!(url = sanitized_url, error = %e, "Failed to connect to RabbitMQ");
-    return Err(ServerError::ConnectionFailed(format!("RabbitMQ: {e}")));
-  }
+    ServerError::ConnectionFailed(format!("RabbitMQ: {e}"))
+  })?;
   info!(url = sanitized_url, "RabbitMQ connection successful");
 
   info!(
-    endpoint = %config.s3_endpoint(),
-    bucket = %config.s3_bucket(),
+    endpoint = %state.config.s3_endpoint(),
+    bucket = %state.config.s3_bucket(),
     "Checking S3 connection..."
   );
-  source_manager.ping().await?;
+  state.source_manager.ping().await?;
   info!(
-    endpoint = %config.s3_endpoint(),
-    bucket = %config.s3_bucket(),
+    endpoint = %state.config.s3_endpoint(),
+    bucket = %state.config.s3_bucket(),
     "S3 connection successful"
   );
 
@@ -171,7 +150,7 @@ async fn verify_connections(
 pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
   let shared_config = Arc::new(config);
 
-  let state_store = Arc::new(RedisStateStore::new(
+  let state_store = Arc::new(state_store::RedisStateStore::new(
     shared_config.redis_url(),
     shared_config.redis_password(),
     16,
@@ -181,19 +160,10 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
 
   let source_manager = Arc::new(SourceManager::new(&shared_config));
 
-  verify_connections(&state_store, &backplane, &source_manager, &shared_config).await?;
-
   let dispatcher = Arc::new(LogDispatcher::new(
     backplane.clone(),
     source_manager.clone(),
   ));
-
-  let _reaper = start_reaper(
-    shared_config.clone(),
-    dispatcher.clone(),
-    state_store.clone(),
-    backplane.clone(),
-  );
 
   let state = Arc::new(ProviderState::new(
     shared_config.clone(),
@@ -202,6 +172,15 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     dispatcher,
     source_manager,
   ));
+
+  verify_connections(&state).await?;
+
+  let _reaper = start_reaper(
+    shared_config.clone(),
+    state.dispatcher.clone(),
+    state.state_store.clone(),
+    state.backplane.clone(),
+  );
 
   let addr = format!("{}:{}", shared_config.host(), shared_config.port());
   let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -212,6 +191,159 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
   Ok(())
 }
 
-async fn health() -> StatusCode {
+async fn health_live() -> StatusCode {
   StatusCode::OK
+}
+
+async fn health_ready(State(state): State<Arc<ProviderState>>) -> StatusCode {
+  const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+  match tokio::time::timeout(PROBE_TIMEOUT, verify_connections(&state)).await {
+    Ok(Ok(())) => StatusCode::OK,
+    Ok(Err(e)) => {
+      warn!(error = %e, "Readiness check failed");
+      StatusCode::SERVICE_UNAVAILABLE
+    }
+    Err(_) => {
+      warn!("Readiness check timed out");
+      StatusCode::SERVICE_UNAVAILABLE
+    }
+  }
+}
+
+async fn handle_node_poke(
+  State(state): State<Arc<ProviderState>>,
+  Path((run_id, node_name)): Path<(String, String)>,
+) -> StatusCode {
+  let outcome = match state
+    .source_manager
+    .get_node_status(&run_id, &node_name)
+    .await
+  {
+    Ok(o) => o,
+    Err(SourceError::NotFound(_)) => {
+      warn!(run_id, node_name, "Status file not found in S3");
+      return StatusCode::NOT_FOUND;
+    }
+    Err(e) => {
+      warn!(run_id, node_name, error = %e, "Failed to read node status from S3");
+      return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+  };
+  match state
+    .backplane
+    .publish_node_completed(&run_id, &node_name, outcome.success)
+    .await
+  {
+    Ok(()) => StatusCode::OK,
+    Err(e) => {
+      warn!(run_id, node_name, error = %e, "Failed to publish node completed event");
+      StatusCode::INTERNAL_SERVER_ERROR
+    }
+  }
+}
+
+async fn cancel_pipeline_run(
+  State(state): State<Arc<ProviderState>>,
+  Path(run_id): Path<String>,
+) -> StatusCode {
+  if let Err(e) = state.dispatcher.cleanup_run(&run_id).await {
+    warn!(run_id, error = %e, "Dispatcher cleanup failed during cancel");
+  }
+  if let Err(e) = state.backplane.publish_cancel(&run_id).await {
+    warn!(run_id, error = %e, "Failed to publish cancel event");
+    return StatusCode::INTERNAL_SERVER_ERROR;
+  }
+  if let Err(e) = state.source_manager.cleanup_run(&run_id).await {
+    warn!(run_id, error = %e, "S3 cleanup failed during cancel");
+  }
+  StatusCode::OK
+}
+
+async fn get_run_status(
+  State(state): State<Arc<ProviderState>>,
+  Path(run_id): Path<String>,
+) -> (StatusCode, Json<Option<RunState>>) {
+  match state.state_store.load_run(&run_id).await {
+    Ok(Some(run_state)) => (StatusCode::OK, Json(Some(run_state))),
+    Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
+    Err(e) => {
+      warn!(run_id, error = %e, "Failed to load run state");
+      (StatusCode::INTERNAL_SERVER_ERROR, Json(None))
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use axum::{body::Body, http::Request};
+  use backplane::InMemoryBackplane;
+  use coordinator::LogDispatcher;
+  use state_store::InMemoryStateStore;
+  use tower::ServiceExt;
+
+  use super::*;
+
+  fn make_test_state() -> Arc<ProviderState> {
+    let config = Arc::new(AppConfig::load().expect("test config"));
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let source_manager = Arc::new(SourceManager::new(&config));
+    let dispatcher = Arc::new(LogDispatcher::new(
+      backplane.clone(),
+      source_manager.clone(),
+    ));
+    Arc::new(ProviderState::new(
+      config,
+      state_store,
+      backplane,
+      dispatcher,
+      source_manager,
+    ))
+  }
+
+  #[tokio::test]
+  async fn test_health_live_returns_200() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/health/live")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn test_get_run_status_unknown_run_returns_404() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/v1/runs/nonexistent-run/status")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+  }
+
+  #[tokio::test]
+  async fn test_cancel_pipeline_run_returns_200() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/api/v1/runs/test-run/cancel")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
 }

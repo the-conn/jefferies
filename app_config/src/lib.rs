@@ -77,10 +77,15 @@ pub struct AppConfig {
 impl AppConfig {
   pub fn load() -> Result<Self, AppConfigError> {
     let environment = env::var("ENV").unwrap_or_else(|_| "dev".into());
+    let src_config_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
 
     let s = Config::builder()
+      // CWD-relative: used by deployed binaries with a config/ directory alongside them
       .add_source(File::with_name("config/default").required(false))
-      .add_source(File::with_name(&format!("config/{}", environment)).required(false))
+      .add_source(File::with_name(&format!("config/{environment}")).required(false))
+      // Source-relative: resolved at compile time, used by tests in any workspace crate
+      .add_source(File::from(src_config_dir.join("default")).required(false))
+      .add_source(File::from(src_config_dir.join(&environment)).required(false))
       .add_source(Environment::with_prefix("JEFFERIES").separator("__"))
       .build()?;
 

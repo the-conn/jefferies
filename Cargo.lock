@@ -861,6 +861,7 @@ dependencies = [
  "http-body-util",
  "octocrab",
  "pipelines",
+ "serde",
  "serde_json",
  "state_store",
  "thiserror",
@@ -3242,6 +3243,7 @@ dependencies = [
  "state_store",
  "thiserror",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
 ]
