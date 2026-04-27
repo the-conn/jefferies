@@ -1,35 +1,35 @@
-## Agents.md
+## AGENTS.md
 
-This document outlines the coding standards and workflow expectations for contributors and automated agents.
+This document outlines the mandatory coding standards and workflow expectations for all contributors and automated agents.
 
----
+### **Code Style & Philosophy**
+* **Self-Documenting Code**: Inline comments are prohibited. Use descriptive naming and clear logical flow to explain intent.
+* **Functional Decomposition**: Large functions must be split into smaller, focused helper functions.
+* **Encapsulation**: Do not mark items `pub` unless they are explicitly required by an external module. Adhere to the principle of least privilege.
+* **Standard Characters**: No emojis, non-standard Unicode, or decorative ASCII art.
 
-### **Code Style & Readability**
-* **No Comments:** Avoid inline comments. Code should be self-documenting through clear naming and logical flow.
-* **Functional Decomposition:** Break large functions into smaller, focused helper functions.
-    * Main functions should outline high-level logic.
-    * Helper functions should handle specific implementation details to support reuse and readability.
-* **Asynchronous Execution:** Since this is an **Axum** backend, logic should be non-blocking and utilize `async/await` where appropriate to handle concurrent requests efficiently.
-* **Logging:** Use structured logging at appropriate levels (`info`, `warn`, `error`, `debug`) to aid in debugging and provide visibility into program execution.
+### **Architecture & Execution**
+* **Asynchronous Design**: All logic must be non-blocking. Utilize `async/await` and structured logging (`tracing`) to maintain visibility into the **Axum** execution flow.
+* **Error Handling**: `unwrap()` and `expect()` are strictly prohibited. All errors must be handled gracefully through established unified error enum patterns.
+* **Resource Efficiency**: Prioritize streaming and zero-copy operations for IO, network, and S3 tasks to minimize memory overhead.
 
-### **Error Handling & Security**
-* **No Panics:** `unwrap()` and `expect()` are strictly prohibited outside of test suites. Failures must be handled gracefully using proper error types.
-* **Data Integrity:** All database interactions must be safe and protected against injection attacks.
-* **Graceful Failures:** The system should remain resilient; a failure in one process should not bring down the entire server.
+### **Documentation & Synchronization**
+* **Living Documentation**: Agents are responsible for ensuring that documentation remains an accurate reflection of the codebase.
+* **README.md**: Must be updated if changes affect the configuration schema (environment variables), project lifecycle, or deployment strategy.
+* **docs/architecture.md**: Must be updated if the relationship between modules, the data flow (e.g., S3/NooBaa integration), or the external interaction model changes.
+* **Context**: Documentation should focus on high-level architecture and "the why" rather than duplicating implementation details found in the code.
 
-### **Testing & Documentation**
-* **Targeted Testing:** Tests are required for new features, functional updates, and integration points where different modules connect.
-    * *Note:* Purely structural changes (refactoring module locations, updating dependencies, or documentation tweaks) do not require new tests unless logic is altered.
-* **Test Scope:** Focus on "large ideas," happy paths, and common failure modes rather than testing every individual helper function.
-* **README Maintenance:** Keep the `README.md` updated with the project's high-level overview and architectural structure. Avoid deep implementation details; focus on helping new contributors understand the major modules.
+### **Testing & Quality**
+* **Strategic Testing**: Tests are required for new features and integration points. Focus on "happy paths" and common failure modes.
+* **Exemptions**: Purely structural changes (e.g., refactoring file locations) do not require new tests unless logic is altered.
 
 ### **Development Workflow**
-A commit is only ready for review if it fulfills the following:
+A contribution is only considered complete if it passes the following `make` targets in order:
 
-1.  **`make fmt`**: Code must be consistently formatted.
-2.  **`make test`**: All existing and new tests must pass.
-3.  **Documentation**: Relevant high-level changes are reflected in the README.
+1.  **`make fmt`**: Code must be formatted using the project's nightly standard.
+2.  **`make lint`**: `clippy` must return zero warnings or errors (`-D warnings`).
+3.  **`make test`**: All unit and integration tests must pass.
 
 ---
 
-Check out [architecture.md](./docs/architecture.md) for a high level description of the architecture of this CI framework.
+Refer to [architecture.md](./docs/architecture.md) for a high-level description of the **The Conn** framework.

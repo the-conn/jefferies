@@ -7,10 +7,14 @@ use pipelines::{NodeInfo, Pipeline};
 use thiserror::Error;
 use tracing::info;
 
+use crate::source_manager::SourceError;
+
 #[derive(Debug, Error)]
 pub enum DispatchError {
   #[error("Dispatch failed: {0}")]
   Failed(String),
+  #[error("Source error: {0}")]
+  Source(#[from] SourceError),
 }
 
 #[async_trait]
@@ -29,15 +33,21 @@ pub trait Dispatcher: Send + Sync {
     node_name: &str,
     config: &AppConfig,
   ) -> Result<(), DispatchError>;
+
+  async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError>;
 }
 
 pub struct LogDispatcher {
   backplane: Arc<dyn Backplane>,
+  _source_manager: Arc<crate::SourceManager>,
 }
 
 impl LogDispatcher {
-  pub fn new(backplane: Arc<dyn Backplane>) -> Self {
-    Self { backplane }
+  pub fn new(backplane: Arc<dyn Backplane>, source_manager: Arc<crate::SourceManager>) -> Self {
+    Self {
+      backplane,
+      _source_manager: source_manager,
+    }
   }
 }
 
@@ -83,6 +93,11 @@ impl Dispatcher for LogDispatcher {
     _config: &AppConfig,
   ) -> Result<(), DispatchError> {
     info!(run_id, node_name, "Cancelling node");
+    Ok(())
+  }
+
+  async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError> {
+    info!(run_id, "Skipping S3 cleanup (LogDispatcher)");
     Ok(())
   }
 }

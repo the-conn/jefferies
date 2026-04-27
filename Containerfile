@@ -1,4 +1,4 @@
-FROM rust:1.94.1-slim as builder
+FROM rust:1.95-slim as builder
 
 WORKDIR /usr/src/jefferies
 COPY . .

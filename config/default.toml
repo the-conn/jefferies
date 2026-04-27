@@ -20,6 +20,12 @@ url = "amqp://user:password@localhost:5672"
 [rabbitmq.pool]
 max_size = 16
 
+[s3]
+endpoint = "http://localhost:9000"
+bucket = "the-conn-runs"
+access_key = ""
+secret_key = ""
+
 # NEVER INCLUDE THESE IN A GIT REPO
 # This is meant as a reference and should be set
 # with environment variables in the Jefferies deployment

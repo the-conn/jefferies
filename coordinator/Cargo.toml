@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 app_config = { workspace = true }
 async-trait = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+http-body-util = { workspace = true }
+octocrab = { workspace = true }
 pipelines = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -8,7 +8,7 @@ use axum::{
   routing::{get, post},
 };
 use backplane::RabbitmqBackplane;
-use coordinator::{LogDispatcher, start_reaper};
+use coordinator::{LogDispatcher, SourceError, SourceManager, start_reaper};
 use providers::{GithubProvider, ProviderState};
 use serde::Deserialize;
 use state_store::RedisStateStore;
@@ -28,6 +28,8 @@ pub enum ServerError {
   StateStore(#[from] state_store::StateStoreError),
   #[error("Backplane error: {0}")]
   Backplane(#[from] backplane::BackplaneError),
+  #[error("Source manager error: {0}")]
+  Source(#[from] SourceError),
   #[error("Connection check failed: {0}")]
   ConnectionFailed(String),
 }
@@ -121,6 +123,7 @@ async fn report_node_status(
 async fn verify_connections(
   state_store: &RedisStateStore,
   backplane: &RabbitmqBackplane,
+  source_manager: &SourceManager,
   config: &AppConfig,
 ) -> Result<(), ServerError> {
   info!(url = %config.redis_url(), "Checking Redis connection...");
@@ -138,7 +141,7 @@ async fn verify_connections(
     .rabbitmq_url()
     .split("@")
     .last()
-    .unwrap_or(&config.rabbitmq_url());
+    .unwrap_or(config.rabbitmq_url());
   let sanitized_url = match host_part.contains("://") {
     true => host_part.to_string(),
     false => format!("{}://{}", scheme, host_part),
@@ -149,6 +152,18 @@ async fn verify_connections(
     return Err(ServerError::ConnectionFailed(format!("RabbitMQ: {e}")));
   }
   info!(url = sanitized_url, "RabbitMQ connection successful");
+
+  info!(
+    endpoint = %config.s3_endpoint(),
+    bucket = %config.s3_bucket(),
+    "Checking S3 connection..."
+  );
+  source_manager.ping().await?;
+  info!(
+    endpoint = %config.s3_endpoint(),
+    bucket = %config.s3_bucket(),
+    "S3 connection successful"
+  );
 
   Ok(())
 }
@@ -164,9 +179,14 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
 
   let backplane = Arc::new(RabbitmqBackplane::new(&shared_config)?);
 
-  verify_connections(&state_store, &backplane, &shared_config).await?;
+  let source_manager = Arc::new(SourceManager::new(&shared_config));
 
-  let dispatcher = Arc::new(LogDispatcher::new(backplane.clone()));
+  verify_connections(&state_store, &backplane, &source_manager, &shared_config).await?;
+
+  let dispatcher = Arc::new(LogDispatcher::new(
+    backplane.clone(),
+    source_manager.clone(),
+  ));
 
   let _reaper = start_reaper(
     shared_config.clone(),
@@ -180,6 +200,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     state_store,
     backplane,
     dispatcher,
+    source_manager,
   ));
 
   let addr = format!("{}:{}", shared_config.host(), shared_config.port());

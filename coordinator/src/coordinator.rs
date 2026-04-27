@@ -172,17 +172,14 @@ impl Coordinator {
           }
         }
         msg = self.internal_rx.recv() => {
-          match msg {
-            Some(CoordinatorMessage::NodeTimedOut { node_name }) => {
-              if self.handle_node_timed_out(&node_name).await {
-                self.cleanup().await;
-                return self.handle_cancellation().await;
-              }
-              if self.run.is_complete() {
-                break;
-              }
+          if let Some(CoordinatorMessage::NodeTimedOut { node_name }) = msg {
+            if self.handle_node_timed_out(&node_name).await {
+              self.cleanup().await;
+              return self.handle_cancellation().await;
             }
-            _ => {}
+            if self.run.is_complete() {
+              break;
+            }
           }
         }
         event = subscription.next_event() => {
@@ -355,14 +352,13 @@ impl Coordinator {
     }
 
     for (node_name, status) in self.run.statuses() {
-      if *status == NodeStatus::Running {
-        if let Err(e) = self
+      if *status == NodeStatus::Running
+        && let Err(e) = self
           .dispatcher
           .cancel_node(&self.run_id, node_name, &self.config)
           .await
-        {
-          warn!(run_id = %self.run_id, node_name, error = %e, "Failed to cancel node");
-        }
+      {
+        warn!(run_id = %self.run_id, node_name, error = %e, "Failed to cancel node");
       }
     }
 
@@ -376,6 +372,9 @@ impl Coordinator {
   }
 
   async fn cleanup(&self) {
+    if let Err(e) = self.dispatcher.cleanup_run(&self.run_id).await {
+      warn!(run_id = %self.run_id, error = %e, "Failed to clean up S3 objects for run");
+    }
     if let Err(e) = self.state_store.release_lease(&self.run_id).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to release lease");
     }
@@ -448,6 +447,10 @@ mod tests {
     ) -> Result<(), DispatchError> {
       Ok(())
     }
+
+    async fn cleanup_run(&self, _run_id: &str) -> Result<(), DispatchError> {
+      Ok(())
+    }
   }
 
   fn make_config() -> Arc<AppConfig> {
@@ -470,6 +473,10 @@ mod tests {
         "amqp://guest:guest@localhost:5672",
       );
       std::env::set_var("JEFFERIES__RABBITMQ__POOL__MAX_SIZE", "16");
+      std::env::set_var("JEFFERIES__S3__ENDPOINT", "http://localhost:9000");
+      std::env::set_var("JEFFERIES__S3__BUCKET", "the-conn-runs");
+      std::env::set_var("JEFFERIES__S3__ACCESS_KEY", "");
+      std::env::set_var("JEFFERIES__S3__SECRET_KEY", "");
     }
     Arc::new(AppConfig::load().expect("test config"))
   }

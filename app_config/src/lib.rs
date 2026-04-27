@@ -56,6 +56,14 @@ struct RabbitmqPoolConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct S3Config {
+  endpoint: String,
+  bucket: String,
+  access_key: String,
+  secret_key: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AppConfig {
   server: ServerConfig,
   log: LogConfig,
@@ -63,6 +71,7 @@ pub struct AppConfig {
   pipeline: PipelineConfig,
   redis: RedisConfig,
   rabbitmq: RabbitmqConfig,
+  s3: S3Config,
 }
 
 impl AppConfig {
@@ -136,5 +145,21 @@ impl AppConfig {
 
   pub fn rabbitmq_pool_max_size(&self) -> usize {
     self.rabbitmq.pool.max_size
+  }
+
+  pub fn s3_endpoint(&self) -> &str {
+    &self.s3.endpoint
+  }
+
+  pub fn s3_bucket(&self) -> &str {
+    &self.s3.bucket
+  }
+
+  pub fn s3_access_key(&self) -> &str {
+    &self.s3.access_key
+  }
+
+  pub fn s3_secret_key(&self) -> &str {
+    &self.s3.secret_key
   }
 }

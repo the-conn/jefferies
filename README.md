@@ -9,12 +9,12 @@
 The platform is built as a distributed state machine where the execution logic is decoupled from individual server instances. By externalizing state to **Redis** and signaling to **RabbitMQ**, the system achieves arbitrary scaling and self-healing capabilities.
 
 ### **System Modules**
-* **`app_config`**: Manages layered configuration loading from TOML and environment variables (using `__` as a hierarchy separator).
+* **`app_config`**: Manages layered configuration loading from TOML and environment variables (using `__` as a hierarchy separator). Covers Redis, RabbitMQ, GitHub, and S3/NooBaa credentials.
 * **`providers`**: Handles GitHub-specific integrations, including HMAC-SHA256 webhook validation and repository content discovery.
 * **`pipelines`**: Manages the parsing of `.jefferies/` YAML files and defines the shared state schema for execution tracking.
 * **`state_store`**: Provides a `StateStore` trait backed by Redis. Persists `RunState` with optimistic concurrency (Lua CAS / version fencing) and manages distributed TTL leases per run for exactly-once coordination.
 * **`backplane`**: Provides a `Backplane` trait backed by RabbitMQ. Replaces in-process MPSC channels with a cluster-wide topic exchange so any server node can route `NodeCompleted` and `Cancel` events to the appropriate coordinator.
-* **`coordinator`**: The reactive engine that acquires and heartbeats a Redis lease, consumes backplane events, persists node-state transitions, and runs the "Reaper" task for reclaiming orphaned runs.
+* **`coordinator`**: The reactive engine that acquires and heartbeats a Redis lease, consumes backplane events, persists node-state transitions, and runs the "Reaper" task for reclaiming orphaned runs. Contains the **`SourceManager`**, which streams repository tarballs from GitHub directly to S3 and generates presigned URLs for worker access.
 * **`server`**: A stateless Axum-based interface that handles incoming webhooks and secure status callbacks from execution workers.
 
 ---
@@ -60,6 +60,12 @@ JEFFERIES__RABBITMQ__PASSWORD=...
 JEFFERIES__GITHUB__APP_ID=...
 JEFFERIES__GITHUB__WEBHOOK_SECRET=...
 JEFFERIES__GITHUB__PRIVATE_KEY=...
+
+# S3 / NooBaa Storage
+JEFFERIES__S3__ENDPOINT=...
+JEFFERIES__S3__BUCKET=the-conn-runs
+JEFFERIES__S3__ACCESS_KEY=...
+JEFFERIES__S3__SECRET_KEY=...
 ```
 
 ---
