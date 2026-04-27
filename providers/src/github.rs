@@ -139,11 +139,7 @@ async fn handle_pull_request(
     })?
     .login;
   let repo_name = head_repo.name;
-  let sha = pr_event.after.ok_or_else(|| {
-    GithubError::InvalidPayload(serde_json::Error::custom(
-      "Missing after field in pull request event",
-    ))
-  })?;
+  let sha = pr.head.sha.clone();
   let base_branch = pr.base.ref_field;
   start_pr_pipelines(&owner, &repo_name, &sha, &base_branch, state).await?;
   Ok(StatusCode::OK)

@@ -857,6 +857,8 @@ dependencies = [
  "app_config",
  "async-trait",
  "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "backplane",
  "http-body-util",
  "octocrab",
@@ -2071,6 +2073,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "app_config",
+ "rustls 0.23.37",
  "server",
  "tokio",
  "tracing",
