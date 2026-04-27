@@ -36,9 +36,11 @@ pub enum ServerError {
 fn router(state: Arc<ProviderState>) -> Router {
   let cors = build_cors_layer();
 
-  Router::new()
+  let health_routes = Router::new()
     .route("/health/live", get(health_live))
-    .route("/health/ready", get(health_ready))
+    .route("/health/ready", get(health_ready));
+
+  let api_routes = Router::new()
     .route(
       "/api/v1/runs/{run_id}/nodes/{node_name}/poke",
       post(handle_node_poke),
@@ -46,13 +48,17 @@ fn router(state: Arc<ProviderState>) -> Router {
     .route("/api/v1/runs/{run_id}/cancel", post(cancel_pipeline_run))
     .route("/api/v1/runs/{run_id}/status", get(get_run_status))
     .route("/webhooks/github", post(GithubProvider::handle_webhook))
-    .layer(cors)
     .layer(
       TraceLayer::new_for_http()
         .make_span_with(make_span)
         .on_request(DefaultOnRequest::new().level(Level::INFO))
         .on_response(DefaultOnResponse::new().level(Level::INFO)),
-    )
+    );
+
+  Router::new()
+    .merge(health_routes)
+    .merge(api_routes)
+    .layer(cors)
     .with_state(state)
 }
 
