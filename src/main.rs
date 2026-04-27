@@ -11,6 +11,10 @@ fn setup_tracing(log_level: Level) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+  rustls::crypto::ring::default_provider()
+    .install_default()
+    .map_err(|_| anyhow::anyhow!("Failed to install rustls crypto provider"))?;
+
   let config = AppConfig::load()?;
   setup_tracing(config.log_level());
   info!("Configuration loaded");

@@ -19,6 +19,7 @@ axum = "0.8.8"
 tower-http = { version = "0.6.8", features = ["cors", "trace"] }
 uuid = { version = "1.23.0", features = ["v4"] }
 reqwest = "0.13.2"
+rustls = { version = "0.23", features = ["ring"] }
 kube = { version = "3.1.0", features = ["client"] }
 k8s-openapi = { version = "0.27.1", features = ["v1_31"] }
 toml = "1.1.2"
@@ -49,3 +50,4 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 app_config = { workspace = true }
 server = { workspace = true }
+rustls = { workspace = true }
