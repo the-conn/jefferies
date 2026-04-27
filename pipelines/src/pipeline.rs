@@ -62,7 +62,8 @@ struct Refs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PipelineNode {
   name: String,
-  image: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  image: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   timeout_secs: Option<u64>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,7 +134,7 @@ impl Pipeline {
       .iter()
       .map(|n| NodeInfo {
         name: n.name.clone(),
-        image: n.image.clone(),
+        image: n.image.clone().unwrap_or_default(),
         steps: n.steps.iter().map(step_command).collect(),
         dependencies: n.after.clone(),
         timeout_secs: n.timeout_secs,
@@ -219,7 +220,7 @@ mod tests {
 
     let first_node = &pipeline.nodes[0];
     assert!(
-      first_node.image.contains("rust"),
+      first_node.image.as_deref().unwrap_or("").contains("rust"),
       "First node should use a Rust image"
     );
 
@@ -312,6 +313,20 @@ nodes:
     let pipeline = Pipeline::from_yaml(yaml).unwrap();
     assert!(!pipeline.triggered_by_push("main"));
     assert!(!pipeline.triggered_by_pull_request("main"));
+  }
+
+  #[test]
+  fn test_node_info_image_defaults_to_empty_when_absent() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert_eq!(infos[0].image, "");
   }
 
   #[test]

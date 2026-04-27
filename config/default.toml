@@ -26,6 +26,11 @@ bucket = "the-conn-runs"
 access_key = ""
 secret_key = ""
 
+[kubernetes]
+namespace = "jefferies-jobs"
+tube_image = "quay.io/the-conn/tube:latest"
+default_node_image = "fedora:45"
+
 # NEVER INCLUDE THESE IN A GIT REPO
 # This is meant as a reference and should be set
 # with environment variables in the Jefferies deployment

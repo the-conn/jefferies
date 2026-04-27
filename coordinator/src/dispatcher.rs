@@ -15,6 +15,8 @@ pub enum DispatchError {
   Failed(String),
   #[error("Source error: {0}")]
   Source(#[from] SourceError),
+  #[error("Kubernetes error: {0}")]
+  Kube(String),
 }
 
 #[async_trait]
