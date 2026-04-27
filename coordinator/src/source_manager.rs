@@ -5,14 +5,49 @@ use aws_sdk_s3::{
   Client,
   config::{BehaviorVersion, Credentials, Region},
   presigning::PresigningConfig,
-  primitives::{ByteStream, SdkBody},
-  types::{Delete, ObjectIdentifier},
+  primitives::ByteStream,
+  types::{
+    BucketLifecycleConfiguration, CompletedMultipartUpload, CompletedPart, Delete,
+    ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectIdentifier,
+  },
 };
+use aws_smithy_runtime_api::{
+  box_error::BoxError,
+  client::{
+    interceptors::{Intercept, context::BeforeTransmitInterceptorContextMut},
+    runtime_components::RuntimeComponents,
+  },
+};
+use aws_smithy_types::config_bag::ConfigBag;
+use http_body_util::BodyExt;
 use octocrab::Octocrab;
 use thiserror::Error;
 use tracing::info;
 
 const PRESIGN_EXPIRES_SECS: u64 = 43200;
+const PART_SIZE: usize = 8 * 1024 * 1024; // 8 MiB; S3 minimum is 5 MiB except for the last part
+
+#[derive(Debug)]
+struct ContentLengthZeroInterceptor;
+
+impl Intercept for ContentLengthZeroInterceptor {
+  fn name(&self) -> &'static str {
+    "ContentLengthZeroInterceptor"
+  }
+
+  fn modify_before_transmit(
+    &self,
+    context: &mut BeforeTransmitInterceptorContextMut<'_>,
+    _: &RuntimeComponents,
+    _: &mut ConfigBag,
+  ) -> Result<(), BoxError> {
+    let request = context.request_mut();
+    if !request.headers().contains_key("content-length") {
+      request.headers_mut().insert("content-length", "0");
+    }
+    Ok(())
+  }
+}
 
 #[derive(Error, Debug)]
 pub enum SourceError {
@@ -52,6 +87,7 @@ impl SourceManager {
       .region(Region::new("us-east-1"))
       .force_path_style(true)
       .behavior_version(BehaviorVersion::latest())
+      .interceptor(ContentLengthZeroInterceptor)
       .build();
 
     Self {
@@ -73,42 +109,134 @@ impl SourceManager {
       owner, repo, sha, "Streaming source tarball from GitHub to S3"
     );
 
-    let response = crab
+    let body = crab
       .repos(owner, repo)
       .download_tarball(sha.to_string())
       .await
-      .map_err(|e| SourceError::Download(e.to_string()))?;
-
-    let content_length = response
-      .headers()
-      .get("content-length")
-      .and_then(|v| v.to_str().ok())
-      .and_then(|v| v.parse::<i64>().ok());
+      .map_err(|e| SourceError::Download(e.to_string()))?
+      .into_body();
 
     let key = source_key(run_id);
-    info!(run_id, %key, "Uploading source tarball to S3");
+    info!(run_id, %key, "Starting multipart upload to S3");
 
-    let body = ByteStream::new(SdkBody::from_body_1_x(response.into_body()));
-
-    let mut req = self
+    let upload = self
       .s3
-      .put_object()
+      .create_multipart_upload()
       .bucket(&self.bucket)
       .key(&key)
       .content_type("application/gzip")
-      .body(body);
-
-    if let Some(length) = content_length {
-      req = req.content_length(length);
-    }
-
-    req
       .send()
       .await
       .map_err(|e| SourceError::S3(e.to_string()))?;
 
+    let upload_id = upload
+      .upload_id()
+      .ok_or_else(|| SourceError::S3("S3 did not return an upload ID".to_string()))?
+      .to_string();
+
+    match self.upload_parts(&key, &upload_id, body).await {
+      Ok(parts) => {
+        let completed = CompletedMultipartUpload::builder()
+          .set_parts(Some(parts))
+          .build();
+        self
+          .s3
+          .complete_multipart_upload()
+          .bucket(&self.bucket)
+          .key(&key)
+          .upload_id(&upload_id)
+          .multipart_upload(completed)
+          .send()
+          .await
+          .map_err(|e| SourceError::S3(e.to_string()))?;
+      }
+      Err(e) => {
+        let _ = self
+          .s3
+          .abort_multipart_upload()
+          .bucket(&self.bucket)
+          .key(&key)
+          .upload_id(&upload_id)
+          .send()
+          .await;
+        return Err(e);
+      }
+    }
+
     info!(run_id, %key, "Source tarball uploaded successfully");
     Ok(())
+  }
+
+  async fn upload_parts<B>(
+    &self,
+    key: &str,
+    upload_id: &str,
+    mut body: B,
+  ) -> Result<Vec<CompletedPart>, SourceError>
+  where
+    B: BodyExt + Unpin,
+    B::Data: AsRef<[u8]>,
+    B::Error: std::fmt::Display,
+  {
+    let mut parts = Vec::new();
+    let mut part_number = 1i32;
+    let mut buffer: Vec<u8> = Vec::new();
+
+    loop {
+      let body_done = loop {
+        if buffer.len() >= PART_SIZE {
+          break false;
+        }
+        match body.frame().await {
+          None => break true,
+          Some(Ok(frame)) => {
+            if let Ok(chunk) = frame.into_data() {
+              buffer.extend_from_slice(chunk.as_ref());
+            }
+          }
+          Some(Err(e)) => return Err(SourceError::Download(e.to_string())),
+        }
+      };
+
+      if buffer.is_empty() {
+        break;
+      }
+
+      let part_vec: Vec<u8> = if buffer.len() > PART_SIZE {
+        buffer.drain(..PART_SIZE).collect()
+      } else {
+        std::mem::take(&mut buffer)
+      };
+      let part_len = part_vec.len() as i64;
+
+      let part = self
+        .s3
+        .upload_part()
+        .bucket(&self.bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(part_number)
+        .content_length(part_len)
+        .body(ByteStream::from(part_vec))
+        .send()
+        .await
+        .map_err(|e| SourceError::S3(e.to_string()))?;
+
+      parts.push(
+        CompletedPart::builder()
+          .e_tag(part.e_tag().unwrap_or_default())
+          .part_number(part_number)
+          .build(),
+      );
+
+      part_number += 1;
+
+      if body_done {
+        break;
+      }
+    }
+
+    Ok(parts)
   }
 
   pub async fn get_source_url(&self, run_id: &str) -> Result<String, SourceError> {
@@ -141,7 +269,7 @@ impl SourceManager {
 
   pub async fn ping(&self) -> Result<(), SourceError> {
     match self.s3.head_bucket().bucket(&self.bucket).send().await {
-      Ok(_) => Ok(()),
+      Ok(_) => {}
       Err(e)
         if e
           .as_service_error()
@@ -155,10 +283,37 @@ impl SourceManager {
           .send()
           .await
           .map_err(|e| SourceError::S3(e.to_string()))?;
-        Ok(())
       }
-      Err(e) => Err(SourceError::S3(e.to_string())),
+      Err(e) => return Err(SourceError::S3(e.to_string())),
     }
+    self.apply_lifecycle_policy().await
+  }
+
+  async fn apply_lifecycle_policy(&self) -> Result<(), SourceError> {
+    let expiration_days = PRESIGN_EXPIRES_SECS.div_ceil(86400) as i32;
+
+    let rule = LifecycleRule::builder()
+      .id("run-artifact-expiration")
+      .filter(LifecycleRuleFilter::builder().prefix("runs/").build())
+      .expiration(LifecycleExpiration::builder().days(expiration_days).build())
+      .status(ExpirationStatus::Enabled)
+      .build()
+      .map_err(|e| SourceError::S3(e.to_string()))?;
+
+    let config = BucketLifecycleConfiguration::builder()
+      .rules(rule)
+      .build()
+      .map_err(|e| SourceError::S3(e.to_string()))?;
+
+    self
+      .s3
+      .put_bucket_lifecycle_configuration()
+      .bucket(&self.bucket)
+      .lifecycle_configuration(config)
+      .send()
+      .await
+      .map_err(|e| SourceError::S3(e.to_string()))?;
+    Ok(())
   }
 
   pub async fn get_node_status(

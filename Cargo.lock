@@ -857,6 +857,8 @@ dependencies = [
  "app_config",
  "async-trait",
  "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "backplane",
  "http-body-util",
  "octocrab",
