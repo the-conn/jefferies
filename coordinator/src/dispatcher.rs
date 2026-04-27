@@ -33,6 +33,8 @@ pub trait Dispatcher: Send + Sync {
     node_name: &str,
     config: &AppConfig,
   ) -> Result<(), DispatchError>;
+
+  async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError>;
 }
 
 pub struct LogDispatcher {
@@ -91,6 +93,11 @@ impl Dispatcher for LogDispatcher {
     _config: &AppConfig,
   ) -> Result<(), DispatchError> {
     info!(run_id, node_name, "Cancelling node");
+    Ok(())
+  }
+
+  async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError> {
+    info!(run_id, "Skipping S3 cleanup (LogDispatcher)");
     Ok(())
   }
 }

@@ -5,14 +5,14 @@ use aws_sdk_s3::{
   Client,
   config::{BehaviorVersion, Credentials, Region},
   presigning::PresigningConfig,
-  primitives::ByteStream,
+  primitives::{ByteStream, SdkBody},
+  types::{Delete, ObjectIdentifier},
 };
-use http_body_util::BodyExt;
 use octocrab::Octocrab;
 use thiserror::Error;
 use tracing::info;
 
-const PRESIGN_EXPIRES_SECS: u64 = 3600;
+const PRESIGN_EXPIRES_SECS: u64 = 43200;
 
 #[derive(Error, Debug)]
 pub enum SourceError {
@@ -61,35 +61,41 @@ impl SourceManager {
     sha: &str,
     crab: &Octocrab,
   ) -> Result<(), SourceError> {
-    let tarball_url = format!("https://api.github.com/repos/{owner}/{repo}/tarball/{sha}");
     info!(
       run_id,
-      owner, repo, sha, "Downloading source tarball from GitHub"
+      owner, repo, sha, "Streaming source tarball from GitHub to S3"
     );
 
     let response = crab
-      ._get(&tarball_url)
+      .repos(owner, repo)
+      .download_tarball(sha.to_string())
       .await
       .map_err(|e| SourceError::Download(e.to_string()))?;
 
-    let bytes = response
-      .into_body()
-      .collect()
-      .await
-      .map_err(|e| SourceError::Download(e.to_string()))?
-      .to_bytes();
+    let content_length = response
+      .headers()
+      .get("content-length")
+      .and_then(|v| v.to_str().ok())
+      .and_then(|v| v.parse::<i64>().ok());
 
     let key = source_key(run_id);
-    let size = bytes.len();
-    info!(run_id, bytes = size, %key, "Uploading source tarball to S3");
+    info!(run_id, %key, "Uploading source tarball to S3");
 
-    self
+    let body = ByteStream::new(SdkBody::from_body_1_x(response.into_body()));
+
+    let mut req = self
       .s3
       .put_object()
       .bucket(&self.bucket)
       .key(&key)
       .content_type("application/gzip")
-      .body(ByteStream::from(bytes))
+      .body(body);
+
+    if let Some(length) = content_length {
+      req = req.content_length(length);
+    }
+
+    req
       .send()
       .await
       .map_err(|e| SourceError::S3(e.to_string()))?;
@@ -124,6 +130,73 @@ impl SourceManager {
       .map_err(|e| SourceError::Presign(e.to_string()))?;
 
     Ok(presigned.uri().to_string())
+  }
+
+  pub async fn ping(&self) -> Result<(), SourceError> {
+    match self.s3.head_bucket().bucket(&self.bucket).send().await {
+      Ok(_) => Ok(()),
+      Err(e)
+        if e
+          .as_service_error()
+          .map(|se| se.is_not_found())
+          .unwrap_or(false) =>
+      {
+        self
+          .s3
+          .create_bucket()
+          .bucket(&self.bucket)
+          .send()
+          .await
+          .map_err(|e| SourceError::S3(e.to_string()))?;
+        Ok(())
+      }
+      Err(e) => Err(SourceError::S3(e.to_string())),
+    }
+  }
+
+  pub async fn cleanup_run(&self, run_id: &str) -> Result<(), SourceError> {
+    let prefix = format!("runs/{run_id}/");
+
+    let listed = self
+      .s3
+      .list_objects_v2()
+      .bucket(&self.bucket)
+      .prefix(&prefix)
+      .send()
+      .await
+      .map_err(|e| SourceError::S3(e.to_string()))?;
+
+    let identifiers: Vec<ObjectIdentifier> = listed
+      .contents()
+      .iter()
+      .filter_map(|obj| {
+        obj
+          .key()
+          .and_then(|k| ObjectIdentifier::builder().key(k).build().ok())
+      })
+      .collect();
+
+    if identifiers.is_empty() {
+      return Ok(());
+    }
+
+    let delete = Delete::builder()
+      .set_objects(Some(identifiers))
+      .quiet(true)
+      .build()
+      .map_err(|e| SourceError::S3(e.to_string()))?;
+
+    self
+      .s3
+      .delete_objects()
+      .bucket(&self.bucket)
+      .delete(delete)
+      .send()
+      .await
+      .map_err(|e| SourceError::S3(e.to_string()))?;
+
+    info!(run_id, %prefix, "Cleaned up S3 objects for run");
+    Ok(())
   }
 }
 

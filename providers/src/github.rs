@@ -210,20 +210,19 @@ async fn launch_coordinator_for_pipeline(
   let run_id = Uuid::new_v4().to_string();
 
   let needs_source = pipeline.node_info().iter().any(|n| n.checkout);
-  if needs_source {
-    if let Err(e) = state
+  if needs_source
+    && let Err(e) = state
       .source_manager
       .upload_source(&run_id, owner, repo, sha, install_crab)
       .await
-    {
-      warn!(
-        run_id,
-        pipeline_name = pipeline.name(),
-        error = %e,
-        "Failed to upload source tarball; aborting run"
-      );
-      return;
-    }
+  {
+    warn!(
+      run_id,
+      pipeline_name = pipeline.name(),
+      error = %e,
+      "Failed to upload source tarball; aborting run"
+    );
+    return;
   }
 
   let pipeline_arc = Arc::new(pipeline.clone());

@@ -11,7 +11,7 @@
 
 #### **A. app_config (The Foundation)**
 * **Layered Configuration:** Loads defaults from TOML and overrides them via environment variables using a double-underscore (`__`) separator for nested fields.
-* **Secrets Management:** Handles sensitive credentials for **Redis**, **RabbitMQ**, and **GitHub** injected via OpenShift SecretKeyRefs.
+* **Secrets Management:** Handles sensitive credentials for **Redis**, **RabbitMQ**, **GitHub**, and **S3/NooBaa** injected via OpenShift SecretKeyRefs.
 
 #### **B. providers (The Gatekeeper)**
 * **GitHub Logic:** Contains the HMAC-SHA256 signature verification logic to ensure webhooks are authentic.
@@ -36,6 +36,7 @@
 * **Version-Fenced Writes:** Persists `RunState` to Redis after every node transition using optimistic concurrency. A rejected write (version conflict) causes the coordinator to stop immediately.
 * **Event Handling:** Consumes `NodeCompleted` and `Cancel` messages from the backplane, updates in-memory state, and dispatches newly unlocked nodes.
 * **The Reaper:** A background task that identifies orphaned runs (Running nodes in Redis but no active lease) and reclaims them by re-acquiring the lease and resuming from persisted state.
+* **SourceManager:** Handles all S3/NooBaa interactions for a run. When a pipeline contains at least one node with `checkout: true`, the `SourceManager` streams the repository tarball directly from the GitHub API to S3 at `runs/{run_id}/source.tar.gz` before the coordinator starts — with no intermediate disk writes. It generates 12-hour presigned GET URLs for the source archive and presigned PUT URLs for per-node status payloads at `runs/{run_id}/nodes/{node_name}/status.json`. On run finalization, it issues a bulk delete of all objects under the `runs/{run_id}/` prefix.
 
 #### **G. server (The Interface)**
 * **Stateless Endpoints:** Axum handlers for GitHub webhooks and the secure status callbacks from **Tubes**.
@@ -46,12 +47,13 @@
 ### **3. Data & Execution Flow**
 
 1.  **Ingress:** A Webhook hits a **server** node. **providers** validates the signature and reads the pipeline YAML.
-2.  **Initialization:** **coordinator** acquires a Redis lease and persists the initial `RunState`. All nodes with no dependencies are dispatched immediately.
-3.  **Execution Loop:**
+2.  **Source Upload:** If the pipeline has any node with `checkout: true`, **providers** calls the **SourceManager** to stream the repository tarball from GitHub directly to S3 at `runs/{run_id}/source.tar.gz` before the coordinator is started.
+3.  **Initialization:** **coordinator** acquires a Redis lease and persists the initial `RunState`. All nodes with no dependencies are dispatched immediately. The **Dispatcher** uses the **SourceManager** to generate presigned URLs that are passed to each worker as environment variables.
+4.  **Execution Loop:**
     * **Tubes** finishes a task and hits the **server** status endpoint.
     * The **server** publishes a `NodeCompleted` event to **RabbitMQ**.
     * The leasing **coordinator** reacts, updates the versioned Redis state, identifies "unlocked" nodes, and triggers the next Pods.
-4.  **Cleanup:** Once all nodes reach a terminal state, the coordinator releases the lease and deletes the run state from Redis.
+5.  **Cleanup:** Once all nodes reach a terminal state, the coordinator calls the **SourceManager** to delete all S3 objects for the run, releases the lease, and deletes the run state from Redis.
 
 ---
 
