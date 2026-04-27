@@ -454,30 +454,6 @@ mod tests {
   }
 
   fn make_config() -> Arc<AppConfig> {
-    unsafe {
-      std::env::set_var("JEFFERIES__SERVER__HOST", "127.0.0.1");
-      std::env::set_var("JEFFERIES__SERVER__PORT", "3000");
-      std::env::set_var("JEFFERIES__LOG__LEVEL", "info");
-      std::env::set_var("JEFFERIES__GITHUB__APP_ID", "test");
-      std::env::set_var("JEFFERIES__GITHUB__WEBHOOK_SECRET", "test");
-      std::env::set_var("JEFFERIES__GITHUB__CLIENT_ID", "test");
-      std::env::set_var("JEFFERIES__GITHUB__CLIENT_SECRET", "test");
-      std::env::set_var("JEFFERIES__GITHUB__PRIVATE_KEY", "test");
-      std::env::set_var("JEFFERIES__PIPELINE__DEFAULT_PIPELINE_TIMEOUT_SECS", "300");
-      std::env::set_var("JEFFERIES__PIPELINE__DEFAULT_NODE_TIMEOUT_SECS", "60");
-      std::env::set_var("JEFFERIES__PIPELINE__FAIL_FAST", "false");
-      std::env::set_var("JEFFERIES__REDIS__URL", "redis://localhost:6379");
-      std::env::set_var("JEFFERIES__REDIS__PASSWORD", "");
-      std::env::set_var(
-        "JEFFERIES__RABBITMQ__URL",
-        "amqp://guest:guest@localhost:5672",
-      );
-      std::env::set_var("JEFFERIES__RABBITMQ__POOL__MAX_SIZE", "16");
-      std::env::set_var("JEFFERIES__S3__ENDPOINT", "http://localhost:9000");
-      std::env::set_var("JEFFERIES__S3__BUCKET", "the-conn-runs");
-      std::env::set_var("JEFFERIES__S3__ACCESS_KEY", "");
-      std::env::set_var("JEFFERIES__S3__SECRET_KEY", "");
-    }
     Arc::new(AppConfig::load().expect("test config"))
   }
 

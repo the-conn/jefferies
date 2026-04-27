@@ -75,6 +75,8 @@ pub trait StateStore: Send + Sync {
   async fn release_lease(&self, run_id: &str) -> Result<(), StateStoreError>;
 
   async fn get_orphaned_runs(&self) -> Result<Vec<String>, StateStoreError>;
+
+  async fn ping(&self) -> Result<(), StateStoreError>;
 }
 
 fn state_key(run_id: &str) -> String {
@@ -117,14 +119,6 @@ impl RedisStateStore {
       .map_err(|e| StateStoreError::Store(e.to_string()))?;
 
     Ok(Self { pool })
-  }
-
-  pub async fn ping(&self) -> Result<(), StateStoreError> {
-    let mut conn = self.pool.get().await?;
-    let _: String = deadpool_redis::redis::cmd("PING")
-      .query_async(&mut conn)
-      .await?;
-    Ok(())
   }
 }
 
@@ -321,6 +315,14 @@ impl StateStore for RedisStateStore {
 
     Ok(orphaned)
   }
+
+  async fn ping(&self) -> Result<(), StateStoreError> {
+    let mut conn = self.pool.get().await?;
+    let _: String = deadpool_redis::redis::cmd("PING")
+      .query_async(&mut conn)
+      .await?;
+    Ok(())
+  }
 }
 
 struct InMemoryRunEntry {
@@ -446,6 +448,10 @@ impl StateStore for InMemoryStateStore {
       .map(|(run_id, _)| run_id.clone())
       .collect();
     Ok(orphaned)
+  }
+
+  async fn ping(&self) -> Result<(), StateStoreError> {
+    Ok(())
   }
 }
 

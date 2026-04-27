@@ -41,6 +41,8 @@ pub trait Backplane: Send + Sync {
 
   async fn publish_cancel(&self, run_id: &str) -> Result<(), BackplaneError>;
 
+  async fn ping(&self) -> Result<(), BackplaneError>;
+
   async fn subscribe_run(
     &self,
     run_id: &str,
@@ -69,11 +71,6 @@ impl RabbitmqBackplane {
       .create_pool(Some(deadpool_lapin::Runtime::Tokio1))
       .map_err(|e| BackplaneError::Other(e.to_string()))?;
     Ok(Self { pool })
-  }
-
-  pub async fn ping(&self) -> Result<(), BackplaneError> {
-    let _conn = self.pool.get().await?;
-    Ok(())
   }
 
   async fn publish_event(
@@ -133,6 +130,11 @@ impl Backplane for RabbitmqBackplane {
 
   async fn publish_cancel(&self, run_id: &str) -> Result<(), BackplaneError> {
     self.publish_event(run_id, &BackplaneEvent::Cancel).await
+  }
+
+  async fn ping(&self) -> Result<(), BackplaneError> {
+    let _conn = self.pool.get().await?;
+    Ok(())
   }
 
   async fn subscribe_run(
@@ -276,6 +278,10 @@ impl Backplane for InMemoryBackplane {
 
   async fn publish_cancel(&self, run_id: &str) -> Result<(), BackplaneError> {
     self.publish_event(run_id, BackplaneEvent::Cancel).await
+  }
+
+  async fn ping(&self) -> Result<(), BackplaneError> {
+    Ok(())
   }
 
   async fn subscribe_run(

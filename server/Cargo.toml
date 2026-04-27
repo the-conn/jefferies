@@ -15,3 +15,6 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 app_config = { workspace = true }
 providers = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

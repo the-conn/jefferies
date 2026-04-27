@@ -1,0 +1,6 @@
+[github]
+app_id = "test"
+webhook_secret = "test"
+client_id = "test"
+client_secret = "test"
+private_key = "test"
