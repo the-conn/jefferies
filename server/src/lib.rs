@@ -17,7 +17,7 @@ use tower_http::{
   cors::CorsLayer,
   trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
-use tracing::{Level, error, info, warn};
+use tracing::{Level, debug, error, info, warn};
 
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -101,13 +101,19 @@ async fn shutdown_signal() {
   }
 }
 
-async fn verify_connections(state: &ProviderState) -> Result<(), ServerError> {
-  info!(url = %state.config.redis_url(), "Checking Redis connection...");
+async fn verify_connections(state: &ProviderState, verbose: bool) -> Result<(), ServerError> {
+  macro_rules! conn_info {
+    ($($arg:tt)*) => {
+      if verbose { info!($($arg)*); } else { debug!($($arg)*); }
+    };
+  }
+
+  conn_info!(url = %state.config.redis_url(), "Checking Redis connection...");
   state.state_store.ping().await.map_err(|e| {
     error!(url = %state.config.redis_url(), error = %e, "Failed to connect to Redis");
     ServerError::ConnectionFailed(format!("Redis: {e}"))
   })?;
-  info!(url = %state.config.redis_url(), "Redis connection successful");
+  conn_info!(url = %state.config.redis_url(), "Redis connection successful");
 
   let scheme = state
     .config
@@ -125,20 +131,20 @@ async fn verify_connections(state: &ProviderState) -> Result<(), ServerError> {
     true => host_part.to_string(),
     false => format!("{}://{}", scheme, host_part),
   };
-  info!(url = sanitized_url, "Checking RabbitMQ connection...");
+  conn_info!(url = sanitized_url, "Checking RabbitMQ connection...");
   state.backplane.ping().await.map_err(|e| {
     error!(url = sanitized_url, error = %e, "Failed to connect to RabbitMQ");
     ServerError::ConnectionFailed(format!("RabbitMQ: {e}"))
   })?;
-  info!(url = sanitized_url, "RabbitMQ connection successful");
+  conn_info!(url = sanitized_url, "RabbitMQ connection successful");
 
-  info!(
+  conn_info!(
     endpoint = %state.config.s3_endpoint(),
     bucket = %state.config.s3_bucket(),
     "Checking S3 connection..."
   );
   state.source_manager.ping().await?;
-  info!(
+  conn_info!(
     endpoint = %state.config.s3_endpoint(),
     bucket = %state.config.s3_bucket(),
     "S3 connection successful"
@@ -173,7 +179,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     source_manager,
   ));
 
-  verify_connections(&state).await?;
+  verify_connections(&state, true).await?;
 
   let _reaper = start_reaper(
     shared_config.clone(),
@@ -197,7 +203,7 @@ async fn health_live() -> StatusCode {
 
 async fn health_ready(State(state): State<Arc<ProviderState>>) -> StatusCode {
   const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-  match tokio::time::timeout(PROBE_TIMEOUT, verify_connections(&state)).await {
+  match tokio::time::timeout(PROBE_TIMEOUT, verify_connections(&state, false)).await {
     Ok(Ok(())) => StatusCode::OK,
     Ok(Err(e)) => {
       warn!(error = %e, "Readiness check failed");
