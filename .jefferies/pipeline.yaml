@@ -29,5 +29,6 @@ nodes:
     env:
       HOME: /tmp
       BUILDAH_ISOLATION: chroot
+      STORAGE_DRIVER: vfs
     steps:
       - buildah bud -f Containerfile -t the-conn-backend .
