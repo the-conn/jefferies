@@ -22,7 +22,9 @@ nodes:
     env:
       ENV: TEST
     steps:
-      - cp -r config app_config/config
+      - ls -ld app_config/config
+      - ls -L app_config/config
+      - pwd
       - cargo test --all-features --workspace
 
   - name: Build Image
