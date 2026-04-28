@@ -114,7 +114,7 @@ fn build_env_vars(
   port: u16,
 ) -> Vec<EnvVar> {
   let poke_url = format!(
-    "http://jefferies.jefferies.svc.cluster.local:{port}/api/v1/runs/{run_id}/nodes/{node_name}/poke"
+    "http://jefferies.jefferies.svc.cluster.local.:{port}/api/v1/runs/{run_id}/nodes/{node_name}/poke"
   );
   vec![
     env_var("TUBE__EXECUTION__USER_SCRIPT_PATH", "/etc/conn/script.sh"),
