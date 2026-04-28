@@ -22,6 +22,7 @@ nodes:
     env:
       ENV: TEST
     steps:
+      - ln -s ../config app_config/config
       - cargo test --all-features --workspace
 
   - name: Build Image
