@@ -26,5 +26,8 @@ nodes:
     image: quay.io/buildah/stable
     checkout: true
     after: ["Unit Tests"]
+    env:
+      HOME: /tmp
+      BUILDAH_ISOLATION: chroot
     steps:
       - buildah bud -f Containerfile -t the-conn-backend .
