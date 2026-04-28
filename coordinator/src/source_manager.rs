@@ -267,6 +267,21 @@ impl SourceManager {
     Ok(presigned.uri().to_string())
   }
 
+  pub async fn put_logs_url(&self, run_id: &str, node_name: &str) -> Result<String, SourceError> {
+    let key = logs_key(run_id, node_name);
+    let presigned = self
+      .s3
+      .put_object()
+      .bucket(&self.bucket)
+      .key(&key)
+      .content_type("text/plain")
+      .presigned(presign_config()?)
+      .await
+      .map_err(|e| SourceError::Presign(e.to_string()))?;
+
+    Ok(presigned.uri().to_string())
+  }
+
   pub async fn ping(&self) -> Result<(), SourceError> {
     match self.s3.head_bucket().bucket(&self.bucket).send().await {
       Ok(_) => {}
@@ -405,6 +420,10 @@ fn source_key(run_id: &str) -> String {
 
 fn status_key(run_id: &str, node_name: &str) -> String {
   format!("runs/{run_id}/nodes/{node_name}/status.json")
+}
+
+fn logs_key(run_id: &str, node_name: &str) -> String {
+  format!("runs/{run_id}/nodes/{node_name}/output.log")
 }
 
 fn presign_config() -> Result<PresigningConfig, SourceError> {

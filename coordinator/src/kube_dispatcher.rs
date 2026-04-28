@@ -12,7 +12,7 @@ use k8s_openapi::{
   },
   apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::ObjectMeta},
 };
-use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::api::{DeleteParams, PostParams};
 use pipelines::{NodeInfo, Pipeline};
 use tracing::{info, warn};
 
@@ -104,7 +104,13 @@ fn env_var(name: &str, value: &str) -> EnvVar {
   }
 }
 
-fn build_env_vars(run_id: &str, node_name: &str, put_url: &str, get_url: &str) -> Vec<EnvVar> {
+fn build_env_vars(
+  run_id: &str,
+  node_name: &str,
+  status_put_url: &str,
+  logs_put_url: &str,
+  get_url: &str,
+) -> Vec<EnvVar> {
   let poke_url = format!(
     "http://jefferies.jefferies.svc.cluster.local./api/v1/runs/{run_id}/nodes/{node_name}/poke"
   );
@@ -112,9 +118,11 @@ fn build_env_vars(run_id: &str, node_name: &str, put_url: &str, get_url: &str) -
     env_var("TUBE__EXECUTION__USER_SCRIPT_PATH", "/etc/conn/script.sh"),
     env_var("TUBE__EXECUTION__RUN_ID", run_id),
     env_var("TUBE__EXECUTION__NODE_NAME", node_name),
-    env_var("TUBE__EXECUTION__PUT_URL", put_url),
+    env_var("TUBE__EXECUTION__STATUS_PUT_URL", status_put_url),
+    env_var("TUBE__EXECUTION__LOGS_PUT_URL", logs_put_url),
     env_var("TUBE__EXECUTION__POKE_URL", &poke_url),
-    env_var("TUBE__LOG__LEVEL", "info"),
+    env_var("TUBE__EXECUTION__LOG_LEVEL", "info"),
+    env_var("TUBE__LOG__LEVEL", "warn"),
     env_var("TUBE__WORKSPACE__GET_URL", get_url),
     env_var("TUBE__WORKSPACE__DIR", "/workspace"),
   ]
@@ -143,10 +151,11 @@ impl Dispatcher for KubeDispatcher {
     _pipeline: &Pipeline,
     _config: &AppConfig,
   ) -> Result<(), DispatchError> {
-    let put_url = self
+    let status_put_url = self
       .source_manager
       .put_status_url(run_id, &node.name)
       .await?;
+    let logs_put_url = self.source_manager.put_logs_url(run_id, &node.name).await?;
     let get_url = self.source_manager.get_source_url(run_id).await?;
 
     let cm_name = configmap_name(run_id, &node.name);
@@ -156,7 +165,7 @@ impl Dispatcher for KubeDispatcher {
       .await?;
 
     let labels = run_labels(run_id);
-    let env_vars = build_env_vars(run_id, &node.name, &put_url, &get_url);
+    let env_vars = build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
     let job = self.build_job(run_id, &node.name, node, &cm_name, labels, env_vars);
 
     let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
@@ -194,23 +203,23 @@ impl Dispatcher for KubeDispatcher {
     Ok(())
   }
 
-  async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError> {
-    let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
+  async fn cleanup_run(&self, _run_id: &str) -> Result<(), DispatchError> {
+    // let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
 
-    let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
-    if let Err(e) = jobs
-      .delete_collection(&DeleteParams::background(), &lp)
-      .await
-    {
-      warn!(run_id, error = %e, "Failed to delete Job collection");
-    }
+    // let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
+    // if let Err(e) = jobs
+    //   .delete_collection(&DeleteParams::background(), &lp)
+    //   .await
+    // {
+    //   warn!(run_id, error = %e, "Failed to delete Job collection");
+    // }
 
-    let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), &self.namespace);
-    if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
-      warn!(run_id, error = %e, "Failed to delete ConfigMap collection");
-    }
+    // let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), &self.namespace);
+    // if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
+    //   warn!(run_id, error = %e, "Failed to delete ConfigMap collection");
+    // }
 
-    self.source_manager.cleanup_run(run_id).await?;
+    // self.source_manager.cleanup_run(run_id).await?;
     Ok(())
   }
 }

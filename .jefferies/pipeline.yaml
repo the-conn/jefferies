@@ -7,18 +7,20 @@ on:
 
 nodes:
   - name: Lint and Format
-    image: rust:1.94.1-slim
+    image: rust:1.95-slim
     checkout: true
     steps:
-      - cargo fmt --check
+      - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+      - cargo +nightly fmt --check
+      - rustup component add clippy
       - cargo clippy -- -D warnings
 
   - name: Unit Tests
-    image: rust:1.94.1-slim
+    image: rust:1.95-slim
     after: ["Lint and Format"]
     checkout: true
     steps:
-      - cargo test
+      - ENV=TEST cargo test --all-features --workspace
 
   - name: Build Image
     image: quay.io/podman/stable
