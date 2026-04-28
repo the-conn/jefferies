@@ -28,7 +28,17 @@ nodes:
     after: ["Unit Tests"]
     env:
       HOME: /tmp
-      BUILDAH_ISOLATION: chroot
-      STORAGE_DRIVER: vfs
+      XDG_CONFIG_HOME: /tmp/.config
     steps:
-      - buildah bud --storage-driver vfs --isolation chroot -f Containerfile -t jefferies:latest .
+      - mkdir -p /tmp/.config/containers
+      - |
+        echo '[storage]
+        driver = "vfs"
+        runroot = "/tmp/runroot"
+        graphroot = "/tmp/graphroot"
+        [storage.options]
+        additionalimagestores = []
+        [storage.options.vfs]
+        ignore_chown_errors = "true"' > /tmp/.config/containers/storage.conf
+
+      - buildah bud --isolation chroot -f Containerfile -t jefferies:latest .
