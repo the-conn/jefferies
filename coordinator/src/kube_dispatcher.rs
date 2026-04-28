@@ -27,7 +27,6 @@ pub struct KubeDispatcher {
   namespace: String,
   tube_image: String,
   default_node_image: String,
-  port: u16,
 }
 
 impl KubeDispatcher {
@@ -44,7 +43,6 @@ impl KubeDispatcher {
       namespace: config.kubernetes_namespace().to_string(),
       tube_image: config.tube_image().to_string(),
       default_node_image: config.default_node_image().to_string(),
-      port: config.port(),
     })
   }
 }
@@ -106,15 +104,9 @@ fn env_var(name: &str, value: &str) -> EnvVar {
   }
 }
 
-fn build_env_vars(
-  run_id: &str,
-  node_name: &str,
-  put_url: &str,
-  get_url: &str,
-  port: u16,
-) -> Vec<EnvVar> {
+fn build_env_vars(run_id: &str, node_name: &str, put_url: &str, get_url: &str) -> Vec<EnvVar> {
   let poke_url = format!(
-    "http://jefferies.jefferies.svc.cluster.local.:{port}/api/v1/runs/{run_id}/nodes/{node_name}/poke"
+    "http://jefferies.jefferies.svc.cluster.local./api/v1/runs/{run_id}/nodes/{node_name}/poke"
   );
   vec![
     env_var("TUBE__EXECUTION__USER_SCRIPT_PATH", "/etc/conn/script.sh"),
@@ -164,7 +156,7 @@ impl Dispatcher for KubeDispatcher {
       .await?;
 
     let labels = run_labels(run_id);
-    let env_vars = build_env_vars(run_id, &node.name, &put_url, &get_url, self.port);
+    let env_vars = build_env_vars(run_id, &node.name, &put_url, &get_url);
     let job = self.build_job(run_id, &node.name, node, &cm_name, labels, env_vars);
 
     let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
@@ -248,6 +240,7 @@ impl KubeDispatcher {
       },
       spec: Some(JobSpec {
         active_deadline_seconds: node.timeout_secs.map(|t| t as i64),
+        backoff_limit: Some(0),
         template: PodTemplateSpec {
           metadata: Some(ObjectMeta {
             labels: Some(labels),
