@@ -61,6 +61,60 @@
     * The leasing **coordinator** reacts, updates the versioned Redis state, identifies "unlocked" nodes, and triggers the next Pods.
 5.  **Cleanup:** Once all nodes reach a terminal state, the coordinator calls the **SourceManager** to delete all S3 objects for the run, releases the lease, and deletes the run state from Redis.
 
+#### **Execution Flow Diagram**
+
+> **Note:** The current terminal step is S3 artifact cleanup. A Postgres-backed run history store is planned as the next step to persist run outcomes beyond the lifetime of the S3 artifacts.
+
+```mermaid
+flowchart TD
+    GH([GitHub])
+    REAPER([Reaper - every 60 s])
+    SRV["Server<br/>Validate HMAC-SHA256, parse pipeline YAML"]
+    POKE["Server poke handler<br/>GET status.json from S3"]
+
+    subgraph infra [Infrastructure]
+        REDIS[(Redis<br/>State + Leases)]
+        RMQ[(RabbitMQ<br/>jefferies.events)]
+        S3[(S3 / NooBaa<br/>Artifacts)]
+    end
+
+    subgraph coord [Coordinator]
+        COORD_INIT["Acquire Redis lease<br/>Init RunState - all nodes Pending"]
+        DEP["Evaluate dependency graph<br/>Dispatch ready nodes"]
+        REACT["Consume BackplaneEvent<br/>Version-fenced RunState write"]
+        CLEAN["Cleanup<br/>Bulk delete S3 artifacts<br/>Release lease and RunState"]
+
+        COORD_INIT --> DEP
+        REACT -->|unlock dependent nodes| DEP
+        REACT -->|all nodes terminal| CLEAN
+    end
+
+    subgraph kube [Kubernetes - one Job per execution node]
+        KDISP["KubeDispatcher<br/>Create ConfigMap + K8s Job"]
+        POD_A["Tube: Node A<br/>execute steps in user image"]
+        POD_B["Tube: Node B<br/>execute steps in user image"]
+
+        KDISP --> POD_A & POD_B
+    end
+
+    GH -->|POST /webhooks/github| SRV
+    SRV -->|stream repo tarball to S3| S3
+    SRV --> COORD_INIT
+    COORD_INIT -.->|heartbeat every 15 s| REDIS
+    DEP -->|presigned S3 URLs injected as env vars| KDISP
+
+    POD_A & POD_B -->|PUT status.json + output.log| S3
+    POD_A & POD_B -->|POST /poke| POKE
+
+    POKE -->|publish NodeCompleted| RMQ
+    RMQ -->|route to leasing coordinator| REACT
+    REACT -->|version-fenced CAS write| REDIS
+    CLEAN -->|bulk delete run artifacts| S3
+    CLEAN -->|release lease| REDIS
+
+    REAPER -.->|orphaned run detected, no active lease| COORD_INIT
+```
+
 ---
 
 ### **4. Resiliency & Error Handling**
