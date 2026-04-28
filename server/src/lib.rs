@@ -8,7 +8,7 @@ use axum::{
   routing::{get, post},
 };
 use backplane::RabbitmqBackplane;
-use coordinator::{LogDispatcher, SourceError, SourceManager, start_reaper};
+use coordinator::{KubeDispatcher, SourceError, SourceManager, start_reaper};
 use providers::{GithubProvider, ProviderState};
 use state_store::RunState;
 use thiserror::Error;
@@ -172,10 +172,11 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
 
   let source_manager = Arc::new(SourceManager::new(&shared_config));
 
-  let dispatcher = Arc::new(LogDispatcher::new(
-    backplane.clone(),
-    source_manager.clone(),
-  ));
+  let dispatcher = Arc::new(
+    KubeDispatcher::new(&shared_config, source_manager.clone())
+      .await
+      .map_err(|e| ServerError::ConnectionFailed(format!("Kubernetes: {e}")))?,
+  );
 
   let state = Arc::new(ProviderState::new(
     shared_config.clone(),

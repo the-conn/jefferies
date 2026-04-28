@@ -64,6 +64,13 @@ struct S3Config {
 }
 
 #[derive(Debug, Deserialize)]
+struct KubernetesConfig {
+  namespace: String,
+  tube_image: String,
+  default_node_image: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AppConfig {
   server: ServerConfig,
   log: LogConfig,
@@ -72,6 +79,7 @@ pub struct AppConfig {
   redis: RedisConfig,
   rabbitmq: RabbitmqConfig,
   s3: S3Config,
+  kubernetes: KubernetesConfig,
 }
 
 impl AppConfig {
@@ -166,5 +174,17 @@ impl AppConfig {
 
   pub fn s3_secret_key(&self) -> &str {
     &self.s3.secret_key
+  }
+
+  pub fn kubernetes_namespace(&self) -> &str {
+    &self.kubernetes.namespace
+  }
+
+  pub fn tube_image(&self) -> &str {
+    &self.kubernetes.tube_image
+  }
+
+  pub fn default_node_image(&self) -> &str {
+    &self.kubernetes.default_node_image
   }
 }

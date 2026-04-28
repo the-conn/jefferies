@@ -20,3 +20,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 state_store = { workspace = true }
 backplane = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }

@@ -37,6 +37,12 @@
 * **Event Handling:** Consumes `NodeCompleted` and `Cancel` messages from the backplane, updates in-memory state, and dispatches newly unlocked nodes.
 * **The Reaper:** A background task that identifies orphaned runs (Running nodes in Redis but no active lease) and reclaims them by re-acquiring the lease and resuming from persisted state.
 * **SourceManager:** Handles all S3/NooBaa interactions for a run. When a pipeline contains at least one node with `checkout: true`, the `SourceManager` streams the repository tarball directly from the GitHub API to S3 at `runs/{run_id}/source.tar.gz` before the coordinator starts — with no intermediate disk writes. It generates 12-hour presigned GET URLs for the source archive and presigned PUT URLs for per-node status payloads at `runs/{run_id}/nodes/{node_name}/status.json`. On run finalization, it issues a bulk delete of all objects under the `runs/{run_id}/` prefix.
+* **KubeDispatcher:** The live `Dispatcher` implementation that actuates each pipeline node as a Kubernetes Job in the configured namespace (`jefferies-jobs` by default, overridable via `JEFFERIES__KUBERNETES__NAMESPACE`). For each node dispatch it:
+  1. Creates a `ConfigMap` named `run-{run_id}-{node_name}-script` containing the user-authored shell script (built from the node's `steps`).
+  2. Submits a `Job` with an init container that copies the **Tube** binary from `quay.io/the-conn/tube:latest` to a shared `emptyDir` volume, and a main container that runs it with the node image and all required `TUBE__` environment variables (presigned S3 URLs, poke callback URL, workspace config).
+  3. Applies `the-conn.com/run-id` and `the-conn.com/managed-by: jefferies` labels to all created objects for tracking and bulk cleanup.
+  4. On cancellation or run cleanup, deletes all labelled Jobs and ConfigMaps via `delete_collection` and purges S3 artifacts via the `SourceManager`.
+  * The node image, Tube image, and target namespace are user-configurable in `[kubernetes]` of the TOML config.
 
 #### **G. server (The Interface)**
 * **Stateless Endpoints:** Axum handlers for GitHub webhooks and the secure status callbacks from **Tubes**.

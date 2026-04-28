@@ -14,7 +14,7 @@ The platform is built as a distributed state machine where the execution logic i
 * **`pipelines`**: Manages the parsing of `.jefferies/` YAML files and defines the shared state schema for execution tracking.
 * **`state_store`**: Provides a `StateStore` trait backed by Redis. Persists `RunState` with optimistic concurrency (Lua CAS / version fencing) and manages distributed TTL leases per run for exactly-once coordination.
 * **`backplane`**: Provides a `Backplane` trait backed by RabbitMQ. Replaces in-process MPSC channels with a cluster-wide topic exchange so any server node can route `NodeCompleted` and `Cancel` events to the appropriate coordinator.
-* **`coordinator`**: The reactive engine that acquires and heartbeats a Redis lease, consumes backplane events, persists node-state transitions, and runs the "Reaper" task for reclaiming orphaned runs. Contains the **`SourceManager`**, which streams repository tarballs from GitHub directly to S3 and generates presigned URLs for worker access.
+* **`coordinator`**: The reactive engine that acquires and heartbeats a Redis lease, consumes backplane events, persists node-state transitions, and runs the "Reaper" task for reclaiming orphaned runs. Contains the **`SourceManager`**, which streams repository tarballs from GitHub directly to S3 and generates presigned URLs for worker access. The **`KubeDispatcher`** actuates each pipeline node by creating a ConfigMap with the user script and submitting a Kubernetes Job with the Tube binary injected via an init container.
 * **`server`**: A stateless Axum-based interface that handles incoming webhooks and secure status callbacks from execution workers.
 
 ---
@@ -66,6 +66,11 @@ JEFFERIES__S3__ENDPOINT=...
 JEFFERIES__S3__BUCKET=the-conn-runs
 JEFFERIES__S3__ACCESS_KEY=...
 JEFFERIES__S3__SECRET_KEY=...
+
+# Kubernetes Dispatcher
+JEFFERIES__KUBERNETES__NAMESPACE=jefferies-jobs
+JEFFERIES__KUBERNETES__TUBE_IMAGE=quay.io/the-conn/tube:latest
+JEFFERIES__KUBERNETES__DEFAULT_NODE_IMAGE=fedora:45
 ```
 
 ---
