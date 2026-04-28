@@ -22,9 +22,10 @@ nodes:
     env:
       ENV: TEST
     steps:
+      - rm -rf app_config/config
+      - mkdir -p app_config
+      - ln -s /workspace/config app_config/config
       - ls -ld app_config/config
-      - ls -L app_config/config
-      - pwd
       - cargo test --all-features --workspace
 
   - name: Build Image
