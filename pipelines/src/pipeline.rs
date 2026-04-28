@@ -484,9 +484,18 @@ nodes:
 "#;
     let pipeline = Pipeline::from_yaml(yaml).unwrap();
     let infos = pipeline.node_info();
-    assert_eq!(infos[0].env.get("SHARED").map(String::as_str), Some("pipeline"));
-    assert_eq!(infos[0].env.get("OVERRIDE").map(String::as_str), Some("node"));
-    assert_eq!(infos[0].env.get("NODE_ONLY").map(String::as_str), Some("present"));
+    assert_eq!(
+      infos[0].env.get("SHARED").map(String::as_str),
+      Some("pipeline")
+    );
+    assert_eq!(
+      infos[0].env.get("OVERRIDE").map(String::as_str),
+      Some("node")
+    );
+    assert_eq!(
+      infos[0].env.get("NODE_ONLY").map(String::as_str),
+      Some("present")
+    );
   }
 
   #[test]
@@ -507,8 +516,14 @@ nodes:
 "#;
     let pipeline = Pipeline::from_yaml(yaml).unwrap();
     let infos = pipeline.node_info();
-    assert_eq!(infos[0].env.get("SHARED").map(String::as_str), Some("value"));
-    assert_eq!(infos[1].env.get("SHARED").map(String::as_str), Some("value"));
+    assert_eq!(
+      infos[0].env.get("SHARED").map(String::as_str),
+      Some("value")
+    );
+    assert_eq!(
+      infos[1].env.get("SHARED").map(String::as_str),
+      Some("value")
+    );
   }
 
   #[test]

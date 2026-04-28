@@ -165,8 +165,7 @@ impl Dispatcher for KubeDispatcher {
       .await?;
 
     let labels = run_labels(run_id);
-    let mut env_vars =
-      build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
+    let mut env_vars = build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
     env_vars.extend(node.env.iter().map(|(k, v)| env_var(k, v)));
     let job = self.build_job(run_id, &node.name, node, &cm_name, labels, env_vars);
 
