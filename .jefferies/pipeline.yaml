@@ -19,10 +19,7 @@ nodes:
     image: rust:1.95-slim
     after: ["Lint and Format"]
     checkout: true
-    env:
-      ENV: TEST
     steps:
-      - echo "ENV=$ENV"
       - cargo test --all-features --workspace
 
   - name: Build Image
