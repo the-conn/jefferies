@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -22,6 +22,8 @@ pub struct Pipeline {
   fail_fast: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   on: Option<PipelineTriggers>,
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+  env: HashMap<String, String>,
   nodes: Vec<PipelineNode>,
 }
 
@@ -70,6 +72,8 @@ struct PipelineNode {
   checkout: Option<bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   after: Vec<String>,
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+  env: HashMap<String, String>,
   steps: Vec<PipelineStep>,
 }
 
@@ -94,6 +98,7 @@ pub struct NodeInfo {
   pub dependencies: Vec<String>,
   pub timeout_secs: Option<u64>,
   pub checkout: bool,
+  pub env: HashMap<String, String>,
 }
 
 impl Pipeline {
@@ -132,13 +137,18 @@ impl Pipeline {
     self
       .nodes
       .iter()
-      .map(|n| NodeInfo {
-        name: n.name.clone(),
-        image: n.image.clone().unwrap_or_default(),
-        steps: n.steps.iter().map(step_command).collect(),
-        dependencies: n.after.clone(),
-        timeout_secs: n.timeout_secs,
-        checkout: n.checkout.unwrap_or(false),
+      .map(|n| {
+        let mut env = self.env.clone();
+        env.extend(n.env.clone());
+        NodeInfo {
+          name: n.name.clone(),
+          image: n.image.clone().unwrap_or_default(),
+          steps: n.steps.iter().map(step_command).collect(),
+          dependencies: n.after.clone(),
+          timeout_secs: n.timeout_secs,
+          checkout: n.checkout.unwrap_or(false),
+          env,
+        }
       })
       .collect()
   }
@@ -454,6 +464,66 @@ nodes:
     let pipeline = Pipeline::from_yaml(yaml).unwrap();
     let infos = pipeline.node_info();
     assert!(infos[0].checkout);
+  }
+
+  #[test]
+  fn test_node_env_vars_override_pipeline_env_vars() {
+    let yaml = r#"
+name: Test Pipeline
+env:
+  SHARED: pipeline
+  OVERRIDE: pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    env:
+      OVERRIDE: node
+      NODE_ONLY: present
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert_eq!(infos[0].env.get("SHARED").map(String::as_str), Some("pipeline"));
+    assert_eq!(infos[0].env.get("OVERRIDE").map(String::as_str), Some("node"));
+    assert_eq!(infos[0].env.get("NODE_ONLY").map(String::as_str), Some("present"));
+  }
+
+  #[test]
+  fn test_pipeline_env_propagates_to_all_nodes() {
+    let yaml = r#"
+name: Test Pipeline
+env:
+  SHARED: value
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+  - name: Test
+    image: rust:latest
+    steps:
+      - cargo test
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert_eq!(infos[0].env.get("SHARED").map(String::as_str), Some("value"));
+    assert_eq!(infos[1].env.get("SHARED").map(String::as_str), Some("value"));
+  }
+
+  #[test]
+  fn test_env_defaults_to_empty_when_absent() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert!(infos[0].env.is_empty());
   }
 
   #[test]

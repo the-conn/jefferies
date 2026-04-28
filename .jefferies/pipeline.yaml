@@ -19,8 +19,10 @@ nodes:
     image: rust:1.95-slim
     after: ["Lint and Format"]
     checkout: true
+    env:
+      ENV: TEST
     steps:
-      - ENV=TEST cargo test --all-features --workspace
+      - cargo test --all-features --workspace
 
   - name: Build Image
     image: quay.io/podman/stable
