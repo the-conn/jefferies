@@ -31,4 +31,4 @@ nodes:
       BUILDAH_ISOLATION: chroot
       STORAGE_DRIVER: vfs
     steps:
-      - buildah bud -f Containerfile -t the-conn-backend .
+      - buildah bud --storage-driver vfs --isolation chroot -f Containerfile -t jefferies:latest .
