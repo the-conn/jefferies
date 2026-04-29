@@ -60,9 +60,13 @@ pub struct NodeRunRecord {
 
 #[async_trait]
 pub trait RunHistory: Send + Sync {
-  async fn record_pipeline_started(&self, record: PipelineStartRecord) -> Result<(), RunHistoryError>;
+  async fn record_pipeline_started(
+    &self,
+    record: PipelineStartRecord,
+  ) -> Result<(), RunHistoryError>;
   async fn record_pipeline_run(&self, record: PipelineRunRecord) -> Result<(), RunHistoryError>;
-  async fn record_node_dispatched(&self, record: NodeDispatchRecord) -> Result<(), RunHistoryError>;
+  async fn record_node_dispatched(&self, record: NodeDispatchRecord)
+  -> Result<(), RunHistoryError>;
   async fn record_node_run(&self, record: NodeRunRecord) -> Result<(), RunHistoryError>;
   async fn ping(&self) -> Result<(), RunHistoryError>;
 }

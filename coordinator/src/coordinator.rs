@@ -4,7 +4,9 @@ use app_config::AppConfig;
 use backplane::{Backplane, BackplaneEvent};
 use chrono::{DateTime, Utc};
 use pipelines::{NodeInfo, Pipeline};
-use run_history::{NodeDispatchRecord, NodeRunRecord, PipelineRunRecord, PipelineStartRecord, RunHistory};
+use run_history::{
+  NodeDispatchRecord, NodeRunRecord, PipelineRunRecord, PipelineStartRecord, RunHistory,
+};
 use state_store::{NodeStatus, StateStore, StateStoreError};
 use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 use tracing::{error, info, warn};
