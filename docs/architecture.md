@@ -11,7 +11,7 @@
 
 #### **A. app_config (The Foundation)**
 * **Layered Configuration:** Loads defaults from TOML and overrides them via environment variables using a double-underscore (`__`) separator for nested fields.
-* **Secrets Management:** Handles sensitive credentials for **Redis**, **RabbitMQ**, **GitHub**, and **S3/NooBaa** injected via OpenShift SecretKeyRefs.
+* **Secrets Management:** Handles sensitive credentials for **Redis**, **RabbitMQ**, **GitHub**, **S3/NooBaa**, and **PostgreSQL** injected via OpenShift SecretKeyRefs.
 
 #### **B. providers (The Gatekeeper)**
 * **GitHub Logic:** Contains the HMAC-SHA256 signature verification logic to ensure webhooks are authentic.
@@ -48,6 +48,13 @@
 * **Stateless Endpoints:** Axum handlers for GitHub webhooks and the secure status callbacks from **Tubes**.
 * **Event Dispatch:** Validates requests and publishes the resulting state change to RabbitMQ, acting as the entry point for all external signals.
 
+#### **H. run_history (The Audit Trail)**
+* **PostgreSQL-backed persistence:** Records the outcome of every pipeline run and each of its constituent node runs in a relational schema, providing a durable history that survives beyond the lifetime of S3 artifacts and Redis state.
+* **Schema:** `pipeline_runs` (UUID PK, pipeline YAML, trigger, owner/repo/SHA, success/cancelled flags, timestamps) and `node_runs` (FK → pipeline run, node JSON definition, success flag, started/completed timestamps, output log).
+* **Insertion ordering:** The pipeline row is inserted before node rows to satisfy the FK constraint. `ON CONFLICT DO NOTHING` makes writes idempotent.
+* **Recording window:** History is written by the coordinator immediately before `cleanup()` removes S3 artifacts, which is the only moment where node status files and output logs are still retrievable.
+* **Test isolation:** A `NoOpRunHistory` implementation (no-op trait impl) is used in all in-process tests so no database is required at test time.
+
 ---
 
 ### **3. Data & Execution Flow**
@@ -59,11 +66,10 @@
     * **Tubes** finishes a task and hits the **server** status endpoint.
     * The **server** publishes a `NodeCompleted` event to **RabbitMQ**.
     * The leasing **coordinator** reacts, updates the versioned Redis state, identifies "unlocked" nodes, and triggers the next Pods.
-5.  **Cleanup:** Once all nodes reach a terminal state, the coordinator calls the **SourceManager** to delete all S3 objects for the run, releases the lease, and deletes the run state from Redis.
+5.  **History Recording:** Before any cleanup, the coordinator reads each node's `status.json` (timestamps) and `output.log` from S3 via the dispatcher, then writes one row to `pipeline_runs` and one row per node to `node_runs` in PostgreSQL.
+6.  **Cleanup:** After history is persisted, the coordinator calls the **SourceManager** to delete all S3 objects for the run, releases the lease, and deletes the run state from Redis.
 
 #### **Execution Flow Diagram**
-
-> **Note:** The current terminal step is S3 artifact cleanup. A Postgres-backed run history store is planned as the next step to persist run outcomes beyond the lifetime of the S3 artifacts.
 
 ```mermaid
 flowchart TD
@@ -76,17 +82,20 @@ flowchart TD
         REDIS[(Redis<br/>State + Leases)]
         RMQ[(RabbitMQ<br/>jefferies.events)]
         S3[(S3 / NooBaa<br/>Artifacts)]
+        PG[(PostgreSQL<br/>Run History)]
     end
 
     subgraph coord [Coordinator]
         COORD_INIT["Acquire Redis lease<br/>Init RunState - all nodes Pending"]
         DEP["Evaluate dependency graph<br/>Dispatch ready nodes"]
         REACT["Consume BackplaneEvent<br/>Version-fenced RunState write"]
+        HIST["Record history<br/>pipeline_runs + node_runs"]
         CLEAN["Cleanup<br/>Bulk delete S3 artifacts<br/>Release lease and RunState"]
 
         COORD_INIT --> DEP
         REACT -->|unlock dependent nodes| DEP
-        REACT -->|all nodes terminal| CLEAN
+        REACT -->|all nodes terminal| HIST
+        HIST --> CLEAN
     end
 
     subgraph kube [Kubernetes - one Job per execution node]
@@ -109,6 +118,8 @@ flowchart TD
     POKE -->|publish NodeCompleted| RMQ
     RMQ -->|route to leasing coordinator| REACT
     REACT -->|version-fenced CAS write| REDIS
+    HIST -->|read status.json + output.log before deletion| S3
+    HIST -->|INSERT pipeline_runs + node_runs| PG
     CLEAN -->|bulk delete run artifacts| S3
     CLEAN -->|release lease| REDIS
 

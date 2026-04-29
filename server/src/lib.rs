@@ -10,6 +10,7 @@ use axum::{
 use backplane::RabbitmqBackplane;
 use coordinator::{KubeDispatcher, SourceError, SourceManager, start_reaper};
 use providers::{GithubProvider, ProviderState};
+use run_history::PostgresRunHistory;
 use state_store::RunState;
 use thiserror::Error;
 use tokio::signal;
@@ -29,6 +30,8 @@ pub enum ServerError {
   Backplane(#[from] backplane::BackplaneError),
   #[error("Source manager error: {0}")]
   Source(#[from] SourceError),
+  #[error("Run history error: {0}")]
+  RunHistory(#[from] run_history::RunHistoryError),
   #[error("Connection check failed: {0}")]
   ConnectionFailed(String),
 }
@@ -156,6 +159,21 @@ async fn verify_connections(state: &ProviderState, verbose: bool) -> Result<(), 
     "S3 connection successful"
   );
 
+  conn_info!(
+    host = %state.config.postgres_host(),
+    db = %state.config.postgres_db(),
+    "Checking PostgreSQL connection..."
+  );
+  state.run_history.ping().await.map_err(|e| {
+    error!(host = %state.config.postgres_host(), error = %e, "Failed to connect to PostgreSQL");
+    ServerError::ConnectionFailed(format!("PostgreSQL: {e}"))
+  })?;
+  conn_info!(
+    host = %state.config.postgres_host(),
+    db = %state.config.postgres_db(),
+    "PostgreSQL connection successful"
+  );
+
   Ok(())
 }
 
@@ -178,12 +196,23 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
       .map_err(|e| ServerError::ConnectionFailed(format!("Kubernetes: {e}")))?,
   );
 
+  let run_history = Arc::new(
+    PostgresRunHistory::connect(&shared_config)
+      .await
+      .map_err(|e| ServerError::ConnectionFailed(format!("PostgreSQL: {e}")))?,
+  );
+  run_history
+    .migrate()
+    .await
+    .map_err(|e| ServerError::ConnectionFailed(format!("PostgreSQL migration: {e}")))?;
+
   let state = Arc::new(ProviderState::new(
     shared_config.clone(),
     state_store,
     backplane,
     dispatcher,
     source_manager,
+    run_history,
   ));
 
   verify_connections(&state, true).await?;
@@ -291,6 +320,7 @@ mod tests {
   use axum::{body::Body, http::Request};
   use backplane::InMemoryBackplane;
   use coordinator::LogDispatcher;
+  use run_history::NoOpRunHistory;
   use state_store::InMemoryStateStore;
   use tower::ServiceExt;
 
@@ -305,12 +335,14 @@ mod tests {
       backplane.clone(),
       source_manager.clone(),
     ));
+    let run_history = Arc::new(NoOpRunHistory);
     Arc::new(ProviderState::new(
       config,
       state_store,
       backplane,
       dispatcher,
       source_manager,
+      run_history,
     ))
   }
 

@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 app_config = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
+run_history = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }

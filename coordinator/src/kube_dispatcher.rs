@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 use crate::{
   dispatcher::{DispatchError, Dispatcher},
-  source_manager::SourceManager,
+  source_manager::{NodeOutcome, SourceError, SourceManager},
 };
 
 pub struct KubeDispatcher {
@@ -265,6 +265,30 @@ impl Dispatcher for KubeDispatcher {
 
     self.source_manager.cleanup_run(run_id).await?;
     Ok(())
+  }
+
+  async fn get_node_outcome(
+    &self,
+    run_id: &str,
+    node_name: &str,
+  ) -> Result<Option<NodeOutcome>, DispatchError> {
+    match self.source_manager.get_node_status(run_id, node_name).await {
+      Ok(outcome) => Ok(Some(outcome)),
+      Err(SourceError::NotFound(_)) => Ok(None),
+      Err(e) => Err(DispatchError::Source(e)),
+    }
+  }
+
+  async fn get_node_log(
+    &self,
+    run_id: &str,
+    node_name: &str,
+  ) -> Result<Option<String>, DispatchError> {
+    self
+      .source_manager
+      .get_node_log(run_id, node_name)
+      .await
+      .map_err(DispatchError::Source)
   }
 }
 

@@ -6,6 +6,8 @@ use axum::{
   extract::State,
   http::{HeaderMap, StatusCode},
 };
+use chrono::Utc;
+use coordinator::RunContext;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::EncodingKey;
 use octocrab::{
@@ -158,13 +160,20 @@ async fn start_push_pipelines(
   })
   .await?;
 
-  for pipeline in matching {
+  for (raw_yaml, pipeline) in matching {
     info!(
       pipeline_name = pipeline.name(),
       owner, repo, sha, branch, "Pipeline triggered by push event"
     );
-    launch_coordinator_for_pipeline(owner, repo, sha, &pipeline, &install_crab, state.clone())
-      .await;
+    let run_context = RunContext {
+      owner: owner.to_string(),
+      repo: repo.to_string(),
+      sha: sha.to_string(),
+      trigger: GITHUB_EVENT_PUSH.to_string(),
+      pipeline_yaml: raw_yaml,
+      created_at: Utc::now(),
+    };
+    launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
 
   Ok(())
@@ -183,23 +192,28 @@ async fn start_pr_pipelines(
   })
   .await?;
 
-  for pipeline in matching {
+  for (raw_yaml, pipeline) in matching {
     info!(
       pipeline_name = pipeline.name(),
       owner, repo, sha, base_branch, "Pipeline triggered by pull request event"
     );
-    launch_coordinator_for_pipeline(owner, repo, sha, &pipeline, &install_crab, state.clone())
-      .await;
+    let run_context = RunContext {
+      owner: owner.to_string(),
+      repo: repo.to_string(),
+      sha: sha.to_string(),
+      trigger: GITHUB_EVENT_PULL_REQUEST.to_string(),
+      pipeline_yaml: raw_yaml,
+      created_at: Utc::now(),
+    };
+    launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
 
   Ok(())
 }
 
 async fn launch_coordinator_for_pipeline(
-  owner: &str,
-  repo: &str,
-  sha: &str,
   pipeline: &Pipeline,
+  run_context: RunContext,
   install_crab: &Octocrab,
   state: Arc<ProviderState>,
 ) {
@@ -209,7 +223,13 @@ async fn launch_coordinator_for_pipeline(
   if needs_source
     && let Err(e) = state
       .source_manager
-      .upload_source(&run_id, owner, repo, sha, install_crab)
+      .upload_source(
+        &run_id,
+        &run_context.owner,
+        &run_context.repo,
+        &run_context.sha,
+        install_crab,
+      )
       .await
   {
     warn!(
@@ -222,14 +242,17 @@ async fn launch_coordinator_for_pipeline(
   }
 
   let pipeline_arc = Arc::new(pipeline.clone());
-
   let handle = coordinator::start_coordinator(
     run_id.clone(),
     pipeline_arc,
-    state.config.clone(),
-    state.dispatcher.clone(),
-    state.state_store.clone(),
-    state.backplane.clone(),
+    coordinator::CoordinatorServices {
+      config: state.config.clone(),
+      dispatcher: state.dispatcher.clone(),
+      state_store: state.state_store.clone(),
+      backplane: state.backplane.clone(),
+      run_history: state.run_history.clone(),
+    },
+    run_context,
   )
   .await;
 
@@ -292,7 +315,7 @@ async fn find_matching_pipelines<F>(
   repo: &str,
   sha: &str,
   matches_event: F,
-) -> Result<Vec<Pipeline>, GithubError>
+) -> Result<Vec<(String, Pipeline)>, GithubError>
 where
   F: Fn(&Pipeline) -> bool,
 {
@@ -343,7 +366,7 @@ where
           path = item.path,
           "Found matching pipeline"
         );
-        matching.push(pipeline);
+        matching.push((yaml_content, pipeline));
       }
       Ok(_) => {}
       Err(e) => {

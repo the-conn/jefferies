@@ -33,6 +33,13 @@ default_node_image = "fedora:45"
 builder_namespace = "jefferies-builder"
 buildah_image = "quay.io/buildah/stable:latest"
 
+[postgres]
+host = "localhost"
+port = 5432
+db = "postgres"
+username = ""
+password = ""
+
 # These are placeholder values overridden in production via JEFFERIES__GITHUB__* env vars
 [github]
 app_id = ""

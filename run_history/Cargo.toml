@@ -1,0 +1,13 @@
+[package]
+name = "run_history"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = { workspace = true }
+app_config  = { workspace = true }
+chrono      = { workspace = true }
+sqlx        = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }

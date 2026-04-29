@@ -7,7 +7,7 @@ use pipelines::{NodeInfo, Pipeline};
 use thiserror::Error;
 use tracing::info;
 
-use crate::source_manager::SourceError;
+use crate::source_manager::{NodeOutcome, SourceError};
 
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -37,6 +37,22 @@ pub trait Dispatcher: Send + Sync {
   ) -> Result<(), DispatchError>;
 
   async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError>;
+
+  async fn get_node_outcome(
+    &self,
+    _run_id: &str,
+    _node_name: &str,
+  ) -> Result<Option<NodeOutcome>, DispatchError> {
+    Ok(None)
+  }
+
+  async fn get_node_log(
+    &self,
+    _run_id: &str,
+    _node_name: &str,
+  ) -> Result<Option<String>, DispatchError> {
+    Ok(None)
+  }
 }
 
 pub struct LogDispatcher {

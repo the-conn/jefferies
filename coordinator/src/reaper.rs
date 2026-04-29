@@ -2,11 +2,13 @@ use std::{sync::Arc, time::Duration};
 
 use app_config::AppConfig;
 use backplane::Backplane;
+use chrono::Utc;
+use run_history::NoOpRunHistory;
 use state_store::StateStore;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::{Dispatcher, start_coordinator};
+use crate::{CoordinatorServices, Dispatcher, RunContext, start_coordinator};
 
 pub fn start_reaper(
   config: Arc<AppConfig>,
@@ -64,10 +66,21 @@ async fn reclaim_orphaned_runs(
     match start_coordinator(
       run_id.clone(),
       pipeline,
-      config.clone(),
-      dispatcher.clone(),
-      state_store.clone(),
-      backplane.clone(),
+      CoordinatorServices {
+        config: config.clone(),
+        dispatcher: dispatcher.clone(),
+        state_store: state_store.clone(),
+        backplane: backplane.clone(),
+        run_history: Arc::new(NoOpRunHistory),
+      },
+      RunContext {
+        owner: String::new(),
+        repo: String::new(),
+        sha: String::new(),
+        trigger: String::new(),
+        pipeline_yaml: String::new(),
+        created_at: Utc::now(),
+      },
     )
     .await
     {
