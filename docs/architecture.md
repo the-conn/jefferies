@@ -37,12 +37,12 @@
 * **Event Handling:** Consumes `NodeCompleted` and `Cancel` messages from the backplane, updates in-memory state, and dispatches newly unlocked nodes.
 * **The Reaper:** A background task that identifies orphaned runs (Running nodes in Redis but no active lease) and reclaims them by re-acquiring the lease and resuming from persisted state.
 * **SourceManager:** Handles all S3/NooBaa interactions for a run. When a pipeline contains at least one node with `checkout: true`, the `SourceManager` streams the repository tarball directly from the GitHub API to S3 at `runs/{run_id}/source.tar.gz` before the coordinator starts — with no intermediate disk writes. It generates 12-hour presigned GET URLs for the source archive and presigned PUT URLs for per-node status payloads at `runs/{run_id}/nodes/{node_name}/status.json`. On run finalization, it issues a bulk delete of all objects under the `runs/{run_id}/` prefix.
-* **KubeDispatcher:** The live `Dispatcher` implementation that actuates each pipeline node as a Kubernetes Job in the configured namespace (`jefferies-jobs` by default, overridable via `JEFFERIES__KUBERNETES__NAMESPACE`). For each node dispatch it:
-  1. Creates a `ConfigMap` named `run-{run_id}-{node_name}-script` containing the user-authored shell script (built from the node's `steps`).
-  2. Submits a `Job` with an init container that copies the **Tube** binary from `quay.io/the-conn/tube:latest` to a shared `emptyDir` volume, and a main container that runs it with the node image and all required `TUBE__` environment variables (presigned S3 URLs, poke callback URL, workspace config).
-  3. Applies `the-conn.com/run-id` and `the-conn.com/managed-by: jefferies` labels to all created objects for tracking and bulk cleanup.
-  4. On cancellation or run cleanup, deletes all labelled Jobs and ConfigMaps via `delete_collection` and purges S3 artifacts via the `SourceManager`.
-  * The node image, Tube image, and target namespace are user-configurable in `[kubernetes]` of the TOML config.
+* **KubeDispatcher:** The live `Dispatcher` implementation that actuates each pipeline node as a Kubernetes Job. It dispatches two distinct node kinds:
+  * **Exec nodes** (`type: exec`, the default): run in `jefferies-jobs`. A `ConfigMap` is created containing the user-authored shell script (built from the node's `steps`), and a `Job` is submitted with an init container that copies the **Tube** binary to a shared `emptyDir` volume; the main container runs the user-provided image with `/shared/tube` as its entrypoint and all required `TUBE__` environment variables (presigned S3 URLs, poke callback URL, workspace config).
+  * **Build nodes** (`type: build`): run in `jefferies-builder`, a dedicated namespace with a pre-provisioned `pipelines-sa-userid-1000` service account and `buildah-storage-config` ConfigMap. The script is system-generated as a single `buildah bud` invocation from the node's `config` block — users cannot supply arbitrary steps, which eliminates the security risk posed by the elevated capabilities buildah requires (`SETUID`, `SETGID`, `SETFCAP`). The merged init container (still using the Tube image) copies the Tube binary and sets up `/var/lib/containers` ownership before the main container starts; the main container runs `quay.io/buildah/stable:latest` with Tube as its entrypoint and the same lifecycle env vars as exec nodes.
+  * Applies `the-conn.com/run-id` and `the-conn.com/managed-by: jefferies` labels to all created objects for tracking and bulk cleanup.
+  * On cancellation, deletes Jobs and ConfigMaps from both namespaces.
+  * The node image, Tube image, target namespace, builder namespace, and buildah image are all user-configurable in `[kubernetes]` of the TOML config.
 
 #### **G. server (The Interface)**
 * **Stateless Endpoints:** Axum handlers for GitHub webhooks and the secure status callbacks from **Tubes**.
@@ -60,6 +60,60 @@
     * The **server** publishes a `NodeCompleted` event to **RabbitMQ**.
     * The leasing **coordinator** reacts, updates the versioned Redis state, identifies "unlocked" nodes, and triggers the next Pods.
 5.  **Cleanup:** Once all nodes reach a terminal state, the coordinator calls the **SourceManager** to delete all S3 objects for the run, releases the lease, and deletes the run state from Redis.
+
+#### **Execution Flow Diagram**
+
+> **Note:** The current terminal step is S3 artifact cleanup. A Postgres-backed run history store is planned as the next step to persist run outcomes beyond the lifetime of the S3 artifacts.
+
+```mermaid
+flowchart TD
+    GH([GitHub])
+    REAPER([Reaper - every 60 s])
+    SRV["Server<br/>Validate HMAC-SHA256, parse pipeline YAML"]
+    POKE["Server poke handler<br/>GET status.json from S3"]
+
+    subgraph infra [Infrastructure]
+        REDIS[(Redis<br/>State + Leases)]
+        RMQ[(RabbitMQ<br/>jefferies.events)]
+        S3[(S3 / NooBaa<br/>Artifacts)]
+    end
+
+    subgraph coord [Coordinator]
+        COORD_INIT["Acquire Redis lease<br/>Init RunState - all nodes Pending"]
+        DEP["Evaluate dependency graph<br/>Dispatch ready nodes"]
+        REACT["Consume BackplaneEvent<br/>Version-fenced RunState write"]
+        CLEAN["Cleanup<br/>Bulk delete S3 artifacts<br/>Release lease and RunState"]
+
+        COORD_INIT --> DEP
+        REACT -->|unlock dependent nodes| DEP
+        REACT -->|all nodes terminal| CLEAN
+    end
+
+    subgraph kube [Kubernetes - one Job per execution node]
+        KDISP["KubeDispatcher<br/>Create ConfigMap + K8s Job"]
+        POD_A["Tube: Node A<br/>execute steps in user image"]
+        POD_B["Tube: Node B<br/>execute steps in user image"]
+
+        KDISP --> POD_A & POD_B
+    end
+
+    GH -->|POST /webhooks/github| SRV
+    SRV -->|stream repo tarball to S3| S3
+    SRV --> COORD_INIT
+    COORD_INIT -.->|heartbeat every 15 s| REDIS
+    DEP -->|presigned S3 URLs injected as env vars| KDISP
+
+    POD_A & POD_B -->|PUT status.json + output.log| S3
+    POD_A & POD_B -->|POST /poke| POKE
+
+    POKE -->|publish NodeCompleted| RMQ
+    RMQ -->|route to leasing coordinator| REACT
+    REACT -->|version-fenced CAS write| REDIS
+    CLEAN -->|bulk delete run artifacts| S3
+    CLEAN -->|release lease| REDIS
+
+    REAPER -.->|orphaned run detected, no active lease| COORD_INIT
+```
 
 ---
 

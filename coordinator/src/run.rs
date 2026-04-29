@@ -138,6 +138,8 @@ mod tests {
       dependencies: deps.iter().map(|d| d.to_string()).collect(),
       timeout_secs: None,
       checkout: false,
+      env: std::collections::HashMap::new(),
+      kind: pipelines::NodeKind::Exec,
     }
   }
 

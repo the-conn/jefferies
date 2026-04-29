@@ -20,11 +20,15 @@ nodes:
     after: ["Lint and Format"]
     checkout: true
     steps:
-      - ENV=TEST cargo test --all-features --workspace
+      - cargo test --all-features --workspace
 
   - name: Build Image
-    image: quay.io/podman/stable
-    checkout: true
+    type: build
     after: ["Unit Tests"]
-    steps:
-      - podman build .
+    checkout: true
+    config:
+      containerfile: Containerfile
+      tags:
+        - quay.io/the-conn/jefferies
+      build_args:
+        - RUST_TAG=1.95-slim

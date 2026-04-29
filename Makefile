@@ -21,7 +21,7 @@ build:
 ## test: Run all unit and integration tests
 test:
 	@echo "Running all unit tests..."
-	ENV=TEST $(CARGO) test $(FLAGS)
+	$(CARGO) test $(FLAGS)
 
 ## lint: Run clippy for static analysis
 lint:

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -11,6 +11,10 @@ pub enum PipelineError {
   UnknownDependency { node: String, dependency: String },
   #[error("Node '{node}' depends on itself")]
   SelfDependency { node: String },
+  #[error("Node '{node}' of type 'exec' must have at least one step")]
+  EmptySteps { node: String },
+  #[error("Node '{node}' of type 'build' is missing required 'config' field")]
+  MissingBuildConfig { node: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +26,8 @@ pub struct Pipeline {
   fail_fast: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   on: Option<PipelineTriggers>,
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+  env: HashMap<String, String>,
   nodes: Vec<PipelineNode>,
 }
 
@@ -59,6 +65,29 @@ struct Refs {
   tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum NodeType {
+  #[default]
+  Exec,
+  Build,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildConfig {
+  pub containerfile: String,
+  #[serde(default)]
+  pub tags: Vec<String>,
+  #[serde(default)]
+  pub build_args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum NodeKind {
+  Exec,
+  Build(BuildConfig),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PipelineNode {
   name: String,
@@ -70,7 +99,14 @@ struct PipelineNode {
   checkout: Option<bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   after: Vec<String>,
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+  env: HashMap<String, String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   steps: Vec<PipelineStep>,
+  #[serde(default, rename = "type")]
+  node_type: NodeType,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  config: Option<BuildConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +130,8 @@ pub struct NodeInfo {
   pub dependencies: Vec<String>,
   pub timeout_secs: Option<u64>,
   pub checkout: bool,
+  pub env: HashMap<String, String>,
+  pub kind: NodeKind,
 }
 
 impl Pipeline {
@@ -101,6 +139,7 @@ impl Pipeline {
     match serde_saphyr::from_str(yaml) {
       Ok(pipeline) => {
         validate_dependencies(&pipeline)?;
+        validate_node_types(&pipeline)?;
         Ok(pipeline)
       }
       Err(e) => Err(PipelineError::YamlParseError(e.to_string())),
@@ -132,13 +171,23 @@ impl Pipeline {
     self
       .nodes
       .iter()
-      .map(|n| NodeInfo {
-        name: n.name.clone(),
-        image: n.image.clone().unwrap_or_default(),
-        steps: n.steps.iter().map(step_command).collect(),
-        dependencies: n.after.clone(),
-        timeout_secs: n.timeout_secs,
-        checkout: n.checkout.unwrap_or(false),
+      .map(|n| {
+        let mut env = self.env.clone();
+        env.extend(n.env.clone());
+        let kind = match (&n.node_type, n.config.as_ref()) {
+          (NodeType::Build, Some(config)) => NodeKind::Build(config.clone()),
+          _ => NodeKind::Exec,
+        };
+        NodeInfo {
+          name: n.name.clone(),
+          image: n.image.clone().unwrap_or_default(),
+          steps: n.steps.iter().map(step_command).collect(),
+          dependencies: n.after.clone(),
+          timeout_secs: n.timeout_secs,
+          checkout: n.checkout.unwrap_or(false),
+          env,
+          kind,
+        }
       })
       .collect()
   }
@@ -152,6 +201,25 @@ impl Pipeline {
     };
     refs_match_branch(pr_trigger, branch)
   }
+}
+
+fn validate_node_types(pipeline: &Pipeline) -> Result<(), PipelineError> {
+  for node in &pipeline.nodes {
+    match node.node_type {
+      NodeType::Exec if node.steps.is_empty() => {
+        return Err(PipelineError::EmptySteps {
+          node: node.name.clone(),
+        });
+      }
+      NodeType::Build if node.config.is_none() => {
+        return Err(PipelineError::MissingBuildConfig {
+          node: node.name.clone(),
+        });
+      }
+      _ => {}
+    }
+  }
+  Ok(())
 }
 
 fn validate_dependencies(pipeline: &Pipeline) -> Result<(), PipelineError> {
@@ -457,6 +525,81 @@ nodes:
   }
 
   #[test]
+  fn test_node_env_vars_override_pipeline_env_vars() {
+    let yaml = r#"
+name: Test Pipeline
+env:
+  SHARED: pipeline
+  OVERRIDE: pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    env:
+      OVERRIDE: node
+      NODE_ONLY: present
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert_eq!(
+      infos[0].env.get("SHARED").map(String::as_str),
+      Some("pipeline")
+    );
+    assert_eq!(
+      infos[0].env.get("OVERRIDE").map(String::as_str),
+      Some("node")
+    );
+    assert_eq!(
+      infos[0].env.get("NODE_ONLY").map(String::as_str),
+      Some("present")
+    );
+  }
+
+  #[test]
+  fn test_pipeline_env_propagates_to_all_nodes() {
+    let yaml = r#"
+name: Test Pipeline
+env:
+  SHARED: value
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+  - name: Test
+    image: rust:latest
+    steps:
+      - cargo test
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert_eq!(
+      infos[0].env.get("SHARED").map(String::as_str),
+      Some("value")
+    );
+    assert_eq!(
+      infos[1].env.get("SHARED").map(String::as_str),
+      Some("value")
+    );
+  }
+
+  #[test]
+  fn test_env_defaults_to_empty_when_absent() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert!(infos[0].env.is_empty());
+  }
+
+  #[test]
   fn test_unknown_dependency_returns_error() {
     let yaml = r#"
 name: Test Pipeline
@@ -518,6 +661,66 @@ nodes:
     assert!(matches!(
       result,
       Err(PipelineError::SelfDependency { ref node }) if node == "Build"
+    ));
+  }
+
+  #[test]
+  fn test_build_node_parses_correctly() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build Image
+    type: build
+    checkout: true
+    config:
+      containerfile: Containerfile
+      tags:
+        - quay.io/the-conn/jefferies
+      build_args:
+        - RUST_TAG=1.95-slim
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    let infos = pipeline.node_info();
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].name, "Build Image");
+    assert!(infos[0].checkout);
+    if let NodeKind::Build(config) = &infos[0].kind {
+      assert_eq!(config.containerfile, "Containerfile");
+      assert_eq!(config.tags, vec!["quay.io/the-conn/jefferies"]);
+      assert_eq!(config.build_args, vec!["RUST_TAG=1.95-slim"]);
+    } else {
+      panic!("Expected NodeKind::Build");
+    }
+  }
+
+  #[test]
+  fn test_exec_node_without_steps_fails_validation() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(
+      result,
+      Err(PipelineError::EmptySteps { ref node }) if node == "Build"
+    ));
+  }
+
+  #[test]
+  fn test_build_node_without_config_fails_validation() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build Image
+    type: build
+    checkout: true
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(
+      result,
+      Err(PipelineError::MissingBuildConfig { ref node }) if node == "Build Image"
     ));
   }
 }

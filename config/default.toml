@@ -30,13 +30,13 @@ secret_key = ""
 namespace = "jefferies-jobs"
 tube_image = "quay.io/the-conn/tube:latest"
 default_node_image = "fedora:45"
+builder_namespace = "jefferies-builder"
+buildah_image = "quay.io/buildah/stable:latest"
 
-# NEVER INCLUDE THESE IN A GIT REPO
-# This is meant as a reference and should be set
-# with environment variables in the Jefferies deployment
-# [github]
-# app_id = ""
-# webhook_secret = ""
-# client_id = ""
-# client_secret = ""
-# private_key = ""
+# These are placeholder values overridden in production via JEFFERIES__GITHUB__* env vars
+[github]
+app_id = ""
+webhook_secret = ""
+client_id = ""
+client_secret = ""
+private_key = ""
