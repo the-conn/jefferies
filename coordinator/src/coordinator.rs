@@ -292,6 +292,7 @@ impl Coordinator {
         error!(run_id = %self.run_id, error = %e, "Failed to persist state after node success; stopping");
         return true;
       }
+      self.record_node_completed(node_name).await;
       self.dispatch_ready_nodes().await;
       false
     } else {
@@ -304,6 +305,7 @@ impl Coordinator {
         error!(run_id = %self.run_id, error = %e, "Failed to persist state after node failure; stopping");
         return true;
       }
+      self.record_node_completed(node_name).await;
       if self.fail_fast_enabled() {
         warn!(run_id = %self.run_id, node_name, "Fail-fast enabled; cancelling pipeline");
         true
@@ -330,6 +332,7 @@ impl Coordinator {
     {
       warn!(run_id = %self.run_id, node_name, error = %e, "Failed to cancel timed-out node");
     }
+    self.record_node_completed(node_name).await;
     if self.fail_fast_enabled() {
       warn!(run_id = %self.run_id, node_name, "Fail-fast enabled; cancelling pipeline");
       true
@@ -445,6 +448,64 @@ impl Coordinator {
     }
   }
 
+  async fn record_node_completed(&self, node_name: &str) {
+    let node_success = self
+      .run
+      .statuses()
+      .get(node_name)
+      .map(|s| *s == NodeStatus::Success)
+      .unwrap_or(false);
+
+    let node_definition = self
+      .node_info_cache
+      .get(node_name)
+      .and_then(|info| serde_json::to_string(info).ok())
+      .unwrap_or_default();
+
+    let outcome = match self
+      .dispatcher
+      .get_node_outcome(&self.run_id, node_name)
+      .await
+    {
+      Ok(o) => o,
+      Err(e) => {
+        warn!(run_id = %self.run_id, node_name, error = %e, "Failed to fetch node outcome for history");
+        None
+      }
+    };
+
+    let started_at = outcome
+      .as_ref()
+      .and_then(|o| o.started_at)
+      .and_then(ms_to_datetime);
+    let node_completed_at = outcome
+      .as_ref()
+      .and_then(|o| o.finished_at)
+      .and_then(ms_to_datetime);
+
+    let output_log = match self.dispatcher.get_node_log(&self.run_id, node_name).await {
+      Ok(log) => log,
+      Err(e) => {
+        warn!(run_id = %self.run_id, node_name, error = %e, "Failed to fetch node log for history");
+        None
+      }
+    };
+
+    let node_record = NodeRunRecord {
+      run_id: self.run_id.clone(),
+      node_name: node_name.to_string(),
+      node_definition,
+      success: node_success,
+      created_at: Utc::now(),
+      started_at,
+      completed_at: node_completed_at,
+      output_log,
+    };
+    if let Err(e) = self.run_history.record_node_run(node_record).await {
+      warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record node run history");
+    }
+  }
+
   async fn record_history(&self, cancelled: bool) {
     let completed_at = Utc::now();
     let success = !cancelled
@@ -471,57 +532,9 @@ impl Coordinator {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
     }
 
-    for (node_name, status) in self.run.statuses() {
-      let node_success = *status == NodeStatus::Success;
-
-      let node_definition = self
-        .node_info_cache
-        .get(node_name)
-        .and_then(|info| serde_json::to_string(info).ok())
-        .unwrap_or_default();
-
-      let outcome = match self
-        .dispatcher
-        .get_node_outcome(&self.run_id, node_name)
-        .await
-      {
-        Ok(o) => o,
-        Err(e) => {
-          warn!(run_id = %self.run_id, node_name, error = %e, "Failed to fetch node outcome for history");
-          None
-        }
-      };
-
-      let started_at = outcome
-        .as_ref()
-        .and_then(|o| o.started_at)
-        .and_then(ms_to_datetime);
-      let node_completed_at = outcome
-        .as_ref()
-        .and_then(|o| o.finished_at)
-        .and_then(ms_to_datetime);
-
-      let output_log = match self.dispatcher.get_node_log(&self.run_id, node_name).await {
-        Ok(log) => log,
-        Err(e) => {
-          warn!(run_id = %self.run_id, node_name, error = %e, "Failed to fetch node log for history");
-          None
-        }
-      };
-
-      let node_record = NodeRunRecord {
-        run_id: self.run_id.clone(),
-        node_name: node_name.clone(),
-        node_definition,
-        success: node_success,
-        created_at: Utc::now(),
-        started_at,
-        completed_at: node_completed_at,
-        output_log,
-      };
-      if let Err(e) = self.run_history.record_node_run(node_record).await {
-        warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record node run history");
-      }
+    let node_names: Vec<String> = self.run.statuses().keys().cloned().collect();
+    for node_name in node_names {
+      self.record_node_completed(&node_name).await;
     }
   }
 
