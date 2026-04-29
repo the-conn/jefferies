@@ -248,22 +248,22 @@ impl Dispatcher for KubeDispatcher {
   }
 
   async fn cleanup_run(&self, _run_id: &str) -> Result<(), DispatchError> {
-    // let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
+    let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
 
-    // let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
-    // if let Err(e) = jobs
-    //   .delete_collection(&DeleteParams::background(), &lp)
-    //   .await
-    // {
-    //   warn!(run_id, error = %e, "Failed to delete Job collection");
-    // }
+    let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
+    if let Err(e) = jobs
+      .delete_collection(&DeleteParams::background(), &lp)
+      .await
+    {
+      warn!(run_id, error = %e, "Failed to delete Job collection");
+    }
 
-    // let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), &self.namespace);
-    // if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
-    //   warn!(run_id, error = %e, "Failed to delete ConfigMap collection");
-    // }
+    let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), &self.namespace);
+    if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
+      warn!(run_id, error = %e, "Failed to delete ConfigMap collection");
+    }
 
-    // self.source_manager.cleanup_run(run_id).await?;
+    self.source_manager.cleanup_run(run_id).await?;
     Ok(())
   }
 }
@@ -412,8 +412,7 @@ impl KubeDispatcher {
     env_vars: Vec<EnvVar>,
   ) -> Job {
     let init_cmd = "cp /usr/local/bin/tube /shared/tube && \
-      mkdir -p /var/lib/containers/storage /var/lib/containers/runroot && \
-      chown -R 1000:1000 /var/lib/containers";
+      mkdir -p /var/lib/containers/storage /var/lib/containers/runroot";
 
     Job {
       metadata: ObjectMeta {
