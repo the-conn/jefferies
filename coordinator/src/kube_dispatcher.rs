@@ -13,7 +13,7 @@ use k8s_openapi::{
   },
   apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::ObjectMeta},
 };
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, ListParams, PostParams};
 use pipelines::{BuildConfig, NodeInfo, NodeKind, Pipeline};
 use tracing::{info, warn};
 
@@ -247,7 +247,7 @@ impl Dispatcher for KubeDispatcher {
     Ok(())
   }
 
-  async fn cleanup_run(&self, _run_id: &str) -> Result<(), DispatchError> {
+  async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError> {
     let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
 
     let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
