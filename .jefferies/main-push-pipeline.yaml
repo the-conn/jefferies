@@ -1,0 +1,18 @@
+name: Jefferies Main Push Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+nodes:
+  - name: Build Image
+    type: build
+    after: ["Unit Tests"]
+    checkout: true
+    config:
+      containerfile: Containerfile
+      tags:
+        - quay.io/the-conn/jefferies
+      build_args:
+        - RUST_TAG=1.95-slim
