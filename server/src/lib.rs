@@ -273,7 +273,7 @@ async fn handle_node_poke(
   };
   match state
     .backplane
-    .publish_node_completed(&run_id, &node_name, outcome.success)
+    .publish_node_completed(&run_id, &node_name, outcome.success.unwrap_or(false))
     .await
   {
     Ok(()) => StatusCode::OK,

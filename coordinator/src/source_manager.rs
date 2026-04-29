@@ -63,9 +63,9 @@ pub enum SourceError {
 
 #[derive(serde::Deserialize)]
 pub struct NodeOutcome {
-  pub success: bool,
-  pub started_at_ms: Option<u128>,
-  pub ended_at_ms: Option<u128>,
+  pub success: Option<bool>,
+  pub started_at: Option<u128>,
+  pub finished_at: Option<u128>,
 }
 
 pub struct SourceManager {

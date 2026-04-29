@@ -4,7 +4,7 @@ use app_config::AppConfig;
 use backplane::{Backplane, BackplaneEvent};
 use chrono::{DateTime, Utc};
 use pipelines::{NodeInfo, Pipeline};
-use run_history::{NodeRunRecord, PipelineRunRecord, RunHistory};
+use run_history::{NodeDispatchRecord, NodeRunRecord, PipelineRunRecord, PipelineStartRecord, RunHistory};
 use state_store::{NodeStatus, StateStore, StateStoreError};
 use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 use tracing::{error, info, warn};
@@ -158,6 +158,7 @@ fn ms_to_datetime(ms: u128) -> Option<DateTime<Utc>> {
 impl Coordinator {
   async fn run(mut self) -> RunSummary {
     info!(run_id = %self.run_id, server_id = %self.server_id, "Coordinator starting");
+    self.record_pipeline_started().await;
 
     let pipeline_timeout_secs = self
       .pipeline
@@ -361,6 +362,7 @@ impl Coordinator {
             warn!(run_id = %self.run_id, node_name = %node_name, "Unexpected state transition: node was not Pending");
           } else {
             info!(run_id = %self.run_id, node_name = %node_name, "Node dispatched");
+            self.record_node_dispatched(&node_name, node).await;
             let timeout_handle = self.spawn_node_timeout(&node_name, node.timeout_secs);
             self.node_timeout_handles.insert(node_name, timeout_handle);
           }
@@ -412,6 +414,35 @@ impl Coordinator {
     }
   }
 
+  async fn record_pipeline_started(&self) {
+    let record = PipelineStartRecord {
+      run_id: self.run_id.clone(),
+      pipeline_name: self.pipeline.name().to_string(),
+      owner: self.run_context.owner.clone(),
+      repo: self.run_context.repo.clone(),
+      sha: self.run_context.sha.clone(),
+      trigger: self.run_context.trigger.clone(),
+      pipeline_definition: self.run_context.pipeline_yaml.clone(),
+      created_at: self.run_context.created_at,
+    };
+    if let Err(e) = self.run_history.record_pipeline_started(record).await {
+      warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline start");
+    }
+  }
+
+  async fn record_node_dispatched(&self, node_name: &str, node: &NodeInfo) {
+    let node_definition = serde_json::to_string(node).unwrap_or_default();
+    let record = NodeDispatchRecord {
+      run_id: self.run_id.clone(),
+      node_name: node_name.to_string(),
+      node_definition,
+      created_at: Utc::now(),
+    };
+    if let Err(e) = self.run_history.record_node_dispatched(record).await {
+      warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record node dispatch");
+    }
+  }
+
   async fn record_history(&self, cancelled: bool) {
     let completed_at = Utc::now();
     let success = !cancelled
@@ -432,7 +463,7 @@ impl Coordinator {
       success,
       cancelled,
       created_at: self.run_context.created_at,
-      completed_at,
+      completed_at: Some(completed_at),
     };
     if let Err(e) = self.run_history.record_pipeline_run(pipeline_record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
@@ -461,11 +492,11 @@ impl Coordinator {
 
       let started_at = outcome
         .as_ref()
-        .and_then(|o| o.started_at_ms)
+        .and_then(|o| o.started_at)
         .and_then(ms_to_datetime);
       let node_completed_at = outcome
         .as_ref()
-        .and_then(|o| o.ended_at_ms)
+        .and_then(|o| o.finished_at)
         .and_then(ms_to_datetime);
 
       let output_log = match self.dispatcher.get_node_log(&self.run_id, node_name).await {
@@ -481,6 +512,7 @@ impl Coordinator {
         node_name: node_name.clone(),
         node_definition,
         success: node_success,
+        created_at: Utc::now(),
         started_at,
         completed_at: node_completed_at,
         output_log,
