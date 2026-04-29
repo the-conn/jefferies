@@ -2,10 +2,13 @@ use std::{fmt::Debug, sync::Arc};
 
 use app_config::AppConfig;
 use axum::{
+  Json,
   body::Bytes,
-  extract::State,
+  extract::{Path, State},
   http::{HeaderMap, StatusCode},
 };
+use chrono::Utc;
+use coordinator::RunContext;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::EncodingKey;
 use octocrab::{
@@ -15,7 +18,7 @@ use octocrab::{
   },
 };
 use pipelines::Pipeline;
-use serde::de::Error;
+use serde::{Serialize, de::Error};
 use sha2::Sha256;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -25,7 +28,13 @@ use super::{ProviderState, get_header};
 
 const GITHUB_EVENT_PUSH: &str = "push";
 const GITHUB_EVENT_PULL_REQUEST: &str = "pull_request";
+const TRIGGER_RETRY: &str = "retry";
 const JEFFERIES_DIR: &str = ".jefferies";
+
+#[derive(Debug, Serialize)]
+pub struct RetryResponse {
+  pub run_id: String,
+}
 
 #[derive(Debug, Error)]
 pub enum GithubError {
@@ -75,6 +84,64 @@ impl GithubProvider {
       }
     }
   }
+
+  pub async fn retry_run(
+    State(state): State<Arc<ProviderState>>,
+    Path(run_id): Path<String>,
+  ) -> (StatusCode, Json<Option<RetryResponse>>) {
+    let original = match state.run_history.get_pipeline_run(&run_id).await {
+      Ok(Some(row)) => row,
+      Ok(None) => {
+        warn!(run_id, "Retry requested for unknown run");
+        return (StatusCode::NOT_FOUND, Json(None));
+      }
+      Err(e) => {
+        warn!(run_id, error = %e, "Failed to fetch run for retry");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
+      }
+    };
+
+    let pipeline = match Pipeline::from_yaml(&original.pipeline_definition) {
+      Ok(p) => p,
+      Err(e) => {
+        warn!(run_id, error = %e, "Stored pipeline YAML failed to parse during retry");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
+      }
+    };
+
+    let install_crab =
+      match build_installation_client(&original.owner, &original.repo, &state.config).await {
+        Ok(c) => c,
+        Err(e) => {
+          warn!(run_id, error = %e, "Failed to build GitHub installation client for retry");
+          return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
+        }
+      };
+
+    let run_context = RunContext {
+      owner: original.owner,
+      repo: original.repo,
+      sha: original.sha,
+      branch: original.branch,
+      target_branch: original.target_branch,
+      tag: original.tag,
+      pr_number: original.pr_number,
+      trigger: TRIGGER_RETRY.to_string(),
+      pipeline_yaml: original.pipeline_definition,
+      created_at: Utc::now(),
+      retry_of: Some(run_id),
+    };
+
+    match launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone())
+      .await
+    {
+      Some(new_run_id) => (
+        StatusCode::OK,
+        Json(Some(RetryResponse { run_id: new_run_id })),
+      ),
+      None => (StatusCode::INTERNAL_SERVER_ERROR, Json(None)),
+    }
+  }
 }
 
 async fn handle_push(payload: &[u8], state: Arc<ProviderState>) -> Result<StatusCode, GithubError> {
@@ -100,9 +167,8 @@ async fn handle_push(payload: &[u8], state: Arc<ProviderState>) -> Result<Status
     .login;
   let repo_name = repo.name;
   let sha = push_event.after.clone();
-  let branch = extract_branch_from_ref(&push_event.r#ref);
 
-  start_push_pipelines(&owner, &repo_name, &sha, branch, state).await?;
+  start_push_pipelines(&owner, &repo_name, &sha, &push_event.r#ref, state).await?;
   Ok(StatusCode::OK)
 }
 
@@ -140,8 +206,19 @@ async fn handle_pull_request(
     .login;
   let repo_name = head_repo.name;
   let sha = pr.head.sha.clone();
+  let head_branch = pr.head.ref_field.clone();
   let base_branch = pr.base.ref_field;
-  start_pr_pipelines(&owner, &repo_name, &sha, &base_branch, state).await?;
+  let pr_number = pr.number as i64;
+  start_pr_pipelines(
+    &owner,
+    &repo_name,
+    &sha,
+    &head_branch,
+    &base_branch,
+    pr_number,
+    state,
+  )
+  .await?;
   Ok(StatusCode::OK)
 }
 
@@ -149,22 +226,41 @@ async fn start_push_pipelines(
   owner: &str,
   repo: &str,
   sha: &str,
-  branch: &str,
+  git_ref: &str,
   state: Arc<ProviderState>,
 ) -> Result<(), GithubError> {
   let install_crab = build_installation_client(owner, repo, &state.config).await?;
+  let (branch, tag) = parse_push_ref(git_ref);
+  let match_ref = branch.as_deref().unwrap_or(git_ref);
   let matching = find_matching_pipelines(&install_crab, owner, repo, sha, |pipeline| {
-    pipeline.triggered_by_push(branch)
+    pipeline.triggered_by_push(match_ref)
   })
   .await?;
 
-  for pipeline in matching {
+  for (raw_yaml, pipeline) in matching {
     info!(
       pipeline_name = pipeline.name(),
-      owner, repo, sha, branch, "Pipeline triggered by push event"
+      owner,
+      repo,
+      sha,
+      branch = branch.as_deref().unwrap_or(""),
+      tag = tag.as_deref().unwrap_or(""),
+      "Pipeline triggered by push event"
     );
-    launch_coordinator_for_pipeline(owner, repo, sha, &pipeline, &install_crab, state.clone())
-      .await;
+    let run_context = RunContext {
+      owner: owner.to_string(),
+      repo: repo.to_string(),
+      sha: sha.to_string(),
+      branch: branch.clone(),
+      target_branch: None,
+      tag: tag.clone(),
+      pr_number: None,
+      trigger: GITHUB_EVENT_PUSH.to_string(),
+      pipeline_yaml: raw_yaml,
+      created_at: Utc::now(),
+      retry_of: None,
+    };
+    launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
 
   Ok(())
@@ -174,7 +270,9 @@ async fn start_pr_pipelines(
   owner: &str,
   repo: &str,
   sha: &str,
+  head_branch: &str,
   base_branch: &str,
+  pr_number: i64,
   state: Arc<ProviderState>,
 ) -> Result<(), GithubError> {
   let install_crab = build_installation_client(owner, repo, &state.config).await?;
@@ -183,33 +281,55 @@ async fn start_pr_pipelines(
   })
   .await?;
 
-  for pipeline in matching {
+  for (raw_yaml, pipeline) in matching {
     info!(
       pipeline_name = pipeline.name(),
-      owner, repo, sha, base_branch, "Pipeline triggered by pull request event"
+      owner,
+      repo,
+      sha,
+      head_branch,
+      base_branch,
+      pr_number,
+      "Pipeline triggered by pull request event"
     );
-    launch_coordinator_for_pipeline(owner, repo, sha, &pipeline, &install_crab, state.clone())
-      .await;
+    let run_context = RunContext {
+      owner: owner.to_string(),
+      repo: repo.to_string(),
+      sha: sha.to_string(),
+      branch: Some(head_branch.to_string()),
+      target_branch: Some(base_branch.to_string()),
+      tag: None,
+      pr_number: Some(pr_number),
+      trigger: GITHUB_EVENT_PULL_REQUEST.to_string(),
+      pipeline_yaml: raw_yaml,
+      created_at: Utc::now(),
+      retry_of: None,
+    };
+    launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
 
   Ok(())
 }
 
 async fn launch_coordinator_for_pipeline(
-  owner: &str,
-  repo: &str,
-  sha: &str,
   pipeline: &Pipeline,
+  run_context: RunContext,
   install_crab: &Octocrab,
   state: Arc<ProviderState>,
-) {
+) -> Option<String> {
   let run_id = Uuid::new_v4().to_string();
 
   let needs_source = pipeline.node_info().iter().any(|n| n.checkout);
   if needs_source
     && let Err(e) = state
       .source_manager
-      .upload_source(&run_id, owner, repo, sha, install_crab)
+      .upload_source(
+        &run_id,
+        &run_context.owner,
+        &run_context.repo,
+        &run_context.sha,
+        install_crab,
+      )
       .await
   {
     warn!(
@@ -218,18 +338,21 @@ async fn launch_coordinator_for_pipeline(
       error = %e,
       "Failed to upload source tarball; aborting run"
     );
-    return;
+    return None;
   }
 
   let pipeline_arc = Arc::new(pipeline.clone());
-
   let handle = coordinator::start_coordinator(
     run_id.clone(),
     pipeline_arc,
-    state.config.clone(),
-    state.dispatcher.clone(),
-    state.state_store.clone(),
-    state.backplane.clone(),
+    coordinator::CoordinatorServices {
+      config: state.config.clone(),
+      dispatcher: state.dispatcher.clone(),
+      state_store: state.state_store.clone(),
+      backplane: state.backplane.clone(),
+      run_history: state.run_history.clone(),
+    },
+    run_context,
   )
   .await;
 
@@ -239,7 +362,7 @@ async fn launch_coordinator_for_pipeline(
       pipeline_name = pipeline.name(),
       "Failed to acquire lease for new run"
     );
-    return;
+    return None;
   };
 
   info!(
@@ -264,6 +387,8 @@ async fn launch_coordinator_for_pipeline(
       }
     }
   });
+
+  Some(run_id)
 }
 
 async fn build_installation_client(
@@ -292,7 +417,7 @@ async fn find_matching_pipelines<F>(
   repo: &str,
   sha: &str,
   matches_event: F,
-) -> Result<Vec<Pipeline>, GithubError>
+) -> Result<Vec<(String, Pipeline)>, GithubError>
 where
   F: Fn(&Pipeline) -> bool,
 {
@@ -343,7 +468,7 @@ where
           path = item.path,
           "Found matching pipeline"
         );
-        matching.push(pipeline);
+        matching.push((yaml_content, pipeline));
       }
       Ok(_) => {}
       Err(e) => {
@@ -379,8 +504,14 @@ async fn fetch_file_content(
   )
 }
 
-fn extract_branch_from_ref(git_ref: &str) -> &str {
-  git_ref.strip_prefix("refs/heads/").unwrap_or(git_ref)
+fn parse_push_ref(git_ref: &str) -> (Option<String>, Option<String>) {
+  if let Some(branch) = git_ref.strip_prefix("refs/heads/") {
+    (Some(branch.to_string()), None)
+  } else if let Some(tag) = git_ref.strip_prefix("refs/tags/") {
+    (None, Some(tag.to_string()))
+  } else {
+    (None, None)
+  }
 }
 
 fn signature_matches(payload: &[u8], signature_header: &str, secret: &str) -> bool {

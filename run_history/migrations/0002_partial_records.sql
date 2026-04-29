@@ -1,0 +1,6 @@
+ALTER TABLE pipeline_runs ALTER COLUMN completed_at DROP NOT NULL;
+
+ALTER TABLE node_runs
+  ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ALTER COLUMN completed_at DROP NOT NULL,
+  ALTER COLUMN success SET DEFAULT FALSE;

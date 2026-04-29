@@ -1,0 +1,5 @@
+ALTER TABLE pipeline_runs ALTER COLUMN success DROP NOT NULL;
+
+ALTER TABLE node_runs
+  ALTER COLUMN success DROP NOT NULL,
+  ALTER COLUMN success DROP DEFAULT;

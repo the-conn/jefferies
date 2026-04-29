@@ -82,7 +82,7 @@ pub struct BuildConfig {
   pub build_args: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum NodeKind {
   Exec,
   Build(BuildConfig),
@@ -122,7 +122,7 @@ struct NamedStep {
   run: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeInfo {
   pub name: String,
   pub image: String,

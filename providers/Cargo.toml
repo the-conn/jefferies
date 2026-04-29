@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 backplane = { workspace = true }
+chrono = { workspace = true }
 coordinator = { workspace = true }
+run_history = { workspace = true }
 hmac = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

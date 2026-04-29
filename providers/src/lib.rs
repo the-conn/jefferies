@@ -7,6 +7,7 @@ use axum::http::HeaderMap;
 use backplane::Backplane;
 use coordinator::{Dispatcher, SourceManager};
 pub use github::GithubProvider;
+use run_history::RunHistory;
 use state_store::StateStore;
 
 pub(crate) fn get_header(headers: &HeaderMap, key: &str) -> String {
@@ -24,6 +25,7 @@ pub struct ProviderState {
   pub backplane: Arc<dyn Backplane>,
   pub dispatcher: Arc<dyn Dispatcher>,
   pub source_manager: Arc<SourceManager>,
+  pub run_history: Arc<dyn RunHistory>,
 }
 
 impl ProviderState {
@@ -33,6 +35,7 @@ impl ProviderState {
     backplane: Arc<dyn Backplane>,
     dispatcher: Arc<dyn Dispatcher>,
     source_manager: Arc<SourceManager>,
+    run_history: Arc<dyn RunHistory>,
   ) -> Self {
     Self {
       config,
@@ -40,6 +43,7 @@ impl ProviderState {
       backplane,
       dispatcher,
       source_manager,
+      run_history,
     }
   }
 }

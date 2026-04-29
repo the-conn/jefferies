@@ -2,12 +2,38 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app_config::AppConfig;
 use backplane::{Backplane, BackplaneEvent};
+use chrono::{DateTime, Utc};
 use pipelines::{NodeInfo, Pipeline};
+use run_history::{
+  NodeDispatchRecord, NodeRunRecord, PipelineRunRecord, PipelineStartRecord, RunHistory,
+};
 use state_store::{NodeStatus, StateStore, StateStoreError};
 use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 use tracing::{error, info, warn};
 
 use crate::{dispatcher::Dispatcher, message::CoordinatorMessage, run::PipelineRun};
+
+pub struct RunContext {
+  pub owner: String,
+  pub repo: String,
+  pub sha: String,
+  pub branch: Option<String>,
+  pub target_branch: Option<String>,
+  pub tag: Option<String>,
+  pub pr_number: Option<i64>,
+  pub trigger: String,
+  pub pipeline_yaml: String,
+  pub created_at: DateTime<Utc>,
+  pub retry_of: Option<String>,
+}
+
+pub struct CoordinatorServices {
+  pub config: Arc<AppConfig>,
+  pub dispatcher: Arc<dyn Dispatcher>,
+  pub state_store: Arc<dyn StateStore>,
+  pub backplane: Arc<dyn Backplane>,
+  pub run_history: Arc<dyn RunHistory>,
+}
 
 pub struct RunSummary {
   pub run_id: String,
@@ -31,19 +57,23 @@ struct Coordinator {
   state_version: u64,
   lease_version: u64,
   server_id: String,
+  run_context: RunContext,
+  run_history: Arc<dyn RunHistory>,
 }
 
 pub async fn start_coordinator(
   run_id: String,
   pipeline: Arc<Pipeline>,
-  config: Arc<AppConfig>,
-  dispatcher: Arc<dyn Dispatcher>,
-  state_store: Arc<dyn StateStore>,
-  backplane: Arc<dyn Backplane>,
+  services: CoordinatorServices,
+  run_context: RunContext,
 ) -> Option<JoinHandle<RunSummary>> {
   let server_id = uuid::Uuid::new_v4().to_string();
 
-  let lease_version = match state_store.try_acquire_lease(&run_id, &server_id, 30).await {
+  let lease_version = match services
+    .state_store
+    .try_acquire_lease(&run_id, &server_id, 30)
+    .await
+  {
     Ok(Some(v)) => v,
     Ok(None) => {
       info!(
@@ -64,8 +94,13 @@ pub async fn start_coordinator(
     .map(|n| (n.name.clone(), n.clone()))
     .collect();
 
-  let (run, state_version) =
-    initialize_run_state(&run_id, &node_infos, &pipeline, state_store.as_ref()).await;
+  let (run, state_version) = initialize_run_state(
+    &run_id,
+    &node_infos,
+    &pipeline,
+    services.state_store.as_ref(),
+  )
+  .await;
 
   let (internal_tx, internal_rx) = mpsc::channel(128);
 
@@ -73,17 +108,19 @@ pub async fn start_coordinator(
     run_id,
     run,
     pipeline,
-    config,
+    config: services.config,
     node_info_cache,
     node_timeout_handles: HashMap::new(),
     internal_tx,
     internal_rx,
-    dispatcher,
-    state_store,
-    backplane,
+    dispatcher: services.dispatcher,
+    state_store: services.state_store,
+    backplane: services.backplane,
     state_version,
     lease_version,
     server_id,
+    run_context,
+    run_history: services.run_history,
   };
 
   Some(tokio::spawn(coordinator.run()))
@@ -121,9 +158,14 @@ async fn initialize_run_state(
   }
 }
 
+fn ms_to_datetime(ms: u128) -> Option<DateTime<Utc>> {
+  DateTime::from_timestamp((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as u32)
+}
+
 impl Coordinator {
   async fn run(mut self) -> RunSummary {
     info!(run_id = %self.run_id, server_id = %self.server_id, "Coordinator starting");
+    self.record_pipeline_started().await;
 
     let pipeline_timeout_secs = self
       .pipeline
@@ -146,6 +188,7 @@ impl Coordinator {
     self.dispatch_ready_nodes().await;
 
     if self.run.is_complete() {
+      self.record_history(false).await;
       self.cleanup().await;
       return self.build_summary(false);
     }
@@ -158,6 +201,7 @@ impl Coordinator {
             timeout_secs = pipeline_timeout_secs,
             "Pipeline timeout exceeded"
           );
+          self.record_history(true).await;
           self.cleanup().await;
           return self.handle_cancellation().await;
         }
@@ -174,6 +218,7 @@ impl Coordinator {
         msg = self.internal_rx.recv() => {
           if let Some(CoordinatorMessage::NodeTimedOut { node_name }) = msg {
             if self.handle_node_timed_out(&node_name).await {
+              self.record_history(true).await;
               self.cleanup().await;
               return self.handle_cancellation().await;
             }
@@ -187,6 +232,7 @@ impl Coordinator {
             Some(BackplaneEvent::NodeCompleted { node_name, success }) => {
               self.cancel_node_timeout(&node_name);
               if self.handle_node_completed(&node_name, success).await {
+                self.record_history(true).await;
                 self.cleanup().await;
                 return self.handle_cancellation().await;
               }
@@ -196,11 +242,13 @@ impl Coordinator {
             }
             Some(BackplaneEvent::Cancel) => {
               info!(run_id = %self.run_id, "Received Cancel event from backplane");
+              self.record_history(true).await;
               self.cleanup().await;
               return self.handle_cancellation().await;
             }
             None => {
               warn!(run_id = %self.run_id, "Backplane subscription closed unexpectedly");
+              self.record_history(true).await;
               self.cleanup().await;
               return self.handle_cancellation().await;
             }
@@ -209,6 +257,7 @@ impl Coordinator {
       }
     }
 
+    self.record_history(false).await;
     self.cleanup().await;
     self.build_summary(false)
   }
@@ -248,6 +297,7 @@ impl Coordinator {
         error!(run_id = %self.run_id, error = %e, "Failed to persist state after node success; stopping");
         return true;
       }
+      self.record_node_completed(node_name).await;
       self.dispatch_ready_nodes().await;
       false
     } else {
@@ -260,6 +310,7 @@ impl Coordinator {
         error!(run_id = %self.run_id, error = %e, "Failed to persist state after node failure; stopping");
         return true;
       }
+      self.record_node_completed(node_name).await;
       if self.fail_fast_enabled() {
         warn!(run_id = %self.run_id, node_name, "Fail-fast enabled; cancelling pipeline");
         true
@@ -286,6 +337,7 @@ impl Coordinator {
     {
       warn!(run_id = %self.run_id, node_name, error = %e, "Failed to cancel timed-out node");
     }
+    self.record_node_completed(node_name).await;
     if self.fail_fast_enabled() {
       warn!(run_id = %self.run_id, node_name, "Fail-fast enabled; cancelling pipeline");
       true
@@ -320,6 +372,7 @@ impl Coordinator {
             warn!(run_id = %self.run_id, node_name = %node_name, "Unexpected state transition: node was not Pending");
           } else {
             info!(run_id = %self.run_id, node_name = %node_name, "Node dispatched");
+            self.record_node_dispatched(&node_name, node).await;
             let timeout_handle = self.spawn_node_timeout(&node_name, node.timeout_secs);
             self.node_timeout_handles.insert(node_name, timeout_handle);
           }
@@ -371,6 +424,135 @@ impl Coordinator {
     }
   }
 
+  async fn record_pipeline_started(&self) {
+    let record = PipelineStartRecord {
+      run_id: self.run_id.clone(),
+      pipeline_name: self.pipeline.name().to_string(),
+      owner: self.run_context.owner.clone(),
+      repo: self.run_context.repo.clone(),
+      sha: self.run_context.sha.clone(),
+      branch: self.run_context.branch.clone(),
+      target_branch: self.run_context.target_branch.clone(),
+      tag: self.run_context.tag.clone(),
+      pr_number: self.run_context.pr_number,
+      trigger: self.run_context.trigger.clone(),
+      pipeline_definition: self.run_context.pipeline_yaml.clone(),
+      created_at: self.run_context.created_at,
+      retry_of: self.run_context.retry_of.clone(),
+    };
+    if let Err(e) = self.run_history.record_pipeline_started(record).await {
+      warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline start");
+    }
+  }
+
+  async fn record_node_dispatched(&self, node_name: &str, node: &NodeInfo) {
+    let node_definition = serde_json::to_string(node).unwrap_or_default();
+    let record = NodeDispatchRecord {
+      run_id: self.run_id.clone(),
+      node_name: node_name.to_string(),
+      node_definition,
+      created_at: Utc::now(),
+    };
+    if let Err(e) = self.run_history.record_node_dispatched(record).await {
+      warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record node dispatch");
+    }
+  }
+
+  async fn record_node_completed(&self, node_name: &str) {
+    let node_success = self
+      .run
+      .statuses()
+      .get(node_name)
+      .map(|s| *s == NodeStatus::Success)
+      .unwrap_or(false);
+
+    let node_definition = self
+      .node_info_cache
+      .get(node_name)
+      .and_then(|info| serde_json::to_string(info).ok())
+      .unwrap_or_default();
+
+    let outcome = match self
+      .dispatcher
+      .get_node_outcome(&self.run_id, node_name)
+      .await
+    {
+      Ok(o) => o,
+      Err(e) => {
+        warn!(run_id = %self.run_id, node_name, error = %e, "Failed to fetch node outcome for history");
+        None
+      }
+    };
+
+    let started_at = outcome
+      .as_ref()
+      .and_then(|o| o.started_at)
+      .and_then(ms_to_datetime);
+    let node_completed_at = outcome
+      .as_ref()
+      .and_then(|o| o.finished_at)
+      .and_then(ms_to_datetime);
+
+    let output_log = match self.dispatcher.get_node_log(&self.run_id, node_name).await {
+      Ok(log) => log,
+      Err(e) => {
+        warn!(run_id = %self.run_id, node_name, error = %e, "Failed to fetch node log for history");
+        None
+      }
+    };
+
+    let node_record = NodeRunRecord {
+      run_id: self.run_id.clone(),
+      node_name: node_name.to_string(),
+      node_definition,
+      success: node_success,
+      created_at: Utc::now(),
+      started_at,
+      completed_at: node_completed_at,
+      output_log,
+    };
+    if let Err(e) = self.run_history.record_node_run(node_record).await {
+      warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record node run history");
+    }
+  }
+
+  async fn record_history(&self, cancelled: bool) {
+    let completed_at = Utc::now();
+    let success = !cancelled
+      && self
+        .run
+        .statuses()
+        .values()
+        .all(|s| *s == NodeStatus::Success);
+
+    let pipeline_record = PipelineRunRecord {
+      run_id: self.run_id.clone(),
+      pipeline_name: self.pipeline.name().to_string(),
+      owner: self.run_context.owner.clone(),
+      repo: self.run_context.repo.clone(),
+      sha: self.run_context.sha.clone(),
+      branch: self.run_context.branch.clone(),
+      target_branch: self.run_context.target_branch.clone(),
+      tag: self.run_context.tag.clone(),
+      pr_number: self.run_context.pr_number,
+      trigger: self.run_context.trigger.clone(),
+      pipeline_definition: self.run_context.pipeline_yaml.clone(),
+      success,
+      cancelled,
+      created_at: self.run_context.created_at,
+      completed_at: Some(completed_at),
+      retry_of: self.run_context.retry_of.clone(),
+    };
+    if let Err(e) = self.run_history.record_pipeline_run(pipeline_record).await {
+      warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
+    }
+
+    let node_names: Vec<String> = self.run.statuses().keys().cloned().collect();
+    for node_name in node_names {
+      self.record_node_completed(&node_name).await;
+    }
+  }
+
   async fn cleanup(&self) {
     if let Err(e) = self.dispatcher.cleanup_run(&self.run_id).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to clean up S3 objects for run");
@@ -410,6 +592,8 @@ mod tests {
   use std::sync::Arc;
 
   use backplane::InMemoryBackplane;
+  use chrono::Utc;
+  use run_history::NoOpRunHistory;
   use state_store::InMemoryStateStore;
 
   use super::*;
@@ -490,10 +674,26 @@ nodes:
     let handle = start_coordinator(
       "test-run-1".to_string(),
       pipeline,
-      config,
-      dispatcher,
-      state_store,
-      backplane,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: Arc::new(NoOpRunHistory),
+      },
+      RunContext {
+        owner: String::new(),
+        repo: String::new(),
+        sha: String::new(),
+        branch: None,
+        target_branch: None,
+        tag: None,
+        pr_number: None,
+        trigger: "push".into(),
+        pipeline_yaml: String::new(),
+        created_at: Utc::now(),
+        retry_of: None,
+      },
     )
     .await
     .expect("Should acquire lease");
@@ -522,10 +722,26 @@ nodes:
     let result = start_coordinator(
       "test-run-2".to_string(),
       pipeline,
-      config,
-      dispatcher,
-      state_store,
-      backplane,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: Arc::new(NoOpRunHistory),
+      },
+      RunContext {
+        owner: String::new(),
+        repo: String::new(),
+        sha: String::new(),
+        branch: None,
+        target_branch: None,
+        tag: None,
+        pr_number: None,
+        trigger: "push".into(),
+        pipeline_yaml: String::new(),
+        created_at: Utc::now(),
+        retry_of: None,
+      },
     )
     .await;
 

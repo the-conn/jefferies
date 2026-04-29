@@ -3,13 +3,17 @@ use std::{sync::Arc, time::Duration};
 use app_config::AppConfig;
 use axum::{
   Json, Router,
-  extract::{Path, State},
+  extract::{Path, Query, State},
   http::{HeaderMap, StatusCode},
   routing::{get, post},
 };
 use backplane::RabbitmqBackplane;
 use coordinator::{KubeDispatcher, SourceError, SourceManager, start_reaper};
 use providers::{GithubProvider, ProviderState};
+use run_history::{
+  ListRunsQuery, NodeRunRow, PipelineRunRow, PostgresRunHistory, SortColumn, SortOrder,
+};
+use serde::Deserialize;
 use state_store::RunState;
 use thiserror::Error;
 use tokio::signal;
@@ -29,6 +33,8 @@ pub enum ServerError {
   Backplane(#[from] backplane::BackplaneError),
   #[error("Source manager error: {0}")]
   Source(#[from] SourceError),
+  #[error("Run history error: {0}")]
+  RunHistory(#[from] run_history::RunHistoryError),
   #[error("Connection check failed: {0}")]
   ConnectionFailed(String),
 }
@@ -47,6 +53,17 @@ fn router(state: Arc<ProviderState>) -> Router {
     )
     .route("/api/v1/runs/{run_id}/cancel", post(cancel_pipeline_run))
     .route("/api/v1/runs/{run_id}/status", get(get_run_status))
+    .route("/api/v1/runs", get(list_runs))
+    .route("/api/v1/runs/{run_id}", get(get_run))
+    .route("/api/v1/runs/{run_id}/nodes", get(list_run_nodes))
+    .route(
+      "/api/v1/runs/{run_id}/nodes/{node_name}/logs",
+      get(get_node_log),
+    )
+    .route(
+      "/api/v1/runs/{run_id}/retry",
+      post(GithubProvider::retry_run),
+    )
     .route("/webhooks/github", post(GithubProvider::handle_webhook))
     .layer(
       TraceLayer::new_for_http()
@@ -156,6 +173,21 @@ async fn verify_connections(state: &ProviderState, verbose: bool) -> Result<(), 
     "S3 connection successful"
   );
 
+  conn_info!(
+    host = %state.config.postgres_host(),
+    db = %state.config.postgres_db(),
+    "Checking PostgreSQL connection..."
+  );
+  state.run_history.ping().await.map_err(|e| {
+    error!(host = %state.config.postgres_host(), error = %e, "Failed to connect to PostgreSQL");
+    ServerError::ConnectionFailed(format!("PostgreSQL: {e}"))
+  })?;
+  conn_info!(
+    host = %state.config.postgres_host(),
+    db = %state.config.postgres_db(),
+    "PostgreSQL connection successful"
+  );
+
   Ok(())
 }
 
@@ -178,12 +210,23 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
       .map_err(|e| ServerError::ConnectionFailed(format!("Kubernetes: {e}")))?,
   );
 
+  let run_history = Arc::new(
+    PostgresRunHistory::connect(&shared_config)
+      .await
+      .map_err(|e| ServerError::ConnectionFailed(format!("PostgreSQL: {e}")))?,
+  );
+  run_history
+    .migrate()
+    .await
+    .map_err(|e| ServerError::ConnectionFailed(format!("PostgreSQL migration: {e}")))?;
+
   let state = Arc::new(ProviderState::new(
     shared_config.clone(),
     state_store,
     backplane,
     dispatcher,
     source_manager,
+    run_history,
   ));
 
   verify_connections(&state, true).await?;
@@ -244,7 +287,7 @@ async fn handle_node_poke(
   };
   match state
     .backplane
-    .publish_node_completed(&run_id, &node_name, outcome.success)
+    .publish_node_completed(&run_id, &node_name, outcome.success.unwrap_or(false))
     .await
   {
     Ok(()) => StatusCode::OK,
@@ -286,11 +329,93 @@ async fn get_run_status(
   }
 }
 
+#[derive(Debug, Deserialize)]
+struct ListRunsParams {
+  limit: Option<i64>,
+  offset: Option<i64>,
+  sort_by: Option<String>,
+  order: Option<String>,
+  owner: Option<String>,
+  repo: Option<String>,
+  pipeline_name: Option<String>,
+}
+
+async fn list_runs(
+  State(state): State<Arc<ProviderState>>,
+  Query(params): Query<ListRunsParams>,
+) -> Result<Json<Vec<PipelineRunRow>>, StatusCode> {
+  let limit = params.limit.unwrap_or(50).clamp(1, 200);
+  let offset = params.offset.unwrap_or(0).max(0);
+  let sort_by = SortColumn::parse(params.sort_by.as_deref().unwrap_or("created_at"))
+    .ok_or(StatusCode::BAD_REQUEST)?;
+  let order =
+    SortOrder::parse(params.order.as_deref().unwrap_or("desc")).ok_or(StatusCode::BAD_REQUEST)?;
+
+  let query = ListRunsQuery {
+    limit,
+    offset,
+    sort_by,
+    order,
+    owner: params.owner,
+    repo: params.repo,
+    pipeline_name: params.pipeline_name,
+  };
+  match state.run_history.list_pipeline_runs(query).await {
+    Ok(rows) => Ok(Json(rows)),
+    Err(e) => {
+      warn!(error = %e, "Failed to list pipeline runs");
+      Err(StatusCode::INTERNAL_SERVER_ERROR)
+    }
+  }
+}
+
+async fn get_run(
+  State(state): State<Arc<ProviderState>>,
+  Path(run_id): Path<String>,
+) -> (StatusCode, Json<Option<PipelineRunRow>>) {
+  match state.run_history.get_pipeline_run(&run_id).await {
+    Ok(Some(row)) => (StatusCode::OK, Json(Some(row))),
+    Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
+    Err(e) => {
+      warn!(run_id, error = %e, "Failed to get pipeline run");
+      (StatusCode::INTERNAL_SERVER_ERROR, Json(None))
+    }
+  }
+}
+
+async fn list_run_nodes(
+  State(state): State<Arc<ProviderState>>,
+  Path(run_id): Path<String>,
+) -> (StatusCode, Json<Vec<NodeRunRow>>) {
+  match state.run_history.list_node_runs(&run_id).await {
+    Ok(rows) => (StatusCode::OK, Json(rows)),
+    Err(e) => {
+      warn!(run_id, error = %e, "Failed to list node runs");
+      (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
+    }
+  }
+}
+
+async fn get_node_log(
+  State(state): State<Arc<ProviderState>>,
+  Path((run_id, node_name)): Path<(String, String)>,
+) -> (StatusCode, String) {
+  match state.run_history.get_node_log(&run_id, &node_name).await {
+    Ok(Some(log)) => (StatusCode::OK, log),
+    Ok(None) => (StatusCode::NOT_FOUND, String::new()),
+    Err(e) => {
+      warn!(run_id, node_name, error = %e, "Failed to get node log");
+      (StatusCode::INTERNAL_SERVER_ERROR, String::new())
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use axum::{body::Body, http::Request};
   use backplane::InMemoryBackplane;
   use coordinator::LogDispatcher;
+  use run_history::NoOpRunHistory;
   use state_store::InMemoryStateStore;
   use tower::ServiceExt;
 
@@ -305,12 +430,14 @@ mod tests {
       backplane.clone(),
       source_manager.clone(),
     ));
+    let run_history = Arc::new(NoOpRunHistory);
     Arc::new(ProviderState::new(
       config,
       state_store,
       backplane,
       dispatcher,
       source_manager,
+      run_history,
     ))
   }
 
@@ -358,5 +485,65 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn test_list_runs_returns_empty_array() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/v1/runs")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn test_get_run_unknown_returns_404() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/v1/runs/00000000-0000-0000-0000-000000000000")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+  }
+
+  #[tokio::test]
+  async fn test_list_runs_invalid_sort_returns_400() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/v1/runs?sort_by=evil_column")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+  }
+
+  #[tokio::test]
+  async fn test_list_runs_invalid_order_returns_400() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/v1/runs?order=sideways")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
   }
 }

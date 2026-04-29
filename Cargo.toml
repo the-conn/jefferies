@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["app_config", "coordinator", "pipelines", "providers", "server", "state_store", "backplane"]
+members = ["app_config", "coordinator", "pipelines", "providers", "run_history", "server", "state_store", "backplane"]
 
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
@@ -17,7 +17,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tokio = { version = "1.50.0", features = ["full"] }
 axum = "0.8.8"
 tower-http = { version = "0.6.8", features = ["cors", "trace"] }
-uuid = { version = "1.23.0", features = ["v4"] }
+uuid = { version = "1.23.0", features = ["v4", "serde"] }
 reqwest = "0.13.2"
 rustls = { version = "0.23", features = ["ring"] }
 kube = { version = "3.1.0", features = ["runtime", "derive"] }
@@ -28,8 +28,11 @@ config = "0.15.22"
 anyhow = "1.0.102"
 app_config = { path = "app_config" }
 coordinator = { path = "coordinator" }
+run_history = { path = "run_history" }
 server = { path = "server" }
 pipelines = { path = "pipelines" }
+chrono = { version = "0.4.44", features = ["serde"] }
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls", "migrate", "chrono", "uuid"] }
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"

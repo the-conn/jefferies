@@ -73,6 +73,15 @@ struct KubernetesConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct PostgresConfig {
+  host: String,
+  port: u16,
+  db: String,
+  username: String,
+  password: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AppConfig {
   server: ServerConfig,
   log: LogConfig,
@@ -82,6 +91,7 @@ pub struct AppConfig {
   rabbitmq: RabbitmqConfig,
   s3: S3Config,
   kubernetes: KubernetesConfig,
+  postgres: PostgresConfig,
 }
 
 impl AppConfig {
@@ -196,5 +206,25 @@ impl AppConfig {
 
   pub fn buildah_image(&self) -> &str {
     &self.kubernetes.buildah_image
+  }
+
+  pub fn postgres_host(&self) -> &str {
+    &self.postgres.host
+  }
+
+  pub fn postgres_port(&self) -> u16 {
+    self.postgres.port
+  }
+
+  pub fn postgres_db(&self) -> &str {
+    &self.postgres.db
+  }
+
+  pub fn postgres_username(&self) -> &str {
+    &self.postgres.username
+  }
+
+  pub fn postgres_password(&self) -> &str {
+    &self.postgres.password
   }
 }

@@ -22,7 +22,7 @@ use aws_smithy_types::config_bag::ConfigBag;
 use http_body_util::BodyExt;
 use octocrab::Octocrab;
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 const PRESIGN_EXPIRES_SECS: u64 = 43200;
 const PART_SIZE: usize = 8 * 1024 * 1024; // 8 MiB; S3 minimum is 5 MiB except for the last part
@@ -63,7 +63,9 @@ pub enum SourceError {
 
 #[derive(serde::Deserialize)]
 pub struct NodeOutcome {
-  pub success: bool,
+  pub success: Option<bool>,
+  pub started_at: Option<u128>,
+  pub finished_at: Option<u128>,
 }
 
 pub struct SourceManager {
@@ -364,6 +366,42 @@ impl SourceManager {
           .map_err(|e| SourceError::S3(e.to_string()))?
           .into_bytes();
         serde_json::from_slice::<NodeOutcome>(&bytes).map_err(|e| SourceError::S3(e.to_string()))
+      }
+    }
+  }
+
+  pub async fn get_node_log(
+    &self,
+    run_id: &str,
+    node_name: &str,
+  ) -> Result<Option<String>, SourceError> {
+    let key = logs_key(run_id, node_name);
+    match self
+      .s3
+      .get_object()
+      .bucket(&self.bucket)
+      .key(&key)
+      .send()
+      .await
+    {
+      Err(e)
+        if e
+          .as_service_error()
+          .map(|se| se.is_no_such_key())
+          .unwrap_or(false) =>
+      {
+        warn!(run_id, node_name, "Node output log not found in S3");
+        Ok(None)
+      }
+      Err(e) => Err(SourceError::S3(e.to_string())),
+      Ok(output) => {
+        let bytes = output
+          .body
+          .collect()
+          .await
+          .map_err(|e| SourceError::S3(e.to_string()))?
+          .into_bytes();
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
       }
     }
   }
