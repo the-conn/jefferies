@@ -17,9 +17,14 @@ pub struct RunContext {
   pub owner: String,
   pub repo: String,
   pub sha: String,
+  pub branch: Option<String>,
+  pub target_branch: Option<String>,
+  pub tag: Option<String>,
+  pub pr_number: Option<i64>,
   pub trigger: String,
   pub pipeline_yaml: String,
   pub created_at: DateTime<Utc>,
+  pub retry_of: Option<String>,
 }
 
 pub struct CoordinatorServices {
@@ -426,9 +431,14 @@ impl Coordinator {
       owner: self.run_context.owner.clone(),
       repo: self.run_context.repo.clone(),
       sha: self.run_context.sha.clone(),
+      branch: self.run_context.branch.clone(),
+      target_branch: self.run_context.target_branch.clone(),
+      tag: self.run_context.tag.clone(),
+      pr_number: self.run_context.pr_number,
       trigger: self.run_context.trigger.clone(),
       pipeline_definition: self.run_context.pipeline_yaml.clone(),
       created_at: self.run_context.created_at,
+      retry_of: self.run_context.retry_of.clone(),
     };
     if let Err(e) = self.run_history.record_pipeline_started(record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline start");
@@ -521,12 +531,17 @@ impl Coordinator {
       owner: self.run_context.owner.clone(),
       repo: self.run_context.repo.clone(),
       sha: self.run_context.sha.clone(),
+      branch: self.run_context.branch.clone(),
+      target_branch: self.run_context.target_branch.clone(),
+      tag: self.run_context.tag.clone(),
+      pr_number: self.run_context.pr_number,
       trigger: self.run_context.trigger.clone(),
       pipeline_definition: self.run_context.pipeline_yaml.clone(),
       success,
       cancelled,
       created_at: self.run_context.created_at,
       completed_at: Some(completed_at),
+      retry_of: self.run_context.retry_of.clone(),
     };
     if let Err(e) = self.run_history.record_pipeline_run(pipeline_record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
@@ -670,9 +685,14 @@ nodes:
         owner: String::new(),
         repo: String::new(),
         sha: String::new(),
+        branch: None,
+        target_branch: None,
+        tag: None,
+        pr_number: None,
         trigger: "push".into(),
         pipeline_yaml: String::new(),
         created_at: Utc::now(),
+        retry_of: None,
       },
     )
     .await
@@ -713,9 +733,14 @@ nodes:
         owner: String::new(),
         repo: String::new(),
         sha: String::new(),
+        branch: None,
+        target_branch: None,
+        tag: None,
+        pr_number: None,
         trigger: "push".into(),
         pipeline_yaml: String::new(),
         created_at: Utc::now(),
+        retry_of: None,
       },
     )
     .await;

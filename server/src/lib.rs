@@ -60,6 +60,10 @@ fn router(state: Arc<ProviderState>) -> Router {
       "/api/v1/runs/{run_id}/nodes/{node_name}/logs",
       get(get_node_log),
     )
+    .route(
+      "/api/v1/runs/{run_id}/retry",
+      post(GithubProvider::retry_run),
+    )
     .route("/webhooks/github", post(GithubProvider::handle_webhook))
     .layer(
       TraceLayer::new_for_http()

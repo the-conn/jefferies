@@ -77,9 +77,14 @@ async fn reclaim_orphaned_runs(
         owner: String::new(),
         repo: String::new(),
         sha: String::new(),
+        branch: None,
+        target_branch: None,
+        tag: None,
+        pr_number: None,
         trigger: String::new(),
         pipeline_yaml: String::new(),
         created_at: Utc::now(),
+        retry_of: None,
       },
     )
     .await

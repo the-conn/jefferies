@@ -22,9 +22,14 @@ pub struct PipelineStartRecord {
   pub owner: String,
   pub repo: String,
   pub sha: String,
+  pub branch: Option<String>,
+  pub target_branch: Option<String>,
+  pub tag: Option<String>,
+  pub pr_number: Option<i64>,
   pub trigger: String,
   pub pipeline_definition: String,
   pub created_at: DateTime<Utc>,
+  pub retry_of: Option<String>,
 }
 
 pub struct PipelineRunRecord {
@@ -33,12 +38,17 @@ pub struct PipelineRunRecord {
   pub owner: String,
   pub repo: String,
   pub sha: String,
+  pub branch: Option<String>,
+  pub target_branch: Option<String>,
+  pub tag: Option<String>,
+  pub pr_number: Option<i64>,
   pub trigger: String,
   pub pipeline_definition: String,
   pub success: bool,
   pub cancelled: bool,
   pub created_at: DateTime<Utc>,
   pub completed_at: Option<DateTime<Utc>>,
+  pub retry_of: Option<String>,
 }
 
 pub struct NodeDispatchRecord {
@@ -66,12 +76,17 @@ pub struct PipelineRunRow {
   pub owner: String,
   pub repo: String,
   pub sha: String,
+  pub branch: Option<String>,
+  pub target_branch: Option<String>,
+  pub tag: Option<String>,
+  pub pr_number: Option<i64>,
   pub trigger: String,
   pub pipeline_definition: String,
   pub success: Option<bool>,
   pub cancelled: bool,
   pub created_at: DateTime<Utc>,
   pub completed_at: Option<DateTime<Utc>>,
+  pub retry_of: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -206,19 +221,26 @@ fn parse_run_id(s: &str) -> Result<Uuid, RunHistoryError> {
 impl RunHistory for PostgresRunHistory {
   async fn record_pipeline_started(&self, r: PipelineStartRecord) -> Result<(), RunHistoryError> {
     let run_id = parse_run_id(&r.run_id)?;
+    let retry_of = r.retry_of.as_deref().map(parse_run_id).transpose()?;
     sqlx::query(
       "INSERT INTO pipeline_runs \
-       (run_id, pipeline_name, owner, repo, sha, trigger, pipeline_definition, created_at) \
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (run_id) DO NOTHING",
+       (run_id, pipeline_name, owner, repo, sha, branch, target_branch, tag, pr_number, \
+        trigger, pipeline_definition, created_at, retry_of) \
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (run_id) DO NOTHING",
     )
     .bind(run_id)
     .bind(&r.pipeline_name)
     .bind(&r.owner)
     .bind(&r.repo)
     .bind(&r.sha)
+    .bind(r.branch.as_deref())
+    .bind(r.target_branch.as_deref())
+    .bind(r.tag.as_deref())
+    .bind(r.pr_number)
     .bind(&r.trigger)
     .bind(&r.pipeline_definition)
     .bind(r.created_at)
+    .bind(retry_of)
     .execute(&self.pool)
     .await?;
     Ok(())
@@ -226,11 +248,12 @@ impl RunHistory for PostgresRunHistory {
 
   async fn record_pipeline_run(&self, r: PipelineRunRecord) -> Result<(), RunHistoryError> {
     let run_id = parse_run_id(&r.run_id)?;
+    let retry_of = r.retry_of.as_deref().map(parse_run_id).transpose()?;
     sqlx::query(
       "INSERT INTO pipeline_runs \
-       (run_id, pipeline_name, owner, repo, sha, trigger, pipeline_definition, \
-        success, cancelled, created_at, completed_at) \
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+       (run_id, pipeline_name, owner, repo, sha, branch, target_branch, tag, pr_number, \
+        trigger, pipeline_definition, success, cancelled, created_at, completed_at, retry_of) \
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
        ON CONFLICT (run_id) DO UPDATE SET \
          success = EXCLUDED.success, \
          cancelled = EXCLUDED.cancelled, \
@@ -241,12 +264,17 @@ impl RunHistory for PostgresRunHistory {
     .bind(&r.owner)
     .bind(&r.repo)
     .bind(&r.sha)
+    .bind(r.branch.as_deref())
+    .bind(r.target_branch.as_deref())
+    .bind(r.tag.as_deref())
+    .bind(r.pr_number)
     .bind(&r.trigger)
     .bind(&r.pipeline_definition)
     .bind(r.success)
     .bind(r.cancelled)
     .bind(r.created_at)
     .bind(r.completed_at)
+    .bind(retry_of)
     .execute(&self.pool)
     .await?;
     Ok(())
