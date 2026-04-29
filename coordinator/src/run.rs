@@ -139,6 +139,7 @@ mod tests {
       timeout_secs: None,
       checkout: false,
       env: std::collections::HashMap::new(),
+      kind: pipelines::NodeKind::Exec,
     }
   }
 

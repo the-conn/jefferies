@@ -68,6 +68,8 @@ struct KubernetesConfig {
   namespace: String,
   tube_image: String,
   default_node_image: String,
+  builder_namespace: String,
+  buildah_image: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,5 +188,13 @@ impl AppConfig {
 
   pub fn default_node_image(&self) -> &str {
     &self.kubernetes.default_node_image
+  }
+
+  pub fn builder_namespace(&self) -> &str {
+    &self.kubernetes.builder_namespace
+  }
+
+  pub fn buildah_image(&self) -> &str {
+    &self.kubernetes.buildah_image
   }
 }

@@ -1,4 +1,5 @@
-FROM rust:1.95-slim as builder
+ARG RUST_TAG=1.95-slim
+FROM rust:${RUST_TAG} as builder
 
 WORKDIR /usr/src/jefferies
 COPY . .
