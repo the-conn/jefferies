@@ -7,6 +7,7 @@ edition = "2024"
 async-trait = { workspace = true }
 app_config  = { workspace = true }
 chrono      = { workspace = true }
+serde       = { workspace = true }
 sqlx        = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
