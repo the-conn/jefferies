@@ -102,7 +102,10 @@ fn build_script(steps: &[String]) -> String {
 }
 
 fn build_buildah_script(config: &BuildConfig) -> String {
-  let mut cmd = format!("buildah bud -f {}", config.containerfile);
+  let mut cmd = format!(
+    "buildah bud --dns 8.8.8.8 --dns 1.1.1.1 -f {}",
+    config.containerfile
+  );
   for tag in &config.tags {
     cmd.push_str(&format!(" -t {tag}"));
   }
