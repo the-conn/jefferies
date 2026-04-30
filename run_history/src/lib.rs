@@ -244,6 +244,11 @@ pub trait RunHistory: Send + Sync {
   async fn get_pipeline_run(&self, run_id: &str)
   -> Result<Option<PipelineRunRow>, RunHistoryError>;
   async fn list_node_runs(&self, run_id: &str) -> Result<Vec<NodeRunRow>, RunHistoryError>;
+  async fn get_node_run(
+    &self,
+    run_id: &str,
+    node_name: &str,
+  ) -> Result<Option<NodeRunRow>, RunHistoryError>;
   async fn get_node_log(
     &self,
     run_id: &str,
@@ -428,6 +433,23 @@ impl RunHistory for PostgresRunHistory {
     Ok(rows)
   }
 
+  async fn get_node_run(
+    &self,
+    run_id: &str,
+    node_name: &str,
+  ) -> Result<Option<NodeRunRow>, RunHistoryError> {
+    let uuid = parse_run_id(run_id)?;
+    let row = sqlx::query_as::<_, NodeRunRow>(
+      "SELECT id, run_id, node_name, node_definition, success, created_at, started_at, completed_at \
+       FROM node_runs WHERE run_id = $1 AND node_name = $2",
+    )
+    .bind(uuid)
+    .bind(node_name)
+    .fetch_optional(&self.pool)
+    .await?;
+    Ok(row)
+  }
+
   async fn get_node_log(
     &self,
     run_id: &str,
@@ -482,6 +504,10 @@ impl RunHistory for NoOpRunHistory {
 
   async fn list_node_runs(&self, _: &str) -> Result<Vec<NodeRunRow>, RunHistoryError> {
     Ok(vec![])
+  }
+
+  async fn get_node_run(&self, _: &str, _: &str) -> Result<Option<NodeRunRow>, RunHistoryError> {
+    Ok(None)
   }
 
   async fn get_node_log(&self, _: &str, _: &str) -> Result<Option<String>, RunHistoryError> {

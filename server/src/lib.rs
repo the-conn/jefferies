@@ -56,6 +56,7 @@ fn router(state: Arc<ProviderState>) -> Router {
     .route("/api/v1/runs", get(list_runs))
     .route("/api/v1/runs/{run_id}", get(get_run))
     .route("/api/v1/runs/{run_id}/nodes", get(list_run_nodes))
+    .route("/api/v1/runs/{run_id}/nodes/{node_name}", get(get_run_node))
     .route(
       "/api/v1/runs/{run_id}/nodes/{node_name}/logs",
       get(get_node_log),
@@ -390,6 +391,20 @@ async fn list_run_nodes(
   }
 }
 
+async fn get_run_node(
+  State(state): State<Arc<ProviderState>>,
+  Path((run_id, node_name)): Path<(String, String)>,
+) -> (StatusCode, Json<Option<NodeRunRow>>) {
+  match state.run_history.get_node_run(&run_id, &node_name).await {
+    Ok(Some(row)) => (StatusCode::OK, Json(Some(row))),
+    Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
+    Err(e) => {
+      warn!(run_id, node_name, error = %e, "Failed to get node run");
+      (StatusCode::INTERNAL_SERVER_ERROR, Json(None))
+    }
+  }
+}
+
 async fn get_node_log(
   State(state): State<Arc<ProviderState>>,
   Path((run_id, node_name)): Path<(String, String)>,
@@ -503,6 +518,21 @@ mod tests {
       .oneshot(
         Request::builder()
           .uri("/api/v1/runs/00000000-0000-0000-0000-000000000000")
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+  }
+
+  #[tokio::test]
+  async fn test_get_run_node_unknown_returns_404() {
+    let app = router(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/v1/runs/00000000-0000-0000-0000-000000000000/nodes/missing")
           .body(Body::empty())
           .unwrap(),
       )
