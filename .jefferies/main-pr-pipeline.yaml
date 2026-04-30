@@ -1,4 +1,4 @@
-name: Jefferies Pipeline
+name: Jefferies Main PR Pipeline
 
 on:
   pull_request:
@@ -21,14 +21,3 @@ nodes:
     checkout: true
     steps:
       - cargo test --all-features --workspace
-
-  - name: Build Image
-    type: build
-    after: ["Unit Tests"]
-    checkout: true
-    config:
-      containerfile: Containerfile
-      tags:
-        - quay.io/the-conn/jefferies
-      build_args:
-        - RUST_TAG=1.95-slim

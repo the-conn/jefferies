@@ -5,7 +5,7 @@ use backplane::{Backplane, BackplaneEvent};
 use chrono::{DateTime, Utc};
 use pipelines::{NodeInfo, Pipeline};
 use run_history::{
-  NodeDispatchRecord, NodeRunRecord, PipelineRunRecord, PipelineStartRecord, RunHistory,
+  NodeDispatchRecord, NodeRunRecord, PipelineRunRecord, PipelineStartRecord, RunHistory, RunStatus,
 };
 use state_store::{NodeStatus, StateStore, StateStoreError};
 use tokio::{sync::mpsc, task::JoinHandle, time::interval};
@@ -37,8 +37,7 @@ pub struct CoordinatorServices {
 
 pub struct RunSummary {
   pub run_id: String,
-  pub success: bool,
-  pub cancelled: bool,
+  pub status: RunStatus,
   pub node_statuses: HashMap<String, NodeStatus>,
 }
 
@@ -178,7 +177,7 @@ impl Coordinator {
       Ok(sub) => sub,
       Err(e) => {
         error!(run_id = %self.run_id, error = %e, "Failed to subscribe to backplane");
-        return self.build_summary(true);
+        return self.build_summary(RunStatus::Failure);
       }
     };
 
@@ -188,9 +187,10 @@ impl Coordinator {
     self.dispatch_ready_nodes().await;
 
     if self.run.is_complete() {
-      self.record_history(false).await;
+      let status = self.outcome_status();
+      self.record_history(status).await;
       self.cleanup().await;
-      return self.build_summary(false);
+      return self.build_summary(status);
     }
 
     loop {
@@ -201,9 +201,9 @@ impl Coordinator {
             timeout_secs = pipeline_timeout_secs,
             "Pipeline timeout exceeded"
           );
-          self.record_history(true).await;
+          self.record_history(RunStatus::Failure).await;
           self.cleanup().await;
-          return self.handle_cancellation().await;
+          return self.terminate_running_nodes(RunStatus::Failure).await;
         }
         _ = heartbeat.tick() => {
           let renewed = self.state_store
@@ -212,15 +212,15 @@ impl Coordinator {
             .unwrap_or(false);
           if !renewed {
             warn!(run_id = %self.run_id, "Lease renewal failed; another server took over");
-            return self.build_summary(true);
+            return self.build_summary(RunStatus::Failure);
           }
         }
         msg = self.internal_rx.recv() => {
           if let Some(CoordinatorMessage::NodeTimedOut { node_name }) = msg {
             if self.handle_node_timed_out(&node_name).await {
-              self.record_history(true).await;
+              self.record_history(RunStatus::Failure).await;
               self.cleanup().await;
-              return self.handle_cancellation().await;
+              return self.terminate_running_nodes(RunStatus::Failure).await;
             }
             if self.run.is_complete() {
               break;
@@ -232,9 +232,9 @@ impl Coordinator {
             Some(BackplaneEvent::NodeCompleted { node_name, success }) => {
               self.cancel_node_timeout(&node_name);
               if self.handle_node_completed(&node_name, success).await {
-                self.record_history(true).await;
+                self.record_history(RunStatus::Failure).await;
                 self.cleanup().await;
-                return self.handle_cancellation().await;
+                return self.terminate_running_nodes(RunStatus::Failure).await;
               }
               if self.run.is_complete() {
                 break;
@@ -242,24 +242,38 @@ impl Coordinator {
             }
             Some(BackplaneEvent::Cancel) => {
               info!(run_id = %self.run_id, "Received Cancel event from backplane");
-              self.record_history(true).await;
+              self.record_history(RunStatus::Cancelled).await;
               self.cleanup().await;
-              return self.handle_cancellation().await;
+              return self.terminate_running_nodes(RunStatus::Cancelled).await;
             }
             None => {
               warn!(run_id = %self.run_id, "Backplane subscription closed unexpectedly");
-              self.record_history(true).await;
+              self.record_history(RunStatus::Failure).await;
               self.cleanup().await;
-              return self.handle_cancellation().await;
+              return self.terminate_running_nodes(RunStatus::Failure).await;
             }
           }
         }
       }
     }
 
-    self.record_history(false).await;
+    let status = self.outcome_status();
+    self.record_history(status).await;
     self.cleanup().await;
-    self.build_summary(false)
+    self.build_summary(status)
+  }
+
+  fn outcome_status(&self) -> RunStatus {
+    if self
+      .run
+      .statuses()
+      .values()
+      .all(|s| *s == NodeStatus::Success)
+    {
+      RunStatus::Success
+    } else {
+      RunStatus::Failure
+    }
   }
 
   async fn persist_state(&mut self) -> Result<(), StateStoreError> {
@@ -397,15 +411,15 @@ impl Coordinator {
     })
   }
 
-  async fn handle_cancellation(mut self) -> RunSummary {
-    info!(run_id = %self.run_id, "Coordinator handling cancellation");
+  async fn terminate_running_nodes(mut self, status: RunStatus) -> RunSummary {
+    info!(run_id = %self.run_id, status = status.as_str(), "Coordinator terminating running nodes");
 
     for (_, handle) in self.node_timeout_handles.drain() {
       handle.abort();
     }
 
-    for (node_name, status) in self.run.statuses() {
-      if *status == NodeStatus::Running
+    for (node_name, node_status) in self.run.statuses() {
+      if *node_status == NodeStatus::Running
         && let Err(e) = self
           .dispatcher
           .cancel_node(&self.run_id, node_name, &self.config)
@@ -418,8 +432,7 @@ impl Coordinator {
     let node_statuses = self.run.statuses().clone();
     RunSummary {
       run_id: self.run_id,
-      success: false,
-      cancelled: true,
+      status,
       node_statuses,
     }
   }
@@ -516,14 +529,8 @@ impl Coordinator {
     }
   }
 
-  async fn record_history(&self, cancelled: bool) {
+  async fn record_history(&self, status: RunStatus) {
     let completed_at = Utc::now();
-    let success = !cancelled
-      && self
-        .run
-        .statuses()
-        .values()
-        .all(|s| *s == NodeStatus::Success);
 
     let pipeline_record = PipelineRunRecord {
       run_id: self.run_id.clone(),
@@ -537,8 +544,7 @@ impl Coordinator {
       pr_number: self.run_context.pr_number,
       trigger: self.run_context.trigger.clone(),
       pipeline_definition: self.run_context.pipeline_yaml.clone(),
-      success,
-      cancelled,
+      status,
       created_at: self.run_context.created_at,
       completed_at: Some(completed_at),
       retry_of: self.run_context.retry_of.clone(),
@@ -565,23 +571,15 @@ impl Coordinator {
     }
   }
 
-  fn build_summary(&self, cancelled: bool) -> RunSummary {
-    let success = !cancelled
-      && self
-        .run
-        .statuses()
-        .values()
-        .all(|s| *s == NodeStatus::Success);
+  fn build_summary(&self, status: RunStatus) -> RunSummary {
     info!(
       run_id = %self.run_id,
-      success,
-      cancelled,
+      status = %status,
       "Coordinator completed"
     );
     RunSummary {
       run_id: self.run_id.clone(),
-      success,
-      cancelled,
+      status,
       node_statuses: self.run.statuses().clone(),
     }
   }
@@ -699,8 +697,7 @@ nodes:
     .expect("Should acquire lease");
 
     let summary = handle.await.expect("Coordinator should complete");
-    assert!(summary.success);
-    assert!(!summary.cancelled);
+    assert_eq!(summary.status, RunStatus::Success);
   }
 
   #[tokio::test]

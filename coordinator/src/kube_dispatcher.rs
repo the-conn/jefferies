@@ -148,8 +148,8 @@ fn build_env_vars(
 fn resource_requirements() -> ResourceRequirements {
   ResourceRequirements {
     requests: Some(BTreeMap::from([
-      ("cpu".to_string(), Quantity("1".to_string())),
-      ("memory".to_string(), Quantity("2Gi".to_string())),
+      ("cpu".to_string(), Quantity("500m".to_string())),
+      ("memory".to_string(), Quantity("1Gi".to_string())),
     ])),
     limits: Some(BTreeMap::from([
       ("cpu".to_string(), Quantity("2".to_string())),
