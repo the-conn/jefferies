@@ -1,8 +1,11 @@
 use app_config::AppConfig;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
-use sqlx::{FromRow, PgPool, postgres::PgConnectOptions};
+use serde::{Deserialize, Serialize};
+use sqlx::{
+  FromRow, PgPool, Postgres,
+  postgres::{PgConnectOptions, PgTypeInfo},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -14,6 +17,66 @@ pub enum RunHistoryError {
   Migration(#[from] sqlx::migrate::MigrateError),
   #[error("Invalid run ID: {0}")]
   InvalidRunId(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+  InProgress,
+  Success,
+  Failure,
+  Cancelled,
+}
+
+impl RunStatus {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::InProgress => "in_progress",
+      Self::Success => "success",
+      Self::Failure => "failure",
+      Self::Cancelled => "cancelled",
+    }
+  }
+
+  fn from_db_str(s: &str) -> Result<Self, sqlx::error::BoxDynError> {
+    match s {
+      "in_progress" => Ok(Self::InProgress),
+      "success" => Ok(Self::Success),
+      "failure" => Ok(Self::Failure),
+      "cancelled" => Ok(Self::Cancelled),
+      other => Err(format!("Unknown run status: {other}").into()),
+    }
+  }
+}
+
+impl std::fmt::Display for RunStatus {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+impl sqlx::Type<Postgres> for RunStatus {
+  fn type_info() -> PgTypeInfo {
+    <str as sqlx::Type<Postgres>>::type_info()
+  }
+}
+
+impl<'q> sqlx::Encode<'q, Postgres> for RunStatus {
+  fn encode_by_ref(
+    &self,
+    buf: &mut <Postgres as sqlx::Database>::ArgumentBuffer<'q>,
+  ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+    <&str as sqlx::Encode<Postgres>>::encode_by_ref(&self.as_str(), buf)
+  }
+}
+
+impl<'r> sqlx::Decode<'r, Postgres> for RunStatus {
+  fn decode(
+    value: <Postgres as sqlx::Database>::ValueRef<'r>,
+  ) -> Result<Self, sqlx::error::BoxDynError> {
+    let s = <&str as sqlx::Decode<Postgres>>::decode(value)?;
+    Self::from_db_str(s)
+  }
 }
 
 pub struct PipelineStartRecord {
@@ -44,8 +107,7 @@ pub struct PipelineRunRecord {
   pub pr_number: Option<i64>,
   pub trigger: String,
   pub pipeline_definition: String,
-  pub success: bool,
-  pub cancelled: bool,
+  pub status: RunStatus,
   pub created_at: DateTime<Utc>,
   pub completed_at: Option<DateTime<Utc>>,
   pub retry_of: Option<String>,
@@ -82,8 +144,7 @@ pub struct PipelineRunRow {
   pub pr_number: Option<i64>,
   pub trigger: String,
   pub pipeline_definition: String,
-  pub success: Option<bool>,
-  pub cancelled: bool,
+  pub status: RunStatus,
   pub created_at: DateTime<Utc>,
   pub completed_at: Option<DateTime<Utc>>,
   pub retry_of: Option<Uuid>,
@@ -107,7 +168,7 @@ pub enum SortColumn {
   CompletedAt,
   PipelineName,
   Owner,
-  Success,
+  Status,
 }
 
 impl SortColumn {
@@ -117,7 +178,7 @@ impl SortColumn {
       "completed_at" => Some(Self::CompletedAt),
       "pipeline_name" => Some(Self::PipelineName),
       "owner" => Some(Self::Owner),
-      "success" => Some(Self::Success),
+      "status" => Some(Self::Status),
       _ => None,
     }
   }
@@ -128,7 +189,7 @@ impl SortColumn {
       Self::CompletedAt => "completed_at",
       Self::PipelineName => "pipeline_name",
       Self::Owner => "owner",
-      Self::Success => "success",
+      Self::Status => "status",
     }
   }
 }
@@ -252,11 +313,10 @@ impl RunHistory for PostgresRunHistory {
     sqlx::query(
       "INSERT INTO pipeline_runs \
        (run_id, pipeline_name, owner, repo, sha, branch, target_branch, tag, pr_number, \
-        trigger, pipeline_definition, success, cancelled, created_at, completed_at, retry_of) \
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
+        trigger, pipeline_definition, status, created_at, completed_at, retry_of) \
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
        ON CONFLICT (run_id) DO UPDATE SET \
-         success = EXCLUDED.success, \
-         cancelled = EXCLUDED.cancelled, \
+         status = EXCLUDED.status, \
          completed_at = EXCLUDED.completed_at",
     )
     .bind(run_id)
@@ -270,8 +330,7 @@ impl RunHistory for PostgresRunHistory {
     .bind(r.pr_number)
     .bind(&r.trigger)
     .bind(&r.pipeline_definition)
-    .bind(r.success)
-    .bind(r.cancelled)
+    .bind(r.status)
     .bind(r.created_at)
     .bind(r.completed_at)
     .bind(retry_of)

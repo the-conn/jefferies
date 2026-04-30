@@ -377,8 +377,7 @@ async fn launch_coordinator_for_pipeline(
       Ok(summary) => {
         info!(
           run_id = %monitor_run_id,
-          success = summary.success,
-          cancelled = summary.cancelled,
+          status = %summary.status,
           "Pipeline run completed"
         );
       }
