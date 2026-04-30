@@ -302,15 +302,9 @@ async fn cancel_pipeline_run(
   State(state): State<Arc<ProviderState>>,
   Path(run_id): Path<String>,
 ) -> StatusCode {
-  if let Err(e) = state.dispatcher.cleanup_run(&run_id).await {
-    warn!(run_id, error = %e, "Dispatcher cleanup failed during cancel");
-  }
   if let Err(e) = state.backplane.publish_cancel(&run_id).await {
     warn!(run_id, error = %e, "Failed to publish cancel event");
     return StatusCode::INTERNAL_SERVER_ERROR;
-  }
-  if let Err(e) = state.source_manager.cleanup_run(&run_id).await {
-    warn!(run_id, error = %e, "S3 cleanup failed during cancel");
   }
   StatusCode::OK
 }
