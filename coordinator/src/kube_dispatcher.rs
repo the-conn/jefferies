@@ -6,15 +6,14 @@ use k8s_openapi::{
   api::{
     batch::v1::{Job, JobSpec},
     core::v1::{
-      Capabilities, ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar,
-      PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, SecurityContext, Volume,
-      VolumeMount,
+      ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, PodSpec,
+      PodTemplateSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
     },
   },
   apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::ObjectMeta},
 };
 use kube::api::{DeleteParams, ListParams, PostParams};
-use pipelines::{BuildConfig, NodeInfo, NodeKind, Pipeline};
+use pipelines::{NodeInfo, Pipeline};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{info, warn};
 
@@ -30,8 +29,10 @@ pub struct KubeDispatcher {
   namespace: String,
   tube_image: String,
   default_node_image: String,
-  builder_namespace: String,
-  buildah_image: String,
+  service_account: String,
+  runtime_class: String,
+  default_cpu: String,
+  default_memory: String,
 }
 
 impl KubeDispatcher {
@@ -48,8 +49,10 @@ impl KubeDispatcher {
       namespace: config.kubernetes_namespace().to_string(),
       tube_image: config.tube_image().to_string(),
       default_node_image: config.default_node_image().to_string(),
-      builder_namespace: config.builder_namespace().to_string(),
-      buildah_image: config.buildah_image().to_string(),
+      service_account: config.service_account().to_string(),
+      runtime_class: config.runtime_class().to_string(),
+      default_cpu: config.default_node_cpu().to_string(),
+      default_memory: config.default_node_memory().to_string(),
     })
   }
 }
@@ -105,18 +108,6 @@ fn build_script(steps: &[String]) -> String {
     script.push('\n');
   }
   script
-}
-
-fn build_buildah_script(config: &BuildConfig) -> String {
-  let mut cmd = format!("buildah bud -f {}", config.containerfile);
-  for tag in &config.tags {
-    cmd.push_str(&format!(" -t {tag}"));
-  }
-  for arg in &config.build_args {
-    cmd.push_str(&format!(" --build-arg {arg}"));
-  }
-  cmd.push_str(" .");
-  format!("#!/bin/bash\nset -euxo pipefail\n{cmd}\n")
 }
 
 fn env_var(name: &str, value: &str) -> EnvVar {
@@ -176,19 +167,19 @@ fn compute_safety_deadline_secs(node: &NodeInfo, config: &AppConfig) -> i64 {
   total.try_into().unwrap_or(i64::MAX)
 }
 
-fn resource_requirements() -> ResourceRequirements {
+fn resource_requirements(cpu: &str, memory: &str) -> ResourceRequirements {
+  let map = BTreeMap::from([
+    ("cpu".to_string(), Quantity(cpu.to_string())),
+    ("memory".to_string(), Quantity(memory.to_string())),
+  ]);
   ResourceRequirements {
-    requests: Some(BTreeMap::from([
-      ("cpu".to_string(), Quantity("500m".to_string())),
-      ("memory".to_string(), Quantity("1Gi".to_string())),
-    ])),
-    limits: Some(BTreeMap::from([
-      ("cpu".to_string(), Quantity("2".to_string())),
-      ("memory".to_string(), Quantity("4Gi".to_string())),
-    ])),
+    requests: Some(map.clone()),
+    limits: Some(map),
     ..Default::default()
   }
 }
+
+const CACHE_MOUNT_PATH: &str = "/tmp/cache";
 
 #[async_trait]
 impl Dispatcher for KubeDispatcher {
@@ -214,61 +205,24 @@ impl Dispatcher for KubeDispatcher {
 
     let safety_deadline_secs = compute_safety_deadline_secs(node, config);
 
-    match &node.kind {
-      NodeKind::Exec => {
-        let script = build_script(&node.steps);
-        self
-          .create_script_configmap(run_id, &node.name, &cm_name, script, &self.namespace)
-          .await?;
-        let ctx = JobContext {
-          run_id,
-          node_name: &node.name,
-          cm_name: &cm_name,
-          labels,
-          annotations,
-          env_vars,
-          safety_deadline_secs,
-        };
-        let job = self.build_job(ctx, node);
-        self
-          .create_job_or_rollback_configmap(&self.namespace, &job, &cm_name, run_id, &node.name)
-          .await?;
-        info!(run_id, node_name = %node.name, "Dispatched Kubernetes Job");
-      }
-      NodeKind::Build(build_config) => {
-        let script = build_buildah_script(build_config);
-        self
-          .create_script_configmap(
-            run_id,
-            &node.name,
-            &cm_name,
-            script,
-            &self.builder_namespace,
-          )
-          .await?;
-        env_vars.push(env_var("STORAGE_DRIVER", "vfs"));
-        let ctx = JobContext {
-          run_id,
-          node_name: &node.name,
-          cm_name: &cm_name,
-          labels,
-          annotations,
-          env_vars,
-          safety_deadline_secs,
-        };
-        let job = self.build_buildah_job(ctx);
-        self
-          .create_job_or_rollback_configmap(
-            &self.builder_namespace,
-            &job,
-            &cm_name,
-            run_id,
-            &node.name,
-          )
-          .await?;
-        info!(run_id, node_name = %node.name, "Dispatched buildah Job");
-      }
-    }
+    let script = build_script(&node.steps);
+    self
+      .create_script_configmap(run_id, &node.name, &cm_name, script, &self.namespace)
+      .await?;
+    let ctx = JobContext {
+      run_id,
+      node_name: &node.name,
+      cm_name: &cm_name,
+      labels,
+      annotations,
+      env_vars,
+      safety_deadline_secs,
+    };
+    let job = self.build_job(ctx, node);
+    self
+      .create_job_or_rollback_configmap(&self.namespace, &job, &cm_name, run_id, &node.name)
+      .await?;
+    info!(run_id, node_name = %node.name, "Dispatched Kubernetes Job");
 
     Ok(())
   }
@@ -279,22 +233,21 @@ impl Dispatcher for KubeDispatcher {
     node_name: &str,
     _config: &AppConfig,
   ) -> Result<(), DispatchError> {
-    for ns in [self.namespace.as_str(), self.builder_namespace.as_str()] {
-      let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
-      if let Err(e) = jobs
-        .delete(&job_name(run_id, node_name), &DeleteParams::background())
-        .await
-      {
-        warn!(run_id, node_name, namespace = ns, error = %e, "Failed to delete Job");
-      }
+    let ns = self.namespace.as_str();
+    let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
+    if let Err(e) = jobs
+      .delete(&job_name(run_id, node_name), &DeleteParams::background())
+      .await
+    {
+      warn!(run_id, node_name, namespace = ns, error = %e, "Failed to delete Job");
+    }
 
-      let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
-      if let Err(e) = cms
-        .delete(&configmap_name(run_id, node_name), &DeleteParams::default())
-        .await
-      {
-        warn!(run_id, node_name, namespace = ns, error = %e, "Failed to delete ConfigMap");
-      }
+    let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
+    if let Err(e) = cms
+      .delete(&configmap_name(run_id, node_name), &DeleteParams::default())
+      .await
+    {
+      warn!(run_id, node_name, namespace = ns, error = %e, "Failed to delete ConfigMap");
     }
 
     Ok(())
@@ -302,20 +255,19 @@ impl Dispatcher for KubeDispatcher {
 
   async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError> {
     let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
+    let ns = self.namespace.as_str();
 
-    for ns in [self.namespace.as_str(), self.builder_namespace.as_str()] {
-      let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
-      if let Err(e) = jobs
-        .delete_collection(&DeleteParams::background(), &lp)
-        .await
-      {
-        warn!(run_id, namespace = ns, error = %e, "Failed to delete Job collection");
-      }
+    let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
+    if let Err(e) = jobs
+      .delete_collection(&DeleteParams::background(), &lp)
+      .await
+    {
+      warn!(run_id, namespace = ns, error = %e, "Failed to delete Job collection");
+    }
 
-      let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
-      if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
-        warn!(run_id, namespace = ns, error = %e, "Failed to delete ConfigMap collection");
-      }
+    let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
+    if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
+      warn!(run_id, namespace = ns, error = %e, "Failed to delete ConfigMap collection");
     }
 
     self.source_manager.cleanup_run(run_id).await?;
@@ -354,7 +306,7 @@ impl Dispatcher for KubeDispatcher {
   ) -> Option<JoinHandle<()>> {
     let watcher = PodWatcher::new(
       self.client.clone(),
-      vec![self.namespace.clone(), self.builder_namespace.clone()],
+      vec![self.namespace.clone()],
       run_id.to_string(),
       signal_tx,
       cmd_rx,
@@ -367,32 +319,31 @@ impl Dispatcher for KubeDispatcher {
 
     let lp = ListParams::default().labels("the-conn.com/managed-by=jefferies");
     let mut run_ids: HashSet<String> = HashSet::new();
+    let ns = self.namespace.as_str();
 
-    for ns in [self.namespace.as_str(), self.builder_namespace.as_str()] {
-      let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
-      let job_list = jobs
-        .list(&lp)
-        .await
-        .map_err(|e| DispatchError::Kube(e.to_string()))?;
-      for job in job_list.items {
-        if let Some(labels) = job.metadata.labels.as_ref()
-          && let Some(run_id) = labels.get("the-conn.com/run-id")
-        {
-          run_ids.insert(run_id.clone());
-        }
+    let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
+    let job_list = jobs
+      .list(&lp)
+      .await
+      .map_err(|e| DispatchError::Kube(e.to_string()))?;
+    for job in job_list.items {
+      if let Some(labels) = job.metadata.labels.as_ref()
+        && let Some(run_id) = labels.get("the-conn.com/run-id")
+      {
+        run_ids.insert(run_id.clone());
       }
+    }
 
-      let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
-      let cm_list = cms
-        .list(&lp)
-        .await
-        .map_err(|e| DispatchError::Kube(e.to_string()))?;
-      for cm in cm_list.items {
-        if let Some(labels) = cm.metadata.labels.as_ref()
-          && let Some(run_id) = labels.get("the-conn.com/run-id")
-        {
-          run_ids.insert(run_id.clone());
-        }
+    let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
+    let cm_list = cms
+      .list(&lp)
+      .await
+      .map_err(|e| DispatchError::Kube(e.to_string()))?;
+    for cm in cm_list.items {
+      if let Some(labels) = cm.metadata.labels.as_ref()
+        && let Some(run_id) = labels.get("the-conn.com/run-id")
+      {
+        run_ids.insert(run_id.clone());
       }
     }
 
@@ -407,10 +358,73 @@ impl KubeDispatcher {
     } else {
       node.image.clone()
     };
+    let cpu = node.cpu.as_deref().unwrap_or(&self.default_cpu);
+    let memory = node.memory.as_deref().unwrap_or(&self.default_memory);
+
+    let mut user_volume_mounts = vec![
+      VolumeMount {
+        name: "tube-bin".to_string(),
+        mount_path: "/shared".to_string(),
+        ..Default::default()
+      },
+      VolumeMount {
+        name: "workspace".to_string(),
+        mount_path: "/workspace".to_string(),
+        ..Default::default()
+      },
+      VolumeMount {
+        name: "user-script".to_string(),
+        mount_path: "/etc/conn/script.sh".to_string(),
+        sub_path: Some("script.sh".to_string()),
+        ..Default::default()
+      },
+    ];
+    let mut volumes = vec![
+      Volume {
+        name: "tube-bin".to_string(),
+        empty_dir: Some(EmptyDirVolumeSource::default()),
+        ..Default::default()
+      },
+      Volume {
+        name: "workspace".to_string(),
+        empty_dir: Some(EmptyDirVolumeSource::default()),
+        ..Default::default()
+      },
+      Volume {
+        name: "user-script".to_string(),
+        config_map: Some(ConfigMapVolumeSource {
+          name: ctx.cm_name.to_string(),
+          default_mode: Some(0o755),
+          ..Default::default()
+        }),
+        ..Default::default()
+      },
+    ];
+    if let Some(cache_size) = node.cache_size.as_deref() {
+      user_volume_mounts.push(VolumeMount {
+        name: "cache".to_string(),
+        mount_path: CACHE_MOUNT_PATH.to_string(),
+        ..Default::default()
+      });
+      volumes.push(Volume {
+        name: "cache".to_string(),
+        empty_dir: Some(EmptyDirVolumeSource {
+          medium: Some("Memory".to_string()),
+          size_limit: Some(Quantity(cache_size.to_string())),
+        }),
+        ..Default::default()
+      });
+    }
+
+    let security_context = node.privileged.then(|| SecurityContext {
+      privileged: Some(true),
+      ..Default::default()
+    });
+
     let JobContext {
       run_id,
       node_name,
-      cm_name,
+      cm_name: _,
       labels,
       annotations,
       env_vars,
@@ -436,6 +450,8 @@ impl KubeDispatcher {
           }),
           spec: Some(PodSpec {
             restart_policy: Some("Never".to_string()),
+            runtime_class_name: Some(self.runtime_class.clone()),
+            service_account_name: Some(self.service_account.clone()),
             init_containers: Some(vec![Container {
               name: "tube-init".to_string(),
               image: Some(self.tube_image.clone()),
@@ -457,48 +473,12 @@ impl KubeDispatcher {
               command: Some(vec!["/shared/tube".to_string()]),
               args: Some(vec![]),
               env: Some(env_vars),
-              resources: Some(resource_requirements()),
-              volume_mounts: Some(vec![
-                VolumeMount {
-                  name: "tube-bin".to_string(),
-                  mount_path: "/shared".to_string(),
-                  ..Default::default()
-                },
-                VolumeMount {
-                  name: "workspace".to_string(),
-                  mount_path: "/workspace".to_string(),
-                  ..Default::default()
-                },
-                VolumeMount {
-                  name: "user-script".to_string(),
-                  mount_path: "/etc/conn/script.sh".to_string(),
-                  sub_path: Some("script.sh".to_string()),
-                  ..Default::default()
-                },
-              ]),
+              resources: Some(resource_requirements(cpu, memory)),
+              security_context,
+              volume_mounts: Some(user_volume_mounts),
               ..Default::default()
             }],
-            volumes: Some(vec![
-              Volume {
-                name: "tube-bin".to_string(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-              },
-              Volume {
-                name: "workspace".to_string(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-              },
-              Volume {
-                name: "user-script".to_string(),
-                config_map: Some(ConfigMapVolumeSource {
-                  name: cm_name.to_string(),
-                  default_mode: Some(0o755),
-                  ..Default::default()
-                }),
-                ..Default::default()
-              },
-            ]),
+            volumes: Some(volumes),
             ..Default::default()
           }),
         },
@@ -561,160 +541,6 @@ impl KubeDispatcher {
         }
         Err(DispatchError::Kube(e.to_string()))
       }
-    }
-  }
-
-  fn build_buildah_job(&self, ctx: JobContext<'_>) -> Job {
-    let init_cmd = "cp /usr/local/bin/tube /shared/tube && \
-      mkdir -p /var/lib/containers/storage /var/lib/containers/runroot";
-    let JobContext {
-      run_id,
-      node_name,
-      cm_name,
-      labels,
-      annotations,
-      env_vars,
-      safety_deadline_secs,
-    } = ctx;
-
-    Job {
-      metadata: ObjectMeta {
-        name: Some(job_name(run_id, node_name)),
-        namespace: Some(self.builder_namespace.clone()),
-        labels: Some(labels.clone()),
-        annotations: Some(annotations.clone()),
-        ..Default::default()
-      },
-      spec: Some(JobSpec {
-        active_deadline_seconds: Some(safety_deadline_secs),
-        backoff_limit: Some(0),
-        template: PodTemplateSpec {
-          metadata: Some(ObjectMeta {
-            labels: Some(labels),
-            annotations: Some(annotations),
-            ..Default::default()
-          }),
-          spec: Some(PodSpec {
-            restart_policy: Some("Never".to_string()),
-            service_account_name: Some("pipelines-sa-userid-1000".to_string()),
-            security_context: Some(PodSecurityContext {
-              fs_group: Some(1000),
-              ..Default::default()
-            }),
-            init_containers: Some(vec![Container {
-              name: "tube-init".to_string(),
-              image: Some(self.tube_image.clone()),
-              command: Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                init_cmd.to_string(),
-              ]),
-              volume_mounts: Some(vec![
-                VolumeMount {
-                  name: "tube-bin".to_string(),
-                  mount_path: "/shared".to_string(),
-                  ..Default::default()
-                },
-                VolumeMount {
-                  name: "varlibcontainers".to_string(),
-                  mount_path: "/var/lib/containers".to_string(),
-                  ..Default::default()
-                },
-              ]),
-              ..Default::default()
-            }]),
-            containers: vec![Container {
-              name: "buildah".to_string(),
-              image: Some(self.buildah_image.clone()),
-              command: Some(vec!["/shared/tube".to_string()]),
-              args: Some(vec![]),
-              env: Some(env_vars),
-              resources: Some(resource_requirements()),
-              security_context: Some(SecurityContext {
-                run_as_user: Some(1000),
-                run_as_group: Some(1000),
-                allow_privilege_escalation: Some(true),
-                capabilities: Some(Capabilities {
-                  add: Some(vec![
-                    "SETUID".to_string(),
-                    "SETGID".to_string(),
-                    "SETFCAP".to_string(),
-                  ]),
-                  ..Default::default()
-                }),
-                ..Default::default()
-              }),
-              volume_mounts: Some(vec![
-                VolumeMount {
-                  name: "tube-bin".to_string(),
-                  mount_path: "/shared".to_string(),
-                  ..Default::default()
-                },
-                VolumeMount {
-                  name: "workspace".to_string(),
-                  mount_path: "/workspace".to_string(),
-                  ..Default::default()
-                },
-                VolumeMount {
-                  name: "user-script".to_string(),
-                  mount_path: "/etc/conn/script.sh".to_string(),
-                  sub_path: Some("script.sh".to_string()),
-                  ..Default::default()
-                },
-                VolumeMount {
-                  name: "varlibcontainers".to_string(),
-                  mount_path: "/var/lib/containers".to_string(),
-                  ..Default::default()
-                },
-                VolumeMount {
-                  name: "storage-config".to_string(),
-                  mount_path: "/home/build/.config/containers/storage.conf".to_string(),
-                  sub_path: Some("storage.conf".to_string()),
-                  ..Default::default()
-                },
-              ]),
-              ..Default::default()
-            }],
-            volumes: Some(vec![
-              Volume {
-                name: "tube-bin".to_string(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-              },
-              Volume {
-                name: "workspace".to_string(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-              },
-              Volume {
-                name: "user-script".to_string(),
-                config_map: Some(ConfigMapVolumeSource {
-                  name: cm_name.to_string(),
-                  default_mode: Some(0o755),
-                  ..Default::default()
-                }),
-                ..Default::default()
-              },
-              Volume {
-                name: "varlibcontainers".to_string(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-              },
-              Volume {
-                name: "storage-config".to_string(),
-                config_map: Some(ConfigMapVolumeSource {
-                  name: "buildah-storage-config".to_string(),
-                  ..Default::default()
-                }),
-                ..Default::default()
-              },
-            ]),
-            ..Default::default()
-          }),
-        },
-        ..Default::default()
-      }),
-      ..Default::default()
     }
   }
 }

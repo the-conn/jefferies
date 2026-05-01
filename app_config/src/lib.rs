@@ -69,8 +69,10 @@ struct KubernetesConfig {
   namespace: String,
   tube_image: String,
   default_node_image: String,
-  builder_namespace: String,
-  buildah_image: String,
+  service_account: String,
+  runtime_class: String,
+  default_cpu: String,
+  default_memory: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,12 +207,20 @@ impl AppConfig {
     &self.kubernetes.default_node_image
   }
 
-  pub fn builder_namespace(&self) -> &str {
-    &self.kubernetes.builder_namespace
+  pub fn service_account(&self) -> &str {
+    &self.kubernetes.service_account
   }
 
-  pub fn buildah_image(&self) -> &str {
-    &self.kubernetes.buildah_image
+  pub fn runtime_class(&self) -> &str {
+    &self.kubernetes.runtime_class
+  }
+
+  pub fn default_node_cpu(&self) -> &str {
+    &self.kubernetes.default_cpu
+  }
+
+  pub fn default_node_memory(&self) -> &str {
+    &self.kubernetes.default_memory
   }
 
   pub fn postgres_host(&self) -> &str {

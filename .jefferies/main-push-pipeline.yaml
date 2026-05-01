@@ -7,11 +7,12 @@ on:
 
 nodes:
   - name: Build Image
-    type: build
+    image: quay.io/buildah/stable:latest
     checkout: true
-    config:
-      containerfile: Containerfile
-      tags:
-        - quay.io/the-conn/jefferies
-      build_args:
-        - RUST_TAG=1.95-slim
+    privileged: true
+    cache_size: 2Gi
+    cpu: "2"
+    memory: 4Gi
+    steps:
+      - buildah bud --network=host -f Containerfile -t quay.io/the-conn/jefferies --build-arg RUST_TAG=1.95-slim .
+      - buildah push quay.io/the-conn/jefferies
