@@ -20,6 +20,8 @@ providers = { workspace = true }
 run_history = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 http-body-util = { workspace = true }
 serde_json = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+uuid = { workspace = true }

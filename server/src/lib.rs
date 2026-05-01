@@ -9,7 +9,7 @@ use axum::{
 };
 use backplane::RabbitmqBackplane;
 use chrono::{DateTime, Utc};
-use coordinator::{KubeDispatcher, SourceError, SourceManager, start_reaper};
+use coordinator::{InfraFailureReason, KubeDispatcher, SourceError, SourceManager, start_reaper};
 use futures_util::future::join_all;
 use providers::{GithubProvider, ProviderState};
 use run_history::{
@@ -393,10 +393,25 @@ async fn get_run(
   }
 }
 
+#[derive(Debug, Serialize)]
+struct NodeRunResponse {
+  #[serde(flatten)]
+  row: NodeRunRow,
+  user_message: Option<String>,
+}
+
+fn build_node_run_response(row: NodeRunRow) -> NodeRunResponse {
+  let user_message = row
+    .failure_reason
+    .as_deref()
+    .and_then(InfraFailureReason::user_message_from_code);
+  NodeRunResponse { row, user_message }
+}
+
 async fn list_run_nodes(
   State(state): State<Arc<ProviderState>>,
   Path(run_id): Path<String>,
-) -> (StatusCode, Json<Vec<NodeRunRow>>) {
+) -> (StatusCode, Json<Vec<NodeRunResponse>>) {
   match state.run_history.list_node_runs(&run_id).await {
     Ok(rows) => {
       let augmented = join_all(
@@ -405,7 +420,9 @@ async fn list_run_nodes(
           .map(|row| augment_with_live(row, &state.source_manager)),
       )
       .await;
-      (StatusCode::OK, Json(augmented))
+      let responses: Vec<NodeRunResponse> =
+        augmented.into_iter().map(build_node_run_response).collect();
+      (StatusCode::OK, Json(responses))
     }
     Err(e) => {
       warn!(run_id, error = %e, "Failed to list node runs");
@@ -417,11 +434,14 @@ async fn list_run_nodes(
 async fn get_run_node(
   State(state): State<Arc<ProviderState>>,
   Path((run_id, node_name)): Path<(String, String)>,
-) -> (StatusCode, Json<Option<NodeRunRow>>) {
+) -> (StatusCode, Json<Option<NodeRunResponse>>) {
   match state.run_history.get_node_run(&run_id, &node_name).await {
     Ok(Some(row)) => {
       let augmented = augment_with_live(row, &state.source_manager).await;
-      (StatusCode::OK, Json(Some(augmented)))
+      (
+        StatusCode::OK,
+        Json(Some(build_node_run_response(augmented))),
+      )
     }
     Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
     Err(e) => {
@@ -517,6 +537,7 @@ mod tests {
   use serde_json::Value;
   use state_store::InMemoryStateStore;
   use tower::ServiceExt;
+  use uuid::Uuid;
 
   use super::*;
 
@@ -650,6 +671,47 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+  }
+
+  fn make_node_row(failure_reason: Option<&str>) -> NodeRunRow {
+    NodeRunRow {
+      id: 1,
+      run_id: Uuid::nil(),
+      node_name: "build".into(),
+      node_definition: "{}".into(),
+      success: Some(false),
+      created_at: Utc::now(),
+      started_at: None,
+      completed_at: Some(Utc::now()),
+      failure_reason: failure_reason.map(|s| s.to_string()),
+    }
+  }
+
+  #[test]
+  fn user_message_is_populated_for_actionable_failure_codes() {
+    let response = build_node_run_response(make_node_row(Some("ImagePullFailed")));
+    assert!(response.user_message.is_some());
+    assert_eq!(
+      response.row.failure_reason.as_deref(),
+      Some("ImagePullFailed")
+    );
+  }
+
+  #[test]
+  fn user_message_is_none_for_non_actionable_failure_code() {
+    let response = build_node_run_response(make_node_row(Some("InitContainerFailed")));
+    assert!(response.user_message.is_none());
+    assert_eq!(
+      response.row.failure_reason.as_deref(),
+      Some("InitContainerFailed")
+    );
+  }
+
+  #[test]
+  fn user_message_is_none_when_failure_reason_absent() {
+    let response = build_node_run_response(make_node_row(None));
+    assert!(response.user_message.is_none());
+    assert!(response.row.failure_reason.is_none());
   }
 
   #[tokio::test]

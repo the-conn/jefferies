@@ -129,6 +129,7 @@ pub struct NodeRunRecord {
   pub started_at: Option<DateTime<Utc>>,
   pub completed_at: Option<DateTime<Utc>>,
   pub output_log: Option<String>,
+  pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -160,6 +161,7 @@ pub struct NodeRunRow {
   pub created_at: DateTime<Utc>,
   pub started_at: Option<DateTime<Utc>>,
   pub completed_at: Option<DateTime<Utc>>,
+  pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -373,13 +375,14 @@ impl RunHistory for PostgresRunHistory {
     let run_id = parse_run_id(&r.run_id)?;
     sqlx::query(
       "INSERT INTO node_runs \
-       (run_id, node_name, node_definition, success, created_at, started_at, completed_at, output_log) \
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+       (run_id, node_name, node_definition, success, created_at, started_at, completed_at, output_log, failure_reason) \
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
        ON CONFLICT (run_id, node_name) DO UPDATE SET \
          success = EXCLUDED.success, \
          started_at = EXCLUDED.started_at, \
          completed_at = EXCLUDED.completed_at, \
-         output_log = EXCLUDED.output_log",
+         output_log = EXCLUDED.output_log, \
+         failure_reason = EXCLUDED.failure_reason",
     )
     .bind(run_id)
     .bind(&r.node_name)
@@ -389,6 +392,7 @@ impl RunHistory for PostgresRunHistory {
     .bind(r.started_at)
     .bind(r.completed_at)
     .bind(r.output_log.as_deref())
+    .bind(r.failure_reason.as_deref())
     .execute(&self.pool)
     .await?;
     Ok(())
@@ -442,7 +446,7 @@ impl RunHistory for PostgresRunHistory {
   async fn list_node_runs(&self, run_id: &str) -> Result<Vec<NodeRunRow>, RunHistoryError> {
     let uuid = parse_run_id(run_id)?;
     let rows = sqlx::query_as::<_, NodeRunRow>(
-      "SELECT id, run_id, node_name, node_definition, success, created_at, started_at, completed_at \
+      "SELECT id, run_id, node_name, node_definition, success, created_at, started_at, completed_at, failure_reason \
        FROM node_runs WHERE run_id = $1 ORDER BY id ASC",
     )
     .bind(uuid)
@@ -458,7 +462,7 @@ impl RunHistory for PostgresRunHistory {
   ) -> Result<Option<NodeRunRow>, RunHistoryError> {
     let uuid = parse_run_id(run_id)?;
     let row = sqlx::query_as::<_, NodeRunRow>(
-      "SELECT id, run_id, node_name, node_definition, success, created_at, started_at, completed_at \
+      "SELECT id, run_id, node_name, node_definition, success, created_at, started_at, completed_at, failure_reason \
        FROM node_runs WHERE run_id = $1 AND node_name = $2",
     )
     .bind(uuid)

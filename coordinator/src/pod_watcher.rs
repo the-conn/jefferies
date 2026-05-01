@@ -65,19 +65,32 @@ impl InfraFailureReason {
       Self::ImagePullFailed { image, .. } => Some(format!(
         "Failed to pull image '{image}'. Verify the image name, tag, and registry permissions."
       )),
-      Self::OOMKilled => Some(
+      Self::OOMKilled | Self::ContainerCreateError(_) | Self::PodStartTimeout => {
+        Self::user_message_from_code(self.stable_code())
+      }
+      Self::InitContainerFailed { .. } | Self::PodDeletedUnexpectedly | Self::NodeLost => None,
+    }
+  }
+
+  pub fn user_message_from_code(code: &str) -> Option<String> {
+    match code {
+      "ImagePullFailed" => Some(
+        "Failed to pull the container image. Verify the image name, tag, and registry permissions."
+          .to_string(),
+      ),
+      "OOMKilled" => Some(
         "The container ran out of memory. Increase its memory limit or reduce its memory usage."
           .to_string(),
       ),
-      Self::ContainerCreateError(_) => Some(
+      "ContainerCreateError" => Some(
         "The container could not be created. Check the pod configuration for invalid mounts, environment variables, or security settings."
           .to_string(),
       ),
-      Self::PodStartTimeout => Some(
+      "PodStartTimeout" => Some(
         "The pod did not start in time. The cluster may be out of capacity, or the image may be very large."
           .to_string(),
       ),
-      Self::InitContainerFailed { .. } | Self::PodDeletedUnexpectedly | Self::NodeLost => None,
+      _ => None,
     }
   }
 }

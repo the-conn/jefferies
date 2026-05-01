@@ -283,7 +283,14 @@ impl Coordinator {
               self.handle_pod_running(&node_name).await;
             }
             Some(CoordinatorMessage::NodeInfraFailed { node_name, reason }) => {
-              self.handle_node_infra_failed(&node_name, &reason).await;
+              if self.handle_node_infra_failed(&node_name, &reason).await {
+                self.record_history(RunStatus::Failure).await;
+                self.cleanup().await;
+                return self.terminate_running_nodes(RunStatus::Failure).await;
+              }
+              if self.run.is_complete() {
+                break;
+              }
             }
             Some(CoordinatorMessage::NodePodStartTimedOut { node_name }) => {
               self.handle_pod_start_timed_out(&node_name).await;
@@ -391,7 +398,11 @@ impl Coordinator {
     );
   }
 
-  async fn handle_node_infra_failed(&mut self, node_name: &str, reason: &InfraFailureReason) {
+  async fn handle_node_infra_failed(
+    &mut self,
+    node_name: &str,
+    reason: &InfraFailureReason,
+  ) -> bool {
     let already_terminal = self
       .run
       .statuses()
@@ -404,8 +415,9 @@ impl Coordinator {
         stable_code = reason.stable_code(),
         "Ignoring infra failure for already-terminal node"
       );
-      return;
+      return false;
     }
+
     error!(
       run_id = %self.run_id,
       node_name,
@@ -414,6 +426,31 @@ impl Coordinator {
       user_actionable = reason.user_message().is_some(),
       "Infrastructure failure detected"
     );
+
+    if !self.run.mark_failed(node_name) {
+      return false;
+    }
+    self.cancel_node_timeout(node_name);
+    if let Err(e) = self.persist_state().await {
+      error!(run_id = %self.run_id, error = %e, "Failed to persist state after infra failure; stopping");
+      return true;
+    }
+    self.notify_watcher_of_deletion(node_name).await;
+    if let Err(e) = self
+      .dispatcher
+      .cancel_node(&self.run_id, node_name, &self.config)
+      .await
+    {
+      warn!(run_id = %self.run_id, node_name, error = %e, "Failed to cancel infra-failed node");
+    }
+    self.record_node_completed(node_name, Some(reason)).await;
+    if self.fail_fast_enabled() {
+      warn!(run_id = %self.run_id, node_name, "Fail-fast enabled; cancelling pipeline");
+      true
+    } else {
+      self.dispatch_ready_nodes().await;
+      false
+    }
   }
 
   async fn handle_pod_start_timed_out(&mut self, node_name: &str) {
@@ -435,7 +472,7 @@ impl Coordinator {
         error!(run_id = %self.run_id, error = %e, "Failed to persist state after node success; stopping");
         return true;
       }
-      self.record_node_completed(node_name).await;
+      self.record_node_completed(node_name, None).await;
       self.dispatch_ready_nodes().await;
       false
     } else {
@@ -448,7 +485,7 @@ impl Coordinator {
         error!(run_id = %self.run_id, error = %e, "Failed to persist state after node failure; stopping");
         return true;
       }
-      self.record_node_completed(node_name).await;
+      self.record_node_completed(node_name, None).await;
       if self.fail_fast_enabled() {
         warn!(run_id = %self.run_id, node_name, "Fail-fast enabled; cancelling pipeline");
         true
@@ -476,7 +513,7 @@ impl Coordinator {
     {
       warn!(run_id = %self.run_id, node_name, error = %e, "Failed to cancel timed-out node");
     }
-    self.record_node_completed(node_name).await;
+    self.record_node_completed(node_name, None).await;
     if self.fail_fast_enabled() {
       warn!(run_id = %self.run_id, node_name, "Fail-fast enabled; cancelling pipeline");
       true
@@ -617,7 +654,11 @@ impl Coordinator {
     }
   }
 
-  async fn record_node_completed(&self, node_name: &str) {
+  async fn record_node_completed(
+    &self,
+    node_name: &str,
+    failure_reason: Option<&InfraFailureReason>,
+  ) {
     let node_success = self
       .run
       .statuses()
@@ -650,7 +691,8 @@ impl Coordinator {
     let node_completed_at = outcome
       .as_ref()
       .and_then(|o| o.finished_at)
-      .and_then(ms_to_datetime);
+      .and_then(ms_to_datetime)
+      .or_else(|| failure_reason.is_some().then(Utc::now));
 
     let output_log = match self.dispatcher.get_node_log(&self.run_id, node_name).await {
       Ok(log) => log,
@@ -669,6 +711,7 @@ impl Coordinator {
       started_at,
       completed_at: node_completed_at,
       output_log,
+      failure_reason: failure_reason.map(|r| r.stable_code().to_string()),
     };
     if let Err(e) = self.run_history.record_node_run(node_record).await {
       warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record node run history");
@@ -758,6 +801,7 @@ impl Coordinator {
       started_at,
       completed_at,
       output_log,
+      failure_reason: None,
     };
     if let Err(e) = self.run_history.record_node_run(node_record).await {
       warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record terminated node run history");
@@ -793,11 +837,15 @@ impl Coordinator {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::Arc;
+  use std::sync::{Arc, Mutex};
 
   use backplane::InMemoryBackplane;
   use chrono::Utc;
-  use run_history::NoOpRunHistory;
+  use run_history::{
+    ListRunsQuery, NoOpRunHistory, NodeDispatchRecord, NodeRunRecord, NodeRunRow,
+    PipelineRunRecord, PipelineRunRow, PipelineStartRecord, RunFilters, RunHistory,
+    RunHistoryError,
+  };
   use state_store::InMemoryStateStore;
 
   use super::*;
@@ -838,6 +886,207 @@ mod tests {
 
     async fn cleanup_run(&self, _run_id: &str) -> Result<(), DispatchError> {
       Ok(())
+    }
+  }
+
+  type SignalSender = mpsc::Sender<PodSignal>;
+
+  struct InjectableDispatcher {
+    cancel_calls: Arc<Mutex<Vec<String>>>,
+    signal_tx_slot: Arc<Mutex<Option<SignalSender>>>,
+    watcher_started: Arc<tokio::sync::Notify>,
+    dispatch_called: Arc<tokio::sync::Notify>,
+    dispatch_done: Arc<std::sync::atomic::AtomicBool>,
+  }
+
+  impl InjectableDispatcher {
+    fn new() -> Self {
+      Self {
+        cancel_calls: Arc::new(Mutex::new(Vec::new())),
+        signal_tx_slot: Arc::new(Mutex::new(None)),
+        watcher_started: Arc::new(tokio::sync::Notify::new()),
+        dispatch_called: Arc::new(tokio::sync::Notify::new()),
+        dispatch_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+      }
+    }
+
+    fn cancel_calls(&self) -> Arc<Mutex<Vec<String>>> {
+      self.cancel_calls.clone()
+    }
+
+    fn signal_tx_slot(&self) -> Arc<Mutex<Option<SignalSender>>> {
+      self.signal_tx_slot.clone()
+    }
+
+    fn watcher_started_notify(&self) -> Arc<tokio::sync::Notify> {
+      self.watcher_started.clone()
+    }
+
+    fn dispatch_called_notify(&self) -> Arc<tokio::sync::Notify> {
+      self.dispatch_called.clone()
+    }
+
+    fn dispatch_done_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+      self.dispatch_done.clone()
+    }
+  }
+
+  #[async_trait::async_trait]
+  impl Dispatcher for InjectableDispatcher {
+    async fn dispatch(
+      &self,
+      _run_id: &str,
+      _node: &NodeInfo,
+      _pipeline: &Pipeline,
+      _config: &AppConfig,
+    ) -> Result<(), DispatchError> {
+      self
+        .dispatch_done
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+      self.dispatch_called.notify_waiters();
+      Ok(())
+    }
+
+    async fn cancel_node(
+      &self,
+      _run_id: &str,
+      node_name: &str,
+      _config: &AppConfig,
+    ) -> Result<(), DispatchError> {
+      self
+        .cancel_calls
+        .lock()
+        .unwrap()
+        .push(node_name.to_string());
+      Ok(())
+    }
+
+    async fn cleanup_run(&self, _run_id: &str) -> Result<(), DispatchError> {
+      Ok(())
+    }
+
+    async fn start_pod_watcher(
+      &self,
+      _run_id: &str,
+      signal_tx: mpsc::Sender<PodSignal>,
+      mut cmd_rx: mpsc::Receiver<WatcherCommand>,
+    ) -> Option<JoinHandle<()>> {
+      *self.signal_tx_slot.lock().unwrap() = Some(signal_tx);
+      self.watcher_started.notify_waiters();
+      Some(tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+          if matches!(cmd, WatcherCommand::Shutdown) {
+            return;
+          }
+        }
+      }))
+    }
+  }
+
+  #[derive(Default)]
+  struct CapturingRunHistory {
+    node_runs: Arc<Mutex<Vec<NodeRunRecord>>>,
+  }
+
+  impl CapturingRunHistory {
+    fn new() -> Arc<Self> {
+      Arc::new(Self::default())
+    }
+
+    fn node_runs(&self) -> Vec<NodeRunRecord> {
+      self
+        .node_runs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| NodeRunRecord {
+          run_id: r.run_id.clone(),
+          node_name: r.node_name.clone(),
+          node_definition: r.node_definition.clone(),
+          success: r.success,
+          created_at: r.created_at,
+          started_at: r.started_at,
+          completed_at: r.completed_at,
+          output_log: r.output_log.clone(),
+          failure_reason: r.failure_reason.clone(),
+        })
+        .collect()
+    }
+  }
+
+  #[async_trait::async_trait]
+  impl RunHistory for CapturingRunHistory {
+    async fn record_pipeline_started(&self, _: PipelineStartRecord) -> Result<(), RunHistoryError> {
+      Ok(())
+    }
+    async fn record_pipeline_run(&self, _: PipelineRunRecord) -> Result<(), RunHistoryError> {
+      Ok(())
+    }
+    async fn record_node_dispatched(&self, _: NodeDispatchRecord) -> Result<(), RunHistoryError> {
+      Ok(())
+    }
+    async fn record_node_run(&self, r: NodeRunRecord) -> Result<(), RunHistoryError> {
+      self.node_runs.lock().unwrap().push(r);
+      Ok(())
+    }
+    async fn list_pipeline_runs(
+      &self,
+      _: ListRunsQuery,
+    ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
+      Ok(vec![])
+    }
+    async fn count_pipeline_runs(&self, _: &RunFilters) -> Result<i64, RunHistoryError> {
+      Ok(0)
+    }
+    async fn get_pipeline_run(&self, _: &str) -> Result<Option<PipelineRunRow>, RunHistoryError> {
+      Ok(None)
+    }
+    async fn list_node_runs(&self, _: &str) -> Result<Vec<NodeRunRow>, RunHistoryError> {
+      Ok(vec![])
+    }
+    async fn get_node_run(&self, _: &str, _: &str) -> Result<Option<NodeRunRow>, RunHistoryError> {
+      Ok(None)
+    }
+    async fn get_node_log(&self, _: &str, _: &str) -> Result<Option<String>, RunHistoryError> {
+      Ok(None)
+    }
+    async fn ping(&self) -> Result<(), RunHistoryError> {
+      Ok(())
+    }
+  }
+
+  fn make_run_context() -> RunContext {
+    RunContext {
+      owner: String::new(),
+      repo: String::new(),
+      sha: String::new(),
+      branch: None,
+      target_branch: None,
+      tag: None,
+      pr_number: None,
+      trigger: "push".into(),
+      pipeline_yaml: String::new(),
+      created_at: Utc::now(),
+      retry_of: None,
+    }
+  }
+
+  async fn wait_for_signal_tx(
+    notify: Arc<tokio::sync::Notify>,
+    slot: Arc<Mutex<Option<SignalSender>>>,
+  ) -> SignalSender {
+    if slot.lock().unwrap().is_none() {
+      notify.notified().await;
+    }
+    slot.lock().unwrap().clone().expect("signal_tx populated")
+  }
+
+  async fn wait_for_dispatch(
+    notify: Arc<tokio::sync::Notify>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+  ) {
+    if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+      notify.notified().await;
     }
   }
 
@@ -904,6 +1153,160 @@ nodes:
 
     let summary = handle.await.expect("Coordinator should complete");
     assert_eq!(summary.status, RunStatus::Success);
+  }
+
+  #[tokio::test]
+  async fn infra_failure_marks_node_failed_with_reason() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline();
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let cancel_calls = dispatcher.cancel_calls();
+    let signal_slot = dispatcher.signal_tx_slot();
+    let watcher_started = dispatcher.watcher_started_notify();
+    let run_history = CapturingRunHistory::new();
+
+    let handle = start_coordinator(
+      "test-run-infra".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let signal_tx = wait_for_signal_tx(watcher_started, signal_slot).await;
+    signal_tx
+      .send(PodSignal::InfraFailure {
+        node_name: "build".into(),
+        pod_uid: "uid-1".into(),
+        reason: InfraFailureReason::ImagePullFailed {
+          image: "foo:bar".into(),
+          message: "back-off".into(),
+        },
+      })
+      .await
+      .expect("send signal");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(summary.node_statuses["build"], NodeStatus::Failed);
+    assert!(
+      cancel_calls.lock().unwrap().contains(&"build".to_string()),
+      "cancel_node should have been called for build"
+    );
+    let recorded = run_history.node_runs();
+    let build_record = recorded
+      .iter()
+      .find(|r| r.node_name == "build")
+      .expect("build node was recorded");
+    assert_eq!(build_record.success, false);
+    assert_eq!(
+      build_record.failure_reason.as_deref(),
+      Some("ImagePullFailed")
+    );
+  }
+
+  fn make_two_node_pipeline() -> Arc<Pipeline> {
+    Arc::new(
+      Pipeline::from_yaml(
+        r#"
+name: test-pipeline
+on:
+  push:
+    branches: [main]
+fail_fast: false
+nodes:
+  - name: build
+    image: rust:latest
+    steps:
+      - cargo build
+  - name: linger
+    image: rust:latest
+    steps:
+      - sleep 1
+"#,
+      )
+      .unwrap(),
+    )
+  }
+
+  #[tokio::test]
+  async fn late_oom_for_already_completed_node_is_dropped() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_two_node_pipeline();
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let signal_slot = dispatcher.signal_tx_slot();
+    let watcher_started = dispatcher.watcher_started_notify();
+    let dispatch_called = dispatcher.dispatch_called_notify();
+    let dispatch_done = dispatcher.dispatch_done_flag();
+    let run_history = CapturingRunHistory::new();
+    let backplane_for_test = backplane.clone();
+
+    let handle = start_coordinator(
+      "test-run-race".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let signal_tx = wait_for_signal_tx(watcher_started, signal_slot).await;
+    wait_for_dispatch(dispatch_called, dispatch_done).await;
+
+    backplane_for_test
+      .publish_node_completed("test-run-race", "build", true)
+      .await
+      .expect("publish completed for build");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    signal_tx
+      .send(PodSignal::InfraFailure {
+        node_name: "build".into(),
+        pod_uid: "uid-1".into(),
+        reason: InfraFailureReason::OOMKilled,
+      })
+      .await
+      .expect("send late OOM signal");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    backplane_for_test
+      .publish_node_completed("test-run-race", "linger", true)
+      .await
+      .expect("publish completed for linger");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Success);
+    assert_eq!(summary.node_statuses["build"], NodeStatus::Success);
+    assert_eq!(summary.node_statuses["linger"], NodeStatus::Success);
+    let recorded = run_history.node_runs();
+    let build_record = recorded
+      .iter()
+      .find(|r| r.node_name == "build")
+      .expect("build node was recorded");
+    assert!(build_record.success);
+    assert!(
+      build_record.failure_reason.is_none(),
+      "the OOM signal should have been dropped because build was already Success"
+    );
   }
 
   #[tokio::test]
