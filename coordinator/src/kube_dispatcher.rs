@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::{
   dispatcher::{DispatchError, Dispatcher},
-  pod_watcher::{PodSignal, PodWatcher, WatcherCommand},
+  pod_watcher::{NODE_NAME_ANNOTATION, PodSignal, PodWatcher, WatcherCommand},
   source_manager::{NodeOutcome, SourceError, SourceManager},
 };
 
@@ -94,10 +94,8 @@ fn run_labels(run_id: &str) -> BTreeMap<String, String> {
   ])
 }
 
-fn pod_labels(run_id: &str, node_name: &str) -> BTreeMap<String, String> {
-  let mut labels = run_labels(run_id);
-  labels.insert("the-conn.com/node-name".to_string(), node_name.to_string());
-  labels
+fn node_annotations(node_name: &str) -> BTreeMap<String, String> {
+  BTreeMap::from([(NODE_NAME_ANNOTATION.to_string(), node_name.to_string())])
 }
 
 fn build_script(steps: &[String]) -> String {
@@ -160,6 +158,7 @@ struct JobContext<'a> {
   node_name: &'a str,
   cm_name: &'a str,
   labels: BTreeMap<String, String>,
+  annotations: BTreeMap<String, String>,
   env_vars: Vec<EnvVar>,
   safety_deadline_secs: i64,
 }
@@ -208,7 +207,8 @@ impl Dispatcher for KubeDispatcher {
     let get_url = self.source_manager.get_source_url(run_id).await?;
 
     let cm_name = configmap_name(run_id, &node.name);
-    let labels = pod_labels(run_id, &node.name);
+    let labels = run_labels(run_id);
+    let annotations = node_annotations(&node.name);
     let mut env_vars = build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
     env_vars.extend(node.env.iter().map(|(k, v)| env_var(k, v)));
 
@@ -225,6 +225,7 @@ impl Dispatcher for KubeDispatcher {
           node_name: &node.name,
           cm_name: &cm_name,
           labels,
+          annotations,
           env_vars,
           safety_deadline_secs,
         };
@@ -253,6 +254,7 @@ impl Dispatcher for KubeDispatcher {
           node_name: &node.name,
           cm_name: &cm_name,
           labels,
+          annotations,
           env_vars,
           safety_deadline_secs,
         };
@@ -396,6 +398,7 @@ impl KubeDispatcher {
       node_name,
       cm_name,
       labels,
+      annotations,
       env_vars,
       safety_deadline_secs,
     } = ctx;
@@ -405,6 +408,7 @@ impl KubeDispatcher {
         name: Some(job_name(run_id, node_name)),
         namespace: Some(self.namespace.clone()),
         labels: Some(labels.clone()),
+        annotations: Some(annotations.clone()),
         ..Default::default()
       },
       spec: Some(JobSpec {
@@ -413,6 +417,7 @@ impl KubeDispatcher {
         template: PodTemplateSpec {
           metadata: Some(ObjectMeta {
             labels: Some(labels),
+            annotations: Some(annotations),
             ..Default::default()
           }),
           spec: Some(PodSpec {
@@ -526,6 +531,7 @@ impl KubeDispatcher {
       node_name,
       cm_name,
       labels,
+      annotations,
       env_vars,
       safety_deadline_secs,
     } = ctx;
@@ -535,6 +541,7 @@ impl KubeDispatcher {
         name: Some(job_name(run_id, node_name)),
         namespace: Some(self.builder_namespace.clone()),
         labels: Some(labels.clone()),
+        annotations: Some(annotations.clone()),
         ..Default::default()
       },
       spec: Some(JobSpec {
@@ -543,6 +550,7 @@ impl KubeDispatcher {
         template: PodTemplateSpec {
           metadata: Some(ObjectMeta {
             labels: Some(labels),
+            annotations: Some(annotations),
             ..Default::default()
           }),
           spec: Some(PodSpec {

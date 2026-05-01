@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 pub const RUN_ID_LABEL: &str = "the-conn.com/run-id";
-pub const NODE_NAME_LABEL: &str = "the-conn.com/node-name";
+pub const NODE_NAME_ANNOTATION: &str = "the-conn.com/node-name";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InfraFailureReason {
@@ -129,8 +129,8 @@ pub enum WatcherCommand {
 }
 
 pub fn classify_pod(pod: &Pod) -> Option<PodSignal> {
-  let labels = pod.metadata.labels.as_ref()?;
-  let node_name = labels.get(NODE_NAME_LABEL)?.clone();
+  let annotations = pod.metadata.annotations.as_ref()?;
+  let node_name = annotations.get(NODE_NAME_ANNOTATION)?.clone();
   let pod_uid = pod.metadata.uid.clone()?;
   let status = pod.status.as_ref()?;
 
@@ -363,9 +363,9 @@ impl PodWatcher {
   async fn handle_delete(&self, state: &mut WatcherState, pod: &Pod) {
     let Some(node_name) = pod
       .metadata
-      .labels
+      .annotations
       .as_ref()
-      .and_then(|l| l.get(NODE_NAME_LABEL))
+      .and_then(|a| a.get(NODE_NAME_ANNOTATION))
       .cloned()
     else {
       return;
@@ -418,11 +418,11 @@ mod tests {
   use super::*;
 
   fn pod_with(status: PodStatus) -> Pod {
-    let mut labels = BTreeMap::new();
-    labels.insert(NODE_NAME_LABEL.to_string(), "build".to_string());
+    let mut annotations = BTreeMap::new();
+    annotations.insert(NODE_NAME_ANNOTATION.to_string(), "build".to_string());
     Pod {
       metadata: ObjectMeta {
-        labels: Some(labels),
+        annotations: Some(annotations),
         uid: Some("uid-123".to_string()),
         ..Default::default()
       },
@@ -622,7 +622,7 @@ mod tests {
   }
 
   #[test]
-  fn pod_without_node_name_label_is_ignored() {
+  fn pod_without_node_name_annotation_is_ignored() {
     let pod = Pod {
       metadata: ObjectMeta {
         uid: Some("uid".into()),
