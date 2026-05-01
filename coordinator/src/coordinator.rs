@@ -46,13 +46,24 @@ pub struct RunSummary {
   pub node_statuses: HashMap<String, NodeStatus>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerPhase {
+  Startup,
+  Runtime,
+}
+
+struct PhaseTimer {
+  phase: TimerPhase,
+  handle: JoinHandle<()>,
+}
+
 struct Coordinator {
   run_id: String,
   run: PipelineRun,
   pipeline: Arc<Pipeline>,
   config: Arc<AppConfig>,
   node_info_cache: HashMap<String, NodeInfo>,
-  node_timeout_handles: HashMap<String, JoinHandle<()>>,
+  node_phase_handles: HashMap<String, PhaseTimer>,
   internal_tx: mpsc::Sender<CoordinatorMessage>,
   internal_rx: mpsc::Receiver<CoordinatorMessage>,
   dispatcher: Arc<dyn Dispatcher>,
@@ -120,7 +131,7 @@ pub async fn start_coordinator(
     pipeline,
     config: services.config,
     node_info_cache,
-    node_timeout_handles: HashMap::new(),
+    node_phase_handles: HashMap::new(),
     internal_tx,
     internal_rx,
     dispatcher: services.dispatcher,
@@ -293,7 +304,14 @@ impl Coordinator {
               }
             }
             Some(CoordinatorMessage::NodePodStartTimedOut { node_name }) => {
-              self.handle_pod_start_timed_out(&node_name).await;
+              if self.handle_pod_start_timed_out(&node_name).await {
+                self.record_history(RunStatus::Failure).await;
+                self.cleanup().await;
+                return self.terminate_running_nodes(RunStatus::Failure).await;
+              }
+              if self.run.is_complete() {
+                break;
+              }
             }
             None => {}
           }
@@ -366,8 +384,8 @@ impl Coordinator {
   }
 
   fn cancel_node_timeout(&mut self, node_name: &str) {
-    if let Some(handle) = self.node_timeout_handles.remove(node_name) {
-      handle.abort();
+    if let Some(timer) = self.node_phase_handles.remove(node_name) {
+      timer.handle.abort();
     }
   }
 
@@ -391,10 +409,30 @@ impl Coordinator {
   }
 
   async fn handle_pod_running(&mut self, node_name: &str) {
+    if let Some(existing) = self.node_phase_handles.get(node_name)
+      && existing.phase == TimerPhase::Runtime
+    {
+      return;
+    }
+    let runtime_secs = self
+      .node_info_cache
+      .get(node_name)
+      .and_then(|n| n.timeout_secs);
+    if let Some(prev) = self.node_phase_handles.remove(node_name) {
+      prev.handle.abort();
+    }
+    let handle = self.spawn_runtime_timeout(node_name, runtime_secs);
+    self.node_phase_handles.insert(
+      node_name.to_string(),
+      PhaseTimer {
+        phase: TimerPhase::Runtime,
+        handle,
+      },
+    );
     info!(
       run_id = %self.run_id,
       node_name,
-      "Pod main container is running"
+      "Pod entered Running phase; switching to runtime timeout"
     );
   }
 
@@ -453,12 +491,10 @@ impl Coordinator {
     }
   }
 
-  async fn handle_pod_start_timed_out(&mut self, node_name: &str) {
-    warn!(
-      run_id = %self.run_id,
-      node_name,
-      "Pod did not enter Running phase within startup timeout"
-    );
+  async fn handle_pod_start_timed_out(&mut self, node_name: &str) -> bool {
+    self
+      .handle_node_infra_failed(node_name, &InfraFailureReason::PodStartTimeout)
+      .await
   }
 
   async fn handle_node_completed(&mut self, node_name: &str, success: bool) -> bool {
@@ -538,6 +574,9 @@ impl Coordinator {
         continue;
       };
 
+      let startup_secs = node
+        .startup_timeout_secs
+        .unwrap_or_else(|| self.config.default_node_startup_timeout_secs());
       match self
         .dispatcher
         .dispatch(&self.run_id, node, &self.pipeline, &self.config)
@@ -549,8 +588,14 @@ impl Coordinator {
           } else {
             info!(run_id = %self.run_id, node_name = %node_name, "Node dispatched");
             self.record_node_dispatched(&node_name, node).await;
-            let timeout_handle = self.spawn_node_timeout(&node_name, node.timeout_secs);
-            self.node_timeout_handles.insert(node_name, timeout_handle);
+            let handle = self.spawn_startup_timeout(&node_name, startup_secs);
+            self.node_phase_handles.insert(
+              node_name,
+              PhaseTimer {
+                phase: TimerPhase::Startup,
+                handle,
+              },
+            );
           }
         }
         Err(e) => {
@@ -561,7 +606,18 @@ impl Coordinator {
     }
   }
 
-  fn spawn_node_timeout(&self, node_name: &str, override_secs: Option<u64>) -> JoinHandle<()> {
+  fn spawn_startup_timeout(&self, node_name: &str, timeout_secs: u64) -> JoinHandle<()> {
+    let tx = self.internal_tx.clone();
+    let name = node_name.to_string();
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+      let _ = tx
+        .send(CoordinatorMessage::NodePodStartTimedOut { node_name: name })
+        .await;
+    })
+  }
+
+  fn spawn_runtime_timeout(&self, node_name: &str, override_secs: Option<u64>) -> JoinHandle<()> {
     let timeout_secs = override_secs.unwrap_or_else(|| self.config.default_node_timeout_secs());
     let tx = self.internal_tx.clone();
     let name = node_name.to_string();
@@ -576,8 +632,8 @@ impl Coordinator {
   async fn terminate_running_nodes(mut self, status: RunStatus) -> RunSummary {
     info!(run_id = %self.run_id, status = status.as_str(), "Coordinator terminating running nodes");
 
-    for (_, handle) in self.node_timeout_handles.drain() {
-      handle.abort();
+    for (_, timer) in self.node_phase_handles.drain() {
+      timer.handle.abort();
     }
 
     let running_nodes: Vec<String> = self
@@ -1307,6 +1363,183 @@ nodes:
       build_record.failure_reason.is_none(),
       "the OOM signal should have been dropped because build was already Success"
     );
+  }
+
+  fn make_pipeline_with_timeouts(startup_secs: u64, runtime_secs: u64) -> Arc<Pipeline> {
+    Arc::new(
+      Pipeline::from_yaml(&format!(
+        r#"
+name: test-pipeline
+on:
+  push:
+    branches: [main]
+nodes:
+  - name: build
+    image: rust:latest
+    timeout_secs: {runtime_secs}
+    startup_timeout_secs: {startup_secs}
+    steps:
+      - cargo build
+"#,
+      ))
+      .unwrap(),
+    )
+  }
+
+  #[tokio::test]
+  async fn startup_timeout_fires_when_pod_never_runs() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline_with_timeouts(1, 600);
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let cancel_calls = dispatcher.cancel_calls();
+    let run_history = CapturingRunHistory::new();
+
+    let handle = start_coordinator(
+      "test-run-startup".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(summary.node_statuses["build"], NodeStatus::Failed);
+    assert!(
+      cancel_calls.lock().unwrap().contains(&"build".to_string()),
+      "cancel_node should have been called for build"
+    );
+    let recorded = run_history.node_runs();
+    let build_record = recorded
+      .iter()
+      .find(|r| r.node_name == "build")
+      .expect("build node was recorded");
+    assert_eq!(
+      build_record.failure_reason.as_deref(),
+      Some("PodStartTimeout"),
+      "expected PodStartTimeout, got {:?}",
+      build_record.failure_reason
+    );
+  }
+
+  #[tokio::test]
+  async fn runtime_timeout_starts_fresh_when_pod_enters_running() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline_with_timeouts(60, 1);
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let signal_slot = dispatcher.signal_tx_slot();
+    let watcher_started = dispatcher.watcher_started_notify();
+    let dispatch_called = dispatcher.dispatch_called_notify();
+    let dispatch_done = dispatcher.dispatch_done_flag();
+    let run_history = CapturingRunHistory::new();
+
+    let handle = start_coordinator(
+      "test-run-runtime".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let signal_tx = wait_for_signal_tx(watcher_started, signal_slot).await;
+    wait_for_dispatch(dispatch_called, dispatch_done).await;
+
+    signal_tx
+      .send(PodSignal::PodRunning {
+        node_name: "build".into(),
+        pod_uid: "uid-1".into(),
+      })
+      .await
+      .expect("send running");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(summary.node_statuses["build"], NodeStatus::Failed);
+    let recorded = run_history.node_runs();
+    let build_record = recorded
+      .iter()
+      .find(|r| r.node_name == "build")
+      .expect("build node was recorded");
+    assert!(
+      build_record.failure_reason.is_none(),
+      "runtime timeout should not be recorded as an infra-failure reason; got {:?}",
+      build_record.failure_reason
+    );
+    assert_eq!(build_record.success, false);
+  }
+
+  #[tokio::test]
+  async fn pod_running_after_runtime_already_active_is_idempotent() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline_with_timeouts(60, 60);
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let signal_slot = dispatcher.signal_tx_slot();
+    let watcher_started = dispatcher.watcher_started_notify();
+    let dispatch_called = dispatcher.dispatch_called_notify();
+    let dispatch_done = dispatcher.dispatch_done_flag();
+    let run_history = CapturingRunHistory::new();
+    let backplane_for_test = backplane.clone();
+
+    let handle = start_coordinator(
+      "test-run-idempotent".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let signal_tx = wait_for_signal_tx(watcher_started, signal_slot).await;
+    wait_for_dispatch(dispatch_called, dispatch_done).await;
+
+    signal_tx
+      .send(PodSignal::PodRunning {
+        node_name: "build".into(),
+        pod_uid: "uid-1".into(),
+      })
+      .await
+      .expect("send running 1");
+    signal_tx
+      .send(PodSignal::PodRunning {
+        node_name: "build".into(),
+        pod_uid: "uid-1".into(),
+      })
+      .await
+      .expect("send running 2");
+
+    backplane_for_test
+      .publish_node_completed("test-run-idempotent", "build", true)
+      .await
+      .expect("publish completed");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Success);
   }
 
   #[tokio::test]

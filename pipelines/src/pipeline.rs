@@ -96,6 +96,8 @@ struct PipelineNode {
   image: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   timeout_secs: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  startup_timeout_secs: Option<u64>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   checkout: Option<bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -130,6 +132,7 @@ pub struct NodeInfo {
   pub steps: Vec<String>,
   pub dependencies: Vec<String>,
   pub timeout_secs: Option<u64>,
+  pub startup_timeout_secs: Option<u64>,
   pub checkout: bool,
   pub env: HashMap<String, String>,
   pub kind: NodeKind,
@@ -185,6 +188,7 @@ impl Pipeline {
           steps: n.steps.iter().map(step_command).collect(),
           dependencies: n.after.clone(),
           timeout_secs: n.timeout_secs,
+          startup_timeout_secs: n.startup_timeout_secs,
           checkout: n.checkout.unwrap_or(false),
           env,
           kind,

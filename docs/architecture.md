@@ -136,7 +136,8 @@ flowchart TD
 | **Server Instance Failure** | The Redis **Lease** TTL expires. The **Reaper** detects the orphaned run and re-acquires the lease on a healthy node. |
 | **Network Partition / Zombie Server** | **Fencing Tokens** ensure that a zombie server cannot write outdated state to Redis once a new coordinator has established a higher-version lease. |
 | **Worker Pod Failure** | **Tubes** reports a `Fail` status. The **coordinator** marks the node as failed and, if `fail_fast` is enabled, cancels the pipeline. |
-| **Node Deletion** | A K8s Watcher in the background detects the missing Pod; the **coordinator** reconciles the state and marks it as a system error. |
+| **Infrastructure Failure** | A per-run **PodWatcher** observes Pod conditions via `kube::runtime::watcher` and emits a structured `InfraFailureReason` (e.g. `ImagePullFailed`, `OOMKilled`, `ContainerCreateError`, `InitContainerFailed`, `PodDeletedUnexpectedly`) the moment K8s reports it, so the coordinator can fail-fast without waiting for the runtime timeout. The reason's `stable_code` is persisted to `node_runs.failure_reason`; the API surfaces a curated `user_message` for actionable causes (image pull, OOM, container-config errors, startup timeout). Non-actionable causes are logged structurally on the backend only. |
+| **Pod Stuck Pending** | The coordinator splits the per-node timer into a **startup phase** (Job creation → main container `Running`, default 300s) and a **runtime phase** (default 600s). Resource pressure or slow image pulls fail with `PodStartTimeout` rather than consuming the runtime budget. K8s `activeDeadlineSeconds` is set to `startup + runtime + 60s` as an outer safety net. |
 | **Version Conflict** | The `state_store` rejects the write. The coordinator stops immediately to avoid split-brain execution. |
 
 ---

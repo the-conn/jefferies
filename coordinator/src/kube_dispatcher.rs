@@ -153,6 +153,30 @@ fn build_env_vars(
   ]
 }
 
+const SAFETY_DEADLINE_BUFFER_SECS: u64 = 60;
+
+struct JobContext<'a> {
+  run_id: &'a str,
+  node_name: &'a str,
+  cm_name: &'a str,
+  labels: BTreeMap<String, String>,
+  env_vars: Vec<EnvVar>,
+  safety_deadline_secs: i64,
+}
+
+fn compute_safety_deadline_secs(node: &NodeInfo, config: &AppConfig) -> i64 {
+  let runtime = node
+    .timeout_secs
+    .unwrap_or_else(|| config.default_node_timeout_secs());
+  let startup = node
+    .startup_timeout_secs
+    .unwrap_or_else(|| config.default_node_startup_timeout_secs());
+  let total = startup
+    .saturating_add(runtime)
+    .saturating_add(SAFETY_DEADLINE_BUFFER_SECS);
+  total.try_into().unwrap_or(i64::MAX)
+}
+
 fn resource_requirements() -> ResourceRequirements {
   ResourceRequirements {
     requests: Some(BTreeMap::from([
@@ -174,7 +198,7 @@ impl Dispatcher for KubeDispatcher {
     run_id: &str,
     node: &NodeInfo,
     _pipeline: &Pipeline,
-    _config: &AppConfig,
+    config: &AppConfig,
   ) -> Result<(), DispatchError> {
     let status_put_url = self
       .source_manager
@@ -188,13 +212,23 @@ impl Dispatcher for KubeDispatcher {
     let mut env_vars = build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
     env_vars.extend(node.env.iter().map(|(k, v)| env_var(k, v)));
 
+    let safety_deadline_secs = compute_safety_deadline_secs(node, config);
+
     match &node.kind {
       NodeKind::Exec => {
         let script = build_script(&node.steps);
         self
           .create_script_configmap(run_id, &node.name, &cm_name, script, &self.namespace)
           .await?;
-        let job = self.build_job(run_id, &node.name, node, &cm_name, labels, env_vars);
+        let ctx = JobContext {
+          run_id,
+          node_name: &node.name,
+          cm_name: &cm_name,
+          labels,
+          env_vars,
+          safety_deadline_secs,
+        };
+        let job = self.build_job(ctx, node);
         let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
         jobs
           .create(&PostParams::default(), &job)
@@ -214,7 +248,15 @@ impl Dispatcher for KubeDispatcher {
           )
           .await?;
         env_vars.push(env_var("STORAGE_DRIVER", "vfs"));
-        let job = self.build_buildah_job(run_id, &node.name, node, &cm_name, labels, env_vars);
+        let ctx = JobContext {
+          run_id,
+          node_name: &node.name,
+          cm_name: &cm_name,
+          labels,
+          env_vars,
+          safety_deadline_secs,
+        };
+        let job = self.build_buildah_job(ctx);
         let jobs: kube::Api<Job> =
           kube::Api::namespaced(self.client.clone(), &self.builder_namespace);
         jobs
@@ -317,20 +359,20 @@ impl Dispatcher for KubeDispatcher {
 }
 
 impl KubeDispatcher {
-  fn build_job(
-    &self,
-    run_id: &str,
-    node_name: &str,
-    node: &NodeInfo,
-    cm_name: &str,
-    labels: BTreeMap<String, String>,
-    env_vars: Vec<EnvVar>,
-  ) -> Job {
+  fn build_job(&self, ctx: JobContext<'_>, node: &NodeInfo) -> Job {
     let image = if node.image.is_empty() {
-      &self.default_node_image
+      self.default_node_image.clone()
     } else {
-      &node.image
+      node.image.clone()
     };
+    let JobContext {
+      run_id,
+      node_name,
+      cm_name,
+      labels,
+      env_vars,
+      safety_deadline_secs,
+    } = ctx;
 
     Job {
       metadata: ObjectMeta {
@@ -340,7 +382,7 @@ impl KubeDispatcher {
         ..Default::default()
       },
       spec: Some(JobSpec {
-        active_deadline_seconds: node.timeout_secs.map(|t| t as i64),
+        active_deadline_seconds: Some(safety_deadline_secs),
         backoff_limit: Some(0),
         template: PodTemplateSpec {
           metadata: Some(ObjectMeta {
@@ -366,7 +408,7 @@ impl KubeDispatcher {
             }]),
             containers: vec![Container {
               name: "tube".to_string(),
-              image: Some(image.to_string()),
+              image: Some(image),
               command: Some(vec!["/shared/tube".to_string()]),
               args: Some(vec![]),
               env: Some(env_vars),
@@ -450,17 +492,17 @@ impl KubeDispatcher {
     Ok(())
   }
 
-  fn build_buildah_job(
-    &self,
-    run_id: &str,
-    node_name: &str,
-    node: &NodeInfo,
-    cm_name: &str,
-    labels: BTreeMap<String, String>,
-    env_vars: Vec<EnvVar>,
-  ) -> Job {
+  fn build_buildah_job(&self, ctx: JobContext<'_>) -> Job {
     let init_cmd = "cp /usr/local/bin/tube /shared/tube && \
       mkdir -p /var/lib/containers/storage /var/lib/containers/runroot";
+    let JobContext {
+      run_id,
+      node_name,
+      cm_name,
+      labels,
+      env_vars,
+      safety_deadline_secs,
+    } = ctx;
 
     Job {
       metadata: ObjectMeta {
@@ -470,7 +512,7 @@ impl KubeDispatcher {
         ..Default::default()
       },
       spec: Some(JobSpec {
-        active_deadline_seconds: node.timeout_secs.map(|t| t as i64),
+        active_deadline_seconds: Some(safety_deadline_secs),
         backoff_limit: Some(0),
         template: PodTemplateSpec {
           metadata: Some(ObjectMeta {
