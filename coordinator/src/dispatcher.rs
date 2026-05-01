@@ -66,6 +66,10 @@ pub trait Dispatcher: Send + Sync {
   ) -> Option<JoinHandle<()>> {
     None
   }
+
+  async fn list_managed_run_ids(&self) -> Result<Vec<String>, DispatchError> {
+    Ok(vec![])
+  }
 }
 
 pub struct LogDispatcher {

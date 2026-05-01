@@ -300,17 +300,19 @@ impl Dispatcher for KubeDispatcher {
   async fn cleanup_run(&self, run_id: &str) -> Result<(), DispatchError> {
     let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
 
-    let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
-    if let Err(e) = jobs
-      .delete_collection(&DeleteParams::background(), &lp)
-      .await
-    {
-      warn!(run_id, error = %e, "Failed to delete Job collection");
-    }
+    for ns in [self.namespace.as_str(), self.builder_namespace.as_str()] {
+      let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
+      if let Err(e) = jobs
+        .delete_collection(&DeleteParams::background(), &lp)
+        .await
+      {
+        warn!(run_id, namespace = ns, error = %e, "Failed to delete Job collection");
+      }
 
-    let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), &self.namespace);
-    if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
-      warn!(run_id, error = %e, "Failed to delete ConfigMap collection");
+      let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
+      if let Err(e) = cms.delete_collection(&DeleteParams::default(), &lp).await {
+        warn!(run_id, namespace = ns, error = %e, "Failed to delete ConfigMap collection");
+      }
     }
 
     self.source_manager.cleanup_run(run_id).await?;
@@ -355,6 +357,30 @@ impl Dispatcher for KubeDispatcher {
       cmd_rx,
     );
     Some(tokio::spawn(watcher.run()))
+  }
+
+  async fn list_managed_run_ids(&self) -> Result<Vec<String>, DispatchError> {
+    use std::collections::HashSet;
+
+    let lp = ListParams::default().labels("the-conn.com/managed-by=jefferies");
+    let mut run_ids: HashSet<String> = HashSet::new();
+
+    for ns in [self.namespace.as_str(), self.builder_namespace.as_str()] {
+      let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
+      let list = jobs
+        .list(&lp)
+        .await
+        .map_err(|e| DispatchError::Kube(e.to_string()))?;
+      for job in list.items {
+        if let Some(labels) = job.metadata.labels.as_ref()
+          && let Some(run_id) = labels.get("the-conn.com/run-id")
+        {
+          run_ids.insert(run_id.clone());
+        }
+      }
+    }
+
+    Ok(run_ids.into_iter().collect())
   }
 }
 

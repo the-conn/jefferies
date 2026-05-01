@@ -35,13 +35,14 @@
 * **Distributed Lifecycle:** Acquires a **Lease** in Redis before starting; renews it via heartbeat every 15 seconds. If renewal fails, the coordinator stops gracefully to yield to a new leader.
 * **Version-Fenced Writes:** Persists `RunState` to Redis after every node transition using optimistic concurrency. A rejected write (version conflict) causes the coordinator to stop immediately.
 * **Event Handling:** Consumes `NodeCompleted` and `Cancel` messages from the backplane, updates in-memory state, and dispatches newly unlocked nodes.
-* **The Reaper:** A background task that identifies orphaned runs (Running nodes in Redis but no active lease) and reclaims them by re-acquiring the lease and resuming from persisted state.
+* **The Reaper:** A background task with two cadences. Every **60 seconds** it scans Redis for runs with active in-flight nodes but no active lease and reclaims them by re-acquiring the lease and resuming from persisted state. Every **5 minutes** it runs a resource sweep that handles incomplete cleanup: any Redis run state that is unleased and fully terminal (no `Running` nodes, no dispatchable `Pending` nodes) gets `dispatcher.cleanup_run` plus `release_lease` plus `delete_run`; any Kubernetes Job labeled `the-conn.com/managed-by=jefferies` whose `run-id` no longer has Redis state gets `dispatcher.cleanup_run` to remove the stranded Jobs and ConfigMaps across both namespaces.
 * **SourceManager:** Handles all S3/NooBaa interactions for a run. When a pipeline contains at least one node with `checkout: true`, the `SourceManager` streams the repository tarball directly from the GitHub API to S3 at `runs/{run_id}/source.tar.gz` before the coordinator starts — with no intermediate disk writes. It generates 12-hour presigned GET URLs for the source archive and presigned PUT URLs for per-node status payloads at `runs/{run_id}/nodes/{node_name}/status.json`. On run finalization, it issues a bulk delete of all objects under the `runs/{run_id}/` prefix.
 * **KubeDispatcher:** The live `Dispatcher` implementation that actuates each pipeline node as a Kubernetes Job. It dispatches two distinct node kinds:
   * **Exec nodes** (`type: exec`, the default): run in `jefferies-jobs`. A `ConfigMap` is created containing the user-authored shell script (built from the node's `steps`), and a `Job` is submitted with an init container that copies the **Tube** binary to a shared `emptyDir` volume; the main container runs the user-provided image with `/shared/tube` as its entrypoint and all required `TUBE__` environment variables (presigned S3 URLs, poke callback URL, workspace config).
   * **Build nodes** (`type: build`): run in `jefferies-builder`, a dedicated namespace with a pre-provisioned `pipelines-sa-userid-1000` service account and `buildah-storage-config` ConfigMap. The script is system-generated as a single `buildah bud` invocation from the node's `config` block — users cannot supply arbitrary steps, which eliminates the security risk posed by the elevated capabilities buildah requires (`SETUID`, `SETGID`, `SETFCAP`). The merged init container (still using the Tube image) copies the Tube binary and sets up `/var/lib/containers` ownership before the main container starts; the main container runs `quay.io/buildah/stable:latest` with Tube as its entrypoint and the same lifecycle env vars as exec nodes.
-  * Applies `the-conn.com/run-id` and `the-conn.com/managed-by: jefferies` labels to all created objects for tracking and bulk cleanup.
-  * On cancellation, deletes Jobs and ConfigMaps from both namespaces.
+  * Applies `the-conn.com/run-id`, `the-conn.com/node-name`, and `the-conn.com/managed-by: jefferies` labels to all created objects for tracking, bulk cleanup, and `PodWatcher` routing.
+  * On cancellation and on full-run cleanup, deletes Jobs and ConfigMaps from both namespaces (the `Reaper` calls the same path to mop up resources for runs whose Redis state has already been removed).
+  * Sets the K8s Job `activeDeadlineSeconds` to `startup_timeout + runtime_timeout + 60s` as an outer safety net so a permanently-dead coordinator cannot leave Pods running indefinitely.
   * The node image, Tube image, target namespace, builder namespace, and buildah image are all user-configurable in `[kubernetes]` of the TOML config.
 
 #### **G. server (The Interface)**
@@ -75,7 +76,7 @@
 ```mermaid
 flowchart TD
     GH([GitHub])
-    REAPER([Reaper - every 60 s])
+    REAPER([Reaper - lease reclaim 60 s, resource sweep 5 min])
     SRV["Server<br/>Validate HMAC-SHA256, parse pipeline YAML"]
     POKE["Server poke handler<br/>GET status.json from S3"]
 
@@ -138,6 +139,7 @@ flowchart TD
 | **Worker Pod Failure** | **Tubes** reports a `Fail` status. The **coordinator** marks the node as failed and, if `fail_fast` is enabled, cancels the pipeline. |
 | **Infrastructure Failure** | A per-run **PodWatcher** observes Pod conditions via `kube::runtime::watcher` and emits a structured `InfraFailureReason` (e.g. `ImagePullFailed`, `OOMKilled`, `ContainerCreateError`, `InitContainerFailed`, `PodDeletedUnexpectedly`) the moment K8s reports it, so the coordinator can fail-fast without waiting for the runtime timeout. The reason's `stable_code` is persisted to `node_runs.failure_reason`; the API surfaces a curated `user_message` for actionable causes (image pull, OOM, container-config errors, startup timeout). Non-actionable causes are logged structurally on the backend only. |
 | **Pod Stuck Pending** | The coordinator splits the per-node timer into a **startup phase** (Job creation → main container `Running`, default 300s) and a **runtime phase** (default 600s). Resource pressure or slow image pulls fail with `PodStartTimeout` rather than consuming the runtime budget. K8s `activeDeadlineSeconds` is set to `startup + runtime + 60s` as an outer safety net. |
+| **Stranded Resources After Failed Cleanup** | If a coordinator's `cleanup()` partially fails (e.g., Redis state gets deleted but a K8s API call fails, or vice versa), the **Reaper**'s 5-minute sweep reconciles: terminal-and-unleased Redis state triggers `cleanup_run` + `delete_run`; orphan K8s Jobs whose `run-id` has no Redis state trigger `cleanup_run`. Both passes are idempotent. |
 | **Version Conflict** | The `state_store` rejects the write. The coordinator stops immediately to avoid split-brain execution. |
 
 ---

@@ -76,7 +76,22 @@ pub trait StateStore: Send + Sync {
 
   async fn get_orphaned_runs(&self) -> Result<Vec<String>, StateStoreError>;
 
+  async fn list_terminal_unleased_runs(&self) -> Result<Vec<String>, StateStoreError>;
+
   async fn ping(&self) -> Result<(), StateStoreError>;
+}
+
+fn run_state_is_terminal(state: &RunState) -> bool {
+  if state.statuses.values().any(|s| *s == NodeStatus::Running) {
+    return false;
+  }
+  let has_dispatchable = state.dependencies.iter().any(|(node, deps)| {
+    state.statuses.get(node) == Some(&NodeStatus::Pending)
+      && deps
+        .iter()
+        .all(|d| state.statuses.get(d) == Some(&NodeStatus::Success))
+  });
+  !has_dispatchable
 }
 
 fn state_key(run_id: &str) -> String {
@@ -316,6 +331,54 @@ impl StateStore for RedisStateStore {
     Ok(orphaned)
   }
 
+  async fn list_terminal_unleased_runs(&self) -> Result<Vec<String>, StateStoreError> {
+    let mut conn = self.pool.get().await?;
+    let pattern = "jefferies:run:*:state";
+
+    let keys: Vec<String> = deadpool_redis::redis::cmd("KEYS")
+      .arg(pattern)
+      .query_async(&mut conn)
+      .await?;
+
+    let mut terminal = vec![];
+    for key in &keys {
+      let parts: Vec<&str> = key.split(':').collect();
+      if parts.len() < 4 {
+        continue;
+      }
+      let run_id = parts[2];
+
+      let value: Option<String> = deadpool_redis::redis::cmd("GET")
+        .arg(key)
+        .query_async(&mut conn)
+        .await?;
+      let Some(json) = value else { continue };
+
+      let Ok(state): Result<RunState, _> = serde_json::from_str(&json) else {
+        continue;
+      };
+
+      if !run_state_is_terminal(&state) {
+        continue;
+      }
+
+      let lease_k = lease_key(run_id);
+      let lease_exists: bool = deadpool_redis::redis::cmd("EXISTS")
+        .arg(&lease_k)
+        .query_async(&mut conn)
+        .await
+        .map(|n: i64| n > 0)
+        .unwrap_or(false);
+
+      if !lease_exists {
+        debug!(run_id, "Found terminal unleased run");
+        terminal.push(run_id.to_string());
+      }
+    }
+
+    Ok(terminal)
+  }
+
   async fn ping(&self) -> Result<(), StateStoreError> {
     let mut conn = self.pool.get().await?;
     let _: String = deadpool_redis::redis::cmd("PING")
@@ -450,6 +513,19 @@ impl StateStore for InMemoryStateStore {
     Ok(orphaned)
   }
 
+  async fn list_terminal_unleased_runs(&self) -> Result<Vec<String>, StateStoreError> {
+    let runs = self.runs.lock().await;
+    let leases = self.leases.lock().await;
+    let terminal = runs
+      .iter()
+      .filter(|(run_id, entry)| {
+        run_state_is_terminal(&entry.state) && !leases.contains_key(*run_id)
+      })
+      .map(|(run_id, _)| run_id.clone())
+      .collect();
+    Ok(terminal)
+  }
+
   async fn ping(&self) -> Result<(), StateStoreError> {
     Ok(())
   }
@@ -561,5 +637,61 @@ nodes:
       .unwrap();
     let orphans = store.get_orphaned_runs().await.unwrap();
     assert!(orphans.is_empty(), "Should not be orphaned when lease held");
+  }
+
+  #[tokio::test]
+  async fn terminal_unleased_run_is_listed_when_all_nodes_done() {
+    let store = InMemoryStateStore::new();
+    let mut state = make_run_state(0);
+    state
+      .statuses
+      .insert("build".to_string(), NodeStatus::Success);
+    store.save_run("run1", &state, 0).await.unwrap();
+
+    let terminal = store.list_terminal_unleased_runs().await.unwrap();
+    assert_eq!(terminal, vec!["run1"]);
+  }
+
+  #[tokio::test]
+  async fn terminal_run_with_lease_is_excluded() {
+    let store = InMemoryStateStore::new();
+    let mut state = make_run_state(0);
+    state
+      .statuses
+      .insert("build".to_string(), NodeStatus::Failed);
+    store.save_run("run1", &state, 0).await.unwrap();
+    store
+      .try_acquire_lease("run1", "server-a", 30)
+      .await
+      .unwrap();
+
+    let terminal = store.list_terminal_unleased_runs().await.unwrap();
+    assert!(terminal.is_empty());
+  }
+
+  #[tokio::test]
+  async fn run_with_running_node_is_not_terminal() {
+    let store = InMemoryStateStore::new();
+    let mut state = make_run_state(0);
+    state
+      .statuses
+      .insert("build".to_string(), NodeStatus::Running);
+    store.save_run("run1", &state, 0).await.unwrap();
+
+    let terminal = store.list_terminal_unleased_runs().await.unwrap();
+    assert!(terminal.is_empty());
+  }
+
+  #[tokio::test]
+  async fn run_with_dispatchable_pending_node_is_not_terminal() {
+    let store = InMemoryStateStore::new();
+    let state = make_run_state(0);
+    store.save_run("run1", &state, 0).await.unwrap();
+
+    let terminal = store.list_terminal_unleased_runs().await.unwrap();
+    assert!(
+      terminal.is_empty(),
+      "an all-pending run with no upstream blockers is dispatchable, not terminal"
+    );
   }
 }
