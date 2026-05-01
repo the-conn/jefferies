@@ -35,6 +35,7 @@ service_account = "jefferies-jobs-sa"
 runtime_class = "kata"
 default_cpu = "1"
 default_memory = "2Gi"
+default_workspace_size = "2Gi"
 
 [postgres]
 host = "localhost"

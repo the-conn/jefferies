@@ -73,6 +73,7 @@ struct KubernetesConfig {
   runtime_class: String,
   default_cpu: String,
   default_memory: String,
+  default_workspace_size: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +222,10 @@ impl AppConfig {
 
   pub fn default_node_memory(&self) -> &str {
     &self.kubernetes.default_memory
+  }
+
+  pub fn default_workspace_size(&self) -> &str {
+    &self.kubernetes.default_workspace_size
   }
 
   pub fn postgres_host(&self) -> &str {

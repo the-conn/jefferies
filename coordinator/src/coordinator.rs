@@ -774,9 +774,20 @@ impl Coordinator {
     }
   }
 
-  async fn record_history(&self, status: RunStatus) {
-    let completed_at = Utc::now();
+  async fn record_history(&mut self, status: RunStatus) {
+    let running_nodes: Vec<String> = self
+      .run
+      .statuses()
+      .iter()
+      .filter(|(_, s)| **s == NodeStatus::Running)
+      .map(|(name, _)| name.clone())
+      .collect();
+    for node_name in &running_nodes {
+      self.record_running_node_terminated(node_name).await;
+      self.run.mark_failed(node_name);
+    }
 
+    let completed_at = Utc::now();
     let pipeline_record = PipelineRunRecord {
       run_id: self.run_id.clone(),
       pipeline_name: self.pipeline.name().to_string(),
@@ -796,17 +807,6 @@ impl Coordinator {
     };
     if let Err(e) = self.run_history.record_pipeline_run(pipeline_record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
-    }
-
-    let running_nodes: Vec<String> = self
-      .run
-      .statuses()
-      .iter()
-      .filter(|(_, s)| **s == NodeStatus::Running)
-      .map(|(name, _)| name.clone())
-      .collect();
-    for node_name in running_nodes {
-      self.record_running_node_terminated(&node_name).await;
     }
   }
 
@@ -1540,6 +1540,82 @@ nodes:
 
     let summary = handle.await.expect("Coordinator should complete");
     assert_eq!(summary.status, RunStatus::Success);
+  }
+
+  fn make_pipeline_with_pipeline_timeout(pipeline_timeout_secs: u64) -> Arc<Pipeline> {
+    Arc::new(
+      Pipeline::from_yaml(&format!(
+        r#"
+name: test-pipeline
+timeout_secs: {pipeline_timeout_secs}
+on:
+  push:
+    branches: [main]
+nodes:
+  - name: build
+    image: rust:latest
+    timeout_secs: 600
+    startup_timeout_secs: 600
+    steps:
+      - cargo build
+"#,
+      ))
+      .unwrap(),
+    )
+  }
+
+  #[tokio::test]
+  async fn pipeline_timeout_records_completed_at_for_running_node() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline_with_pipeline_timeout(1);
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let signal_slot = dispatcher.signal_tx_slot();
+    let watcher_started = dispatcher.watcher_started_notify();
+    let dispatch_called = dispatcher.dispatch_called_notify();
+    let dispatch_done = dispatcher.dispatch_done_flag();
+    let run_history = CapturingRunHistory::new();
+
+    let handle = start_coordinator(
+      "test-run-pipeline-timeout".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let signal_tx = wait_for_signal_tx(watcher_started, signal_slot).await;
+    wait_for_dispatch(dispatch_called, dispatch_done).await;
+
+    signal_tx
+      .send(PodSignal::PodRunning {
+        node_name: "build".into(),
+        pod_uid: "uid-1".into(),
+      })
+      .await
+      .expect("send running");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(summary.node_statuses["build"], NodeStatus::Failed);
+    let recorded = run_history.node_runs();
+    let build_record = recorded
+      .iter()
+      .find(|r| r.node_name == "build")
+      .expect("build node was recorded");
+    assert!(
+      build_record.completed_at.is_some(),
+      "completed_at should be set for the running node when the pipeline times out"
+    );
+    assert!(!build_record.success);
   }
 
   #[tokio::test]

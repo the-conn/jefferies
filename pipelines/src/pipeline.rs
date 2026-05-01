@@ -91,6 +91,8 @@ struct PipelineNode {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   cache_size: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  workspace_size: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   cpu: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   memory: Option<String>,
@@ -125,6 +127,7 @@ pub struct NodeInfo {
   pub env: HashMap<String, String>,
   pub privileged: bool,
   pub cache_size: Option<String>,
+  pub workspace_size: Option<String>,
   pub cpu: Option<String>,
   pub memory: Option<String>,
 }
@@ -181,6 +184,7 @@ impl Pipeline {
           env,
           privileged: n.privileged,
           cache_size: n.cache_size.clone(),
+          workspace_size: n.workspace_size.clone(),
           cpu: n.cpu.clone(),
           memory: n.memory.clone(),
         }
@@ -216,6 +220,7 @@ fn validate_quantities(pipeline: &Pipeline) -> Result<(), PipelineError> {
       ("cpu", node.cpu.as_deref()),
       ("memory", node.memory.as_deref()),
       ("cache_size", node.cache_size.as_deref()),
+      ("workspace_size", node.workspace_size.as_deref()),
     ] {
       if let Some(v) = value
         && !is_valid_quantity(v)
@@ -767,6 +772,7 @@ nodes:
     let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
     assert!(!infos[0].privileged);
     assert!(infos[0].cache_size.is_none());
+    assert!(infos[0].workspace_size.is_none());
     assert!(infos[0].cpu.is_none());
     assert!(infos[0].memory.is_none());
   }
@@ -780,6 +786,7 @@ nodes:
     image: quay.io/buildah/stable:latest
     privileged: true
     cache_size: 2Gi
+    workspace_size: 8Gi
     cpu: "2"
     memory: 4Gi
     steps:
@@ -788,6 +795,7 @@ nodes:
     let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
     assert!(infos[0].privileged);
     assert_eq!(infos[0].cache_size.as_deref(), Some("2Gi"));
+    assert_eq!(infos[0].workspace_size.as_deref(), Some("8Gi"));
     assert_eq!(infos[0].cpu.as_deref(), Some("2"));
     assert_eq!(infos[0].memory.as_deref(), Some("4Gi"));
   }

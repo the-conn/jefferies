@@ -9,7 +9,8 @@ nodes:
   - name: Format, Lint and Test
     image: rust:1.95-slim
     checkout: true
-    cache_size: 2Gi
+    cache_size: 1Gi
+    workspace_size: 5Gi
     env:
       CARGO_HOME: /tmp/cache
     steps:
