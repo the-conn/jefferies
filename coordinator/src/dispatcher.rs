@@ -5,9 +5,13 @@ use async_trait::async_trait;
 use backplane::Backplane;
 use pipelines::{NodeInfo, Pipeline};
 use thiserror::Error;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::info;
 
-use crate::source_manager::{NodeOutcome, SourceError};
+use crate::{
+  pod_watcher::{PodSignal, WatcherCommand},
+  source_manager::{NodeOutcome, SourceError},
+};
 
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -52,6 +56,15 @@ pub trait Dispatcher: Send + Sync {
     _node_name: &str,
   ) -> Result<Option<String>, DispatchError> {
     Ok(None)
+  }
+
+  async fn start_pod_watcher(
+    &self,
+    _run_id: &str,
+    _signal_tx: mpsc::Sender<PodSignal>,
+    _cmd_rx: mpsc::Receiver<WatcherCommand>,
+  ) -> Option<JoinHandle<()>> {
+    None
   }
 }
 

@@ -83,6 +83,7 @@ pub struct BuildConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeKind {
   Exec,
   Build(BuildConfig),

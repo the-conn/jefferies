@@ -8,12 +8,14 @@ use axum::{
   routing::{get, post},
 };
 use backplane::RabbitmqBackplane;
+use chrono::{DateTime, Utc};
 use coordinator::{KubeDispatcher, SourceError, SourceManager, start_reaper};
+use futures_util::future::join_all;
 use providers::{GithubProvider, ProviderState};
 use run_history::{
-  ListRunsQuery, NodeRunRow, PipelineRunRow, PostgresRunHistory, SortColumn, SortOrder,
+  ListRunsQuery, NodeRunRow, PipelineRunRow, PostgresRunHistory, RunFilters, SortColumn, SortOrder,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use state_store::RunState;
 use thiserror::Error;
 use tokio::signal;
@@ -335,10 +337,16 @@ struct ListRunsParams {
   pipeline_name: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ListRunsResponse {
+  runs: Vec<PipelineRunRow>,
+  total: i64,
+}
+
 async fn list_runs(
   State(state): State<Arc<ProviderState>>,
   Query(params): Query<ListRunsParams>,
-) -> Result<Json<Vec<PipelineRunRow>>, StatusCode> {
+) -> Result<Json<ListRunsResponse>, StatusCode> {
   let limit = params.limit.unwrap_or(50).clamp(1, 200);
   let offset = params.offset.unwrap_or(0).max(0);
   let sort_by = SortColumn::parse(params.sort_by.as_deref().unwrap_or("created_at"))
@@ -346,17 +354,24 @@ async fn list_runs(
   let order =
     SortOrder::parse(params.order.as_deref().unwrap_or("desc")).ok_or(StatusCode::BAD_REQUEST)?;
 
+  let filters = RunFilters {
+    owner: params.owner,
+    repo: params.repo,
+    pipeline_name: params.pipeline_name,
+  };
   let query = ListRunsQuery {
     limit,
     offset,
     sort_by,
     order,
-    owner: params.owner,
-    repo: params.repo,
-    pipeline_name: params.pipeline_name,
+    filters: filters.clone(),
   };
-  match state.run_history.list_pipeline_runs(query).await {
-    Ok(rows) => Ok(Json(rows)),
+  let result = tokio::try_join!(
+    state.run_history.list_pipeline_runs(query),
+    state.run_history.count_pipeline_runs(&filters),
+  );
+  match result {
+    Ok((runs, total)) => Ok(Json(ListRunsResponse { runs, total })),
     Err(e) => {
       warn!(error = %e, "Failed to list pipeline runs");
       Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -383,7 +398,15 @@ async fn list_run_nodes(
   Path(run_id): Path<String>,
 ) -> (StatusCode, Json<Vec<NodeRunRow>>) {
   match state.run_history.list_node_runs(&run_id).await {
-    Ok(rows) => (StatusCode::OK, Json(rows)),
+    Ok(rows) => {
+      let augmented = join_all(
+        rows
+          .into_iter()
+          .map(|row| augment_with_live(row, &state.source_manager)),
+      )
+      .await;
+      (StatusCode::OK, Json(augmented))
+    }
     Err(e) => {
       warn!(run_id, error = %e, "Failed to list node runs");
       (StatusCode::INTERNAL_SERVER_ERROR, Json(vec![]))
@@ -396,7 +419,10 @@ async fn get_run_node(
   Path((run_id, node_name)): Path<(String, String)>,
 ) -> (StatusCode, Json<Option<NodeRunRow>>) {
   match state.run_history.get_node_run(&run_id, &node_name).await {
-    Ok(Some(row)) => (StatusCode::OK, Json(Some(row))),
+    Ok(Some(row)) => {
+      let augmented = augment_with_live(row, &state.source_manager).await;
+      (StatusCode::OK, Json(Some(augmented)))
+    }
     Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
     Err(e) => {
       warn!(run_id, node_name, error = %e, "Failed to get node run");
@@ -409,6 +435,30 @@ async fn get_node_log(
   State(state): State<Arc<ProviderState>>,
   Path((run_id, node_name)): Path<(String, String)>,
 ) -> (StatusCode, String) {
+  let in_progress = match state.run_history.get_node_run(&run_id, &node_name).await {
+    Ok(Some(row)) => row.completed_at.is_none(),
+    Ok(None) => return (StatusCode::NOT_FOUND, String::new()),
+    Err(e) => {
+      warn!(run_id, node_name, error = %e, "Failed to look up node run for log");
+      return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+    }
+  };
+
+  if in_progress {
+    match state.source_manager.get_node_log(&run_id, &node_name).await {
+      Ok(Some(log)) => return (StatusCode::OK, log),
+      Ok(None) => {
+        debug!(
+          run_id,
+          node_name, "Live log not yet in S3, falling back to Postgres"
+        );
+      }
+      Err(e) => {
+        warn!(run_id, node_name, error = %e, "Live log fetch failed, falling back to Postgres");
+      }
+    }
+  }
+
   match state.run_history.get_node_log(&run_id, &node_name).await {
     Ok(Some(log)) => (StatusCode::OK, log),
     Ok(None) => (StatusCode::NOT_FOUND, String::new()),
@@ -419,12 +469,52 @@ async fn get_node_log(
   }
 }
 
+async fn augment_with_live(mut row: NodeRunRow, source_manager: &SourceManager) -> NodeRunRow {
+  if row.completed_at.is_some() {
+    return row;
+  }
+  let run_id = row.run_id.to_string();
+  match source_manager
+    .get_node_status(&run_id, &row.node_name)
+    .await
+  {
+    Ok(outcome) => {
+      if let Some(success) = outcome.success {
+        row.success = Some(success);
+      }
+      if let Some(ms) = outcome.started_at
+        && let Some(dt) = millis_to_datetime(ms)
+      {
+        row.started_at = Some(dt);
+      }
+      if let Some(ms) = outcome.finished_at
+        && let Some(dt) = millis_to_datetime(ms)
+      {
+        row.completed_at = Some(dt);
+      }
+    }
+    Err(SourceError::NotFound(_)) => {}
+    Err(e) => {
+      warn!(run_id, node = %row.node_name, error = %e, "Live status fetch failed");
+    }
+  }
+  row
+}
+
+fn millis_to_datetime(ms: u128) -> Option<DateTime<Utc>> {
+  let secs = i64::try_from(ms / 1000).ok()?;
+  let nanos = u32::try_from((ms % 1000) * 1_000_000).ok()?;
+  DateTime::from_timestamp(secs, nanos)
+}
+
 #[cfg(test)]
 mod tests {
   use axum::{body::Body, http::Request};
   use backplane::InMemoryBackplane;
   use coordinator::LogDispatcher;
+  use http_body_util::BodyExt;
   use run_history::NoOpRunHistory;
+  use serde_json::Value;
   use state_store::InMemoryStateStore;
   use tower::ServiceExt;
 
@@ -497,7 +587,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_list_runs_returns_empty_array() {
+  async fn test_list_runs_returns_envelope_with_total() {
     let app = router(make_test_state());
     let response = app
       .oneshot(
@@ -509,6 +599,12 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).expect("response is JSON");
+    assert!(json.get("runs").map(|v| v.is_array()).unwrap_or(false));
+    assert!(json.get("total").map(|v| v.is_i64()).unwrap_or(false));
+    assert_eq!(json["total"], 0);
+    assert_eq!(json["runs"].as_array().map(|a| a.len()), Some(0));
   }
 
   #[tokio::test]

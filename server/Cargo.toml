@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 axum = { workspace = true }
 backplane = { workspace = true }
+chrono = { workspace = true }
 coordinator = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 state_store = { workspace = true }
 tower-http = { workspace = true }
@@ -18,4 +20,6 @@ providers = { workspace = true }
 run_history = { workspace = true }
 
 [dev-dependencies]
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

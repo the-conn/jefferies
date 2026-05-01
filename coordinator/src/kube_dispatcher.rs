@@ -15,10 +15,12 @@ use k8s_openapi::{
 };
 use kube::api::{DeleteParams, ListParams, PostParams};
 use pipelines::{BuildConfig, NodeInfo, NodeKind, Pipeline};
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{info, warn};
 
 use crate::{
   dispatcher::{DispatchError, Dispatcher},
+  pod_watcher::{PodSignal, PodWatcher, WatcherCommand},
   source_manager::{NodeOutcome, SourceError, SourceManager},
 };
 
@@ -90,6 +92,12 @@ fn run_labels(run_id: &str) -> BTreeMap<String, String> {
       "jefferies".to_string(),
     ),
   ])
+}
+
+fn pod_labels(run_id: &str, node_name: &str) -> BTreeMap<String, String> {
+  let mut labels = run_labels(run_id);
+  labels.insert("the-conn.com/node-name".to_string(), node_name.to_string());
+  labels
 }
 
 fn build_script(steps: &[String]) -> String {
@@ -176,7 +184,7 @@ impl Dispatcher for KubeDispatcher {
     let get_url = self.source_manager.get_source_url(run_id).await?;
 
     let cm_name = configmap_name(run_id, &node.name);
-    let labels = run_labels(run_id);
+    let labels = pod_labels(run_id, &node.name);
     let mut env_vars = build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
     env_vars.extend(node.env.iter().map(|(k, v)| env_var(k, v)));
 
@@ -289,6 +297,22 @@ impl Dispatcher for KubeDispatcher {
       .get_node_log(run_id, node_name)
       .await
       .map_err(DispatchError::Source)
+  }
+
+  async fn start_pod_watcher(
+    &self,
+    run_id: &str,
+    signal_tx: mpsc::Sender<PodSignal>,
+    cmd_rx: mpsc::Receiver<WatcherCommand>,
+  ) -> Option<JoinHandle<()>> {
+    let watcher = PodWatcher::new(
+      self.client.clone(),
+      vec![self.namespace.clone(), self.builder_namespace.clone()],
+      run_id.to_string(),
+      signal_tx,
+      cmd_rx,
+    );
+    Some(tokio::spawn(watcher.run()))
   }
 }
 

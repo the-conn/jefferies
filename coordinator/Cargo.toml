@@ -25,3 +25,4 @@ backplane = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 schemars = { workspace = true }
+futures-util = { workspace = true }

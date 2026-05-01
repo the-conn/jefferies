@@ -217,15 +217,24 @@ impl SortOrder {
   }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct RunFilters {
+  pub owner: Option<String>,
+  pub repo: Option<String>,
+  pub pipeline_name: Option<String>,
+}
+
 pub struct ListRunsQuery {
   pub limit: i64,
   pub offset: i64,
   pub sort_by: SortColumn,
   pub order: SortOrder,
-  pub owner: Option<String>,
-  pub repo: Option<String>,
-  pub pipeline_name: Option<String>,
+  pub filters: RunFilters,
 }
+
+const FILTER_WHERE: &str = "WHERE ($1::text IS NULL OR owner = $1) \
+                             AND ($2::text IS NULL OR repo = $2) \
+                             AND ($3::text IS NULL OR pipeline_name = $3)";
 
 #[async_trait]
 pub trait RunHistory: Send + Sync {
@@ -241,6 +250,7 @@ pub trait RunHistory: Send + Sync {
     &self,
     query: ListRunsQuery,
   ) -> Result<Vec<PipelineRunRow>, RunHistoryError>;
+  async fn count_pipeline_runs(&self, filters: &RunFilters) -> Result<i64, RunHistoryError>;
   async fn get_pipeline_run(&self, run_id: &str)
   -> Result<Option<PipelineRunRow>, RunHistoryError>;
   async fn list_node_runs(&self, run_id: &str) -> Result<Vec<NodeRunRow>, RunHistoryError>;
@@ -389,24 +399,32 @@ impl RunHistory for PostgresRunHistory {
     q: ListRunsQuery,
   ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
     let sql = format!(
-      "SELECT * FROM pipeline_runs \
-       WHERE ($1::text IS NULL OR owner = $1) \
-         AND ($2::text IS NULL OR repo = $2) \
-         AND ($3::text IS NULL OR pipeline_name = $3) \
+      "SELECT * FROM pipeline_runs {FILTER_WHERE} \
        ORDER BY {} {} NULLS LAST \
        LIMIT $4 OFFSET $5",
       q.sort_by.as_sql(),
       q.order.as_sql(),
     );
     let rows = sqlx::query_as::<_, PipelineRunRow>(&sql)
-      .bind(q.owner.as_deref())
-      .bind(q.repo.as_deref())
-      .bind(q.pipeline_name.as_deref())
+      .bind(q.filters.owner.as_deref())
+      .bind(q.filters.repo.as_deref())
+      .bind(q.filters.pipeline_name.as_deref())
       .bind(q.limit)
       .bind(q.offset)
       .fetch_all(&self.pool)
       .await?;
     Ok(rows)
+  }
+
+  async fn count_pipeline_runs(&self, filters: &RunFilters) -> Result<i64, RunHistoryError> {
+    let sql = format!("SELECT COUNT(*) FROM pipeline_runs {FILTER_WHERE}");
+    let (count,): (i64,) = sqlx::query_as(&sql)
+      .bind(filters.owner.as_deref())
+      .bind(filters.repo.as_deref())
+      .bind(filters.pipeline_name.as_deref())
+      .fetch_one(&self.pool)
+      .await?;
+    Ok(count)
   }
 
   async fn get_pipeline_run(
@@ -496,6 +514,10 @@ impl RunHistory for NoOpRunHistory {
     _: ListRunsQuery,
   ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
     Ok(vec![])
+  }
+
+  async fn count_pipeline_runs(&self, _: &RunFilters) -> Result<i64, RunHistoryError> {
+    Ok(0)
   }
 
   async fn get_pipeline_run(&self, _: &str) -> Result<Option<PipelineRunRow>, RunHistoryError> {

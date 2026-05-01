@@ -11,7 +11,12 @@ use state_store::{NodeStatus, StateStore, StateStoreError};
 use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 use tracing::{error, info, warn};
 
-use crate::{dispatcher::Dispatcher, message::CoordinatorMessage, run::PipelineRun};
+use crate::{
+  dispatcher::Dispatcher,
+  message::CoordinatorMessage,
+  pod_watcher::{InfraFailureReason, PodSignal, WatcherCommand},
+  run::PipelineRun,
+};
 
 pub struct RunContext {
   pub owner: String,
@@ -58,6 +63,9 @@ struct Coordinator {
   server_id: String,
   run_context: RunContext,
   run_history: Arc<dyn RunHistory>,
+  pod_watcher_handle: Option<JoinHandle<()>>,
+  signal_relay_handle: Option<JoinHandle<()>>,
+  watcher_cmd_tx: Option<mpsc::Sender<WatcherCommand>>,
 }
 
 pub async fn start_coordinator(
@@ -103,6 +111,9 @@ pub async fn start_coordinator(
 
   let (internal_tx, internal_rx) = mpsc::channel(128);
 
+  let (pod_watcher_handle, signal_relay_handle, watcher_cmd_tx) =
+    spawn_pod_watcher(&run_id, &services.dispatcher, internal_tx.clone()).await;
+
   let coordinator = Coordinator {
     run_id,
     run,
@@ -120,9 +131,50 @@ pub async fn start_coordinator(
     server_id,
     run_context,
     run_history: services.run_history,
+    pod_watcher_handle,
+    signal_relay_handle,
+    watcher_cmd_tx,
   };
 
   Some(tokio::spawn(coordinator.run()))
+}
+
+async fn spawn_pod_watcher(
+  run_id: &str,
+  dispatcher: &Arc<dyn Dispatcher>,
+  internal_tx: mpsc::Sender<CoordinatorMessage>,
+) -> (
+  Option<JoinHandle<()>>,
+  Option<JoinHandle<()>>,
+  Option<mpsc::Sender<WatcherCommand>>,
+) {
+  let (signal_tx, mut signal_rx) = mpsc::channel::<PodSignal>(128);
+  let (cmd_tx, cmd_rx) = mpsc::channel::<WatcherCommand>(32);
+
+  let Some(watcher_handle) = dispatcher
+    .start_pod_watcher(run_id, signal_tx, cmd_rx)
+    .await
+  else {
+    return (None, None, None);
+  };
+
+  let run_id_owned = run_id.to_string();
+  let relay_handle = tokio::spawn(async move {
+    while let Some(signal) = signal_rx.recv().await {
+      let msg = match signal {
+        PodSignal::PodRunning { node_name, .. } => CoordinatorMessage::NodePodRunning { node_name },
+        PodSignal::InfraFailure {
+          node_name, reason, ..
+        } => CoordinatorMessage::NodeInfraFailed { node_name, reason },
+      };
+      if let Err(e) = internal_tx.send(msg).await {
+        warn!(run_id = %run_id_owned, error = %e, "Pod signal relay channel closed");
+        return;
+      }
+    }
+  });
+
+  (Some(watcher_handle), Some(relay_handle), Some(cmd_tx))
 }
 
 async fn initialize_run_state(
@@ -177,7 +229,7 @@ impl Coordinator {
       Ok(sub) => sub,
       Err(e) => {
         error!(run_id = %self.run_id, error = %e, "Failed to subscribe to backplane");
-        return self.build_summary(RunStatus::Failure);
+        return self.build_summary(RunStatus::Failure).await;
       }
     };
 
@@ -190,7 +242,7 @@ impl Coordinator {
       let status = self.outcome_status();
       self.record_history(status).await;
       self.cleanup().await;
-      return self.build_summary(status);
+      return self.build_summary(status).await;
     }
 
     loop {
@@ -212,19 +264,31 @@ impl Coordinator {
             .unwrap_or(false);
           if !renewed {
             warn!(run_id = %self.run_id, "Lease renewal failed; another server took over");
-            return self.build_summary(RunStatus::Failure);
+            return self.build_summary(RunStatus::Failure).await;
           }
         }
         msg = self.internal_rx.recv() => {
-          if let Some(CoordinatorMessage::NodeTimedOut { node_name }) = msg {
-            if self.handle_node_timed_out(&node_name).await {
-              self.record_history(RunStatus::Failure).await;
-              self.cleanup().await;
-              return self.terminate_running_nodes(RunStatus::Failure).await;
+          match msg {
+            Some(CoordinatorMessage::NodeTimedOut { node_name }) => {
+              if self.handle_node_timed_out(&node_name).await {
+                self.record_history(RunStatus::Failure).await;
+                self.cleanup().await;
+                return self.terminate_running_nodes(RunStatus::Failure).await;
+              }
+              if self.run.is_complete() {
+                break;
+              }
             }
-            if self.run.is_complete() {
-              break;
+            Some(CoordinatorMessage::NodePodRunning { node_name }) => {
+              self.handle_pod_running(&node_name).await;
             }
+            Some(CoordinatorMessage::NodeInfraFailed { node_name, reason }) => {
+              self.handle_node_infra_failed(&node_name, &reason).await;
+            }
+            Some(CoordinatorMessage::NodePodStartTimedOut { node_name }) => {
+              self.handle_pod_start_timed_out(&node_name).await;
+            }
+            None => {}
           }
         }
         event = subscription.next_event() => {
@@ -260,7 +324,7 @@ impl Coordinator {
     let status = self.outcome_status();
     self.record_history(status).await;
     self.cleanup().await;
-    self.build_summary(status)
+    self.build_summary(status).await
   }
 
   fn outcome_status(&self) -> RunStatus {
@@ -298,6 +362,66 @@ impl Coordinator {
     if let Some(handle) = self.node_timeout_handles.remove(node_name) {
       handle.abort();
     }
+  }
+
+  async fn notify_watcher_of_deletion(&self, node_name: &str) {
+    let Some(tx) = self.watcher_cmd_tx.as_ref() else {
+      return;
+    };
+    if let Err(e) = tx
+      .send(WatcherCommand::ExpectDeletion {
+        node_name: node_name.to_string(),
+      })
+      .await
+    {
+      warn!(
+        run_id = %self.run_id,
+        node_name,
+        error = %e,
+        "Failed to notify pod watcher of expected deletion"
+      );
+    }
+  }
+
+  async fn handle_pod_running(&mut self, node_name: &str) {
+    info!(
+      run_id = %self.run_id,
+      node_name,
+      "Pod main container is running"
+    );
+  }
+
+  async fn handle_node_infra_failed(&mut self, node_name: &str, reason: &InfraFailureReason) {
+    let already_terminal = self
+      .run
+      .statuses()
+      .get(node_name)
+      .is_some_and(|s| matches!(s, NodeStatus::Success | NodeStatus::Failed));
+    if already_terminal {
+      tracing::debug!(
+        run_id = %self.run_id,
+        node_name,
+        stable_code = reason.stable_code(),
+        "Ignoring infra failure for already-terminal node"
+      );
+      return;
+    }
+    error!(
+      run_id = %self.run_id,
+      node_name,
+      stable_code = reason.stable_code(),
+      message = %reason.full_message(),
+      user_actionable = reason.user_message().is_some(),
+      "Infrastructure failure detected"
+    );
+  }
+
+  async fn handle_pod_start_timed_out(&mut self, node_name: &str) {
+    warn!(
+      run_id = %self.run_id,
+      node_name,
+      "Pod did not enter Running phase within startup timeout"
+    );
   }
 
   async fn handle_node_completed(&mut self, node_name: &str, success: bool) -> bool {
@@ -344,6 +468,7 @@ impl Coordinator {
       error!(run_id = %self.run_id, error = %e, "Failed to persist state after node timeout; stopping");
       return true;
     }
+    self.notify_watcher_of_deletion(node_name).await;
     if let Err(e) = self
       .dispatcher
       .cancel_node(&self.run_id, node_name, &self.config)
@@ -418,22 +543,43 @@ impl Coordinator {
       handle.abort();
     }
 
-    for (node_name, node_status) in self.run.statuses() {
-      if *node_status == NodeStatus::Running
-        && let Err(e) = self
-          .dispatcher
-          .cancel_node(&self.run_id, node_name, &self.config)
-          .await
+    let running_nodes: Vec<String> = self
+      .run
+      .statuses()
+      .iter()
+      .filter(|(_, s)| **s == NodeStatus::Running)
+      .map(|(name, _)| name.clone())
+      .collect();
+    for node_name in &running_nodes {
+      self.notify_watcher_of_deletion(node_name).await;
+      if let Err(e) = self
+        .dispatcher
+        .cancel_node(&self.run_id, node_name, &self.config)
+        .await
       {
         warn!(run_id = %self.run_id, node_name, error = %e, "Failed to cancel node");
       }
     }
+
+    self.shutdown_pod_watcher().await;
 
     let node_statuses = self.run.statuses().clone();
     RunSummary {
       run_id: self.run_id,
       status,
       node_statuses,
+    }
+  }
+
+  async fn shutdown_pod_watcher(&mut self) {
+    if let Some(tx) = self.watcher_cmd_tx.take() {
+      let _ = tx.send(WatcherCommand::Shutdown).await;
+    }
+    if let Some(handle) = self.signal_relay_handle.take() {
+      handle.abort();
+    }
+    if let Some(handle) = self.pod_watcher_handle.take() {
+      handle.abort();
     }
   }
 
@@ -630,12 +776,13 @@ impl Coordinator {
     }
   }
 
-  fn build_summary(&self, status: RunStatus) -> RunSummary {
+  async fn build_summary(&mut self, status: RunStatus) -> RunSummary {
     info!(
       run_id = %self.run_id,
       status = %status,
       "Coordinator completed"
     );
+    self.shutdown_pod_watcher().await;
     RunSummary {
       run_id: self.run_id.clone(),
       status,
