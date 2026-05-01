@@ -230,11 +230,9 @@ impl Dispatcher for KubeDispatcher {
           safety_deadline_secs,
         };
         let job = self.build_job(ctx, node);
-        let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), &self.namespace);
-        jobs
-          .create(&PostParams::default(), &job)
-          .await
-          .map_err(|e| DispatchError::Kube(e.to_string()))?;
+        self
+          .create_job_or_rollback_configmap(&self.namespace, &job, &cm_name, run_id, &node.name)
+          .await?;
         info!(run_id, node_name = %node.name, "Dispatched Kubernetes Job");
       }
       NodeKind::Build(build_config) => {
@@ -259,12 +257,15 @@ impl Dispatcher for KubeDispatcher {
           safety_deadline_secs,
         };
         let job = self.build_buildah_job(ctx);
-        let jobs: kube::Api<Job> =
-          kube::Api::namespaced(self.client.clone(), &self.builder_namespace);
-        jobs
-          .create(&PostParams::default(), &job)
-          .await
-          .map_err(|e| DispatchError::Kube(e.to_string()))?;
+        self
+          .create_job_or_rollback_configmap(
+            &self.builder_namespace,
+            &job,
+            &cm_name,
+            run_id,
+            &node.name,
+          )
+          .await?;
         info!(run_id, node_name = %node.name, "Dispatched buildah Job");
       }
     }
@@ -369,12 +370,25 @@ impl Dispatcher for KubeDispatcher {
 
     for ns in [self.namespace.as_str(), self.builder_namespace.as_str()] {
       let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), ns);
-      let list = jobs
+      let job_list = jobs
         .list(&lp)
         .await
         .map_err(|e| DispatchError::Kube(e.to_string()))?;
-      for job in list.items {
+      for job in job_list.items {
         if let Some(labels) = job.metadata.labels.as_ref()
+          && let Some(run_id) = labels.get("the-conn.com/run-id")
+        {
+          run_ids.insert(run_id.clone());
+        }
+      }
+
+      let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), ns);
+      let cm_list = cms
+        .list(&lp)
+        .await
+        .map_err(|e| DispatchError::Kube(e.to_string()))?;
+      for cm in cm_list.items {
+        if let Some(labels) = cm.metadata.labels.as_ref()
           && let Some(run_id) = labels.get("the-conn.com/run-id")
         {
           run_ids.insert(run_id.clone());
@@ -521,6 +535,33 @@ impl KubeDispatcher {
 
     info!(run_id, node_name, "Created script ConfigMap");
     Ok(())
+  }
+
+  async fn create_job_or_rollback_configmap(
+    &self,
+    namespace: &str,
+    job: &Job,
+    cm_name: &str,
+    run_id: &str,
+    node_name: &str,
+  ) -> Result<(), DispatchError> {
+    let jobs: kube::Api<Job> = kube::Api::namespaced(self.client.clone(), namespace);
+    match jobs.create(&PostParams::default(), job).await {
+      Ok(_) => Ok(()),
+      Err(e) => {
+        let cms: kube::Api<ConfigMap> = kube::Api::namespaced(self.client.clone(), namespace);
+        if let Err(cm_err) = cms.delete(cm_name, &DeleteParams::default()).await {
+          warn!(
+            run_id,
+            node_name,
+            namespace,
+            error = %cm_err,
+            "Failed to roll back ConfigMap after Job creation error"
+          );
+        }
+        Err(DispatchError::Kube(e.to_string()))
+      }
+    }
   }
 
   fn build_buildah_job(&self, ctx: JobContext<'_>) -> Job {
