@@ -4,6 +4,7 @@ FROM rust:${RUST_TAG} as builder
 WORKDIR /usr/src/jefferies
 COPY . .
 
+RUN apt-get update && apt-get install -y --no-install-recommends make mold clang
 RUN cargo build --release
 
 FROM debian:trixie-slim

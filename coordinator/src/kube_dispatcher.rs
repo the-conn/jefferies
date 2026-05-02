@@ -73,20 +73,44 @@ fn sanitize_k8s_name(s: &str) -> String {
   sanitized.trim_matches('-').to_string()
 }
 
+const RUN_ID_PREFIX_LEN: usize = 8;
+const NODE_NAME_PREFIX_LEN: usize = 24;
+const STABLE_HASH_LEN: usize = 8;
+
+fn stable_hash(s: &str) -> String {
+  use sha2::{Digest, Sha256};
+  let digest = Sha256::digest(s.as_bytes());
+  hex::encode(&digest[..STABLE_HASH_LEN / 2])
+}
+
+fn truncate_with_hash(s: &str, prefix_len: usize) -> String {
+  let sanitized = sanitize_k8s_name(s);
+  if sanitized.len() <= prefix_len + 1 + STABLE_HASH_LEN {
+    return sanitized;
+  }
+  let prefix: String = sanitized.chars().take(prefix_len).collect();
+  let trimmed = prefix.trim_end_matches('-');
+  format!("{}-{}", trimmed, stable_hash(s))
+}
+
+fn short_run_id(run_id: &str) -> String {
+  truncate_with_hash(run_id, RUN_ID_PREFIX_LEN)
+}
+
+fn short_node_name(node_name: &str) -> String {
+  truncate_with_hash(node_name, NODE_NAME_PREFIX_LEN)
+}
+
 fn job_name(run_id: &str, node_name: &str) -> String {
   format!(
     "run-{}-{}",
-    sanitize_k8s_name(run_id),
-    sanitize_k8s_name(node_name)
+    short_run_id(run_id),
+    short_node_name(node_name)
   )
 }
 
 fn configmap_name(run_id: &str, node_name: &str) -> String {
-  format!(
-    "run-{}-{}-script",
-    sanitize_k8s_name(run_id),
-    sanitize_k8s_name(node_name)
-  )
+  format!("{}-script", job_name(run_id, node_name))
 }
 
 fn run_labels(run_id: &str) -> BTreeMap<String, String> {
@@ -551,5 +575,76 @@ impl KubeDispatcher {
         Err(DispatchError::Kube(e.to_string()))
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  const K8S_DNS_LABEL_MAX: usize = 63;
+
+  #[test]
+  fn short_node_name_truncates_long_names_with_stable_hash() {
+    let long = "Format, Lint, Test, Deploy, Notify, Cleanup, And A Lot More Words";
+    let a = short_node_name(long);
+    let b = short_node_name(long);
+    assert_eq!(a, b, "hash must be deterministic across calls");
+    assert!(
+      a.len() <= NODE_NAME_PREFIX_LEN + 1 + STABLE_HASH_LEN,
+      "got {} ({} chars)",
+      a,
+      a.len()
+    );
+    assert!(!a.starts_with('-') && !a.ends_with('-'));
+  }
+
+  #[test]
+  fn short_node_name_passes_through_short_names_untouched() {
+    assert_eq!(short_node_name("build"), "build");
+    assert_eq!(
+      short_node_name("Format, Lint and Test"),
+      "format--lint-and-test"
+    );
+  }
+
+  #[test]
+  fn short_node_name_disambiguates_names_that_truncate_to_the_same_prefix() {
+    let a = short_node_name("Format-Lint-And-Test-Run-One-Of-Many-Different-Names");
+    let b = short_node_name("Format-Lint-And-Test-Run-Two-Of-Many-Different-Names");
+    assert_ne!(
+      a, b,
+      "different inputs must produce different shortened ids"
+    );
+  }
+
+  #[test]
+  fn job_and_configmap_names_fit_under_dns_label_limit() {
+    let run_id = "abc12345-6789-0abc-def1-23456789abcd";
+    let long_node = "Format, Lint, Test, Deploy, Notify, Cleanup, And A Lot More Words";
+    let job = job_name(run_id, long_node);
+    let cm = configmap_name(run_id, long_node);
+    assert!(
+      job.len() <= K8S_DNS_LABEL_MAX,
+      "job_name length {} should be <= {} ({})",
+      job.len(),
+      K8S_DNS_LABEL_MAX,
+      job
+    );
+    assert!(
+      cm.len() <= K8S_DNS_LABEL_MAX,
+      "configmap_name length {} should be <= {} ({})",
+      cm.len(),
+      K8S_DNS_LABEL_MAX,
+      cm
+    );
+  }
+
+  #[test]
+  fn short_run_id_truncates_uuid_to_predictable_length() {
+    let run_id = "abc12345-6789-0abc-def1-23456789abcd";
+    let short = short_run_id(run_id);
+    assert_eq!(short.len(), RUN_ID_PREFIX_LEN + 1 + STABLE_HASH_LEN);
+    assert_eq!(short_run_id(run_id), short, "must be deterministic");
   }
 }
