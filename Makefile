@@ -14,7 +14,7 @@ FULL_TEST_IMAGE_NAME = $(REGISTRY)/$(REPOSITORY)/$(TEST_IMAGE_NAME):$(TAG)
 TEST_CONTAINERFILE = Containerfile-test
 
 # Added all new targets to .PHONY to ensure they always run
-.PHONY: all build test lint fmt fmt-check image push image-test push-test clean clean-test help run ci
+.PHONY: all build test lint fmt fmt-check image push image-test push-test clean clean-test help run ci update rollout
 
 all: fmt lint test build
 
@@ -59,6 +59,13 @@ image:
 push:
 	@echo "Pushing $(FULL_IMAGE_NAME) to registry..."
 	$(CONTAINER_ENGINE) push $(FULL_IMAGE_NAME)
+
+## rollout: Update the deployment on openshift
+rollout:
+	oc -n jefferies rollout restart deployment jefferies
+
+## update: Builds the image from source, pushes, and rolls out the deployment
+update: image push rollout
 
 ## image-test: Build the test container image using $(TEST_CONTAINERFILE)
 image-test:
