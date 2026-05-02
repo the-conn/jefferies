@@ -71,7 +71,6 @@ struct KubernetesConfig {
   default_node_image: String,
   service_account_privileged: String,
   service_account_default: String,
-  vault_role: String,
   runtime_class: String,
   default_cpu: String,
   default_memory: String,
@@ -215,10 +214,6 @@ impl AppConfig {
 
   pub fn service_account_default(&self) -> &str {
     &self.kubernetes.service_account_default
-  }
-
-  pub fn vault_role(&self) -> &str {
-    &self.kubernetes.vault_role
   }
 
   pub fn runtime_class(&self) -> &str {

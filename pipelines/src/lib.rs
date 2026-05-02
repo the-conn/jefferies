@@ -1,2 +1,2 @@
 mod pipeline;
-pub use pipeline::{NodeInfo, Pipeline};
+pub use pipeline::{FileSecretSpec, NodeInfo, Pipeline};

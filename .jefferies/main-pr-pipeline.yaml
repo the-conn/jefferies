@@ -16,11 +16,20 @@ on:
 #       - rustup component add clippy
 #       - make ci
 nodes:
-  - name: Test Login
+  - name: Test Secrets
     image: quay.io/buildah/stable:latest
     privileged: true
+    env:
+      KUBECONFIG: /etc/tube/secrets/files/KUBECONFIG
     secrets:
-      - QUAY_USERNAME
-      - QUAY_PASSWORD
+      env:
+        - QUAY_USERNAME
+        - QUAY_PASSWORD
+      files:
+        - KUBECONFIG
+        - name: PROXY_CERT
+          path: /etc/pki/ca-trust/source/anchors/proxy.crt
     steps:
-      - buildah login -u $QUAY_USERNAME -p QUAY_PASSWORD quay.io
+      - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
+      - cat /etc/tube/secrets/files/KUBECONFIG
+      - cat /etc/pki/ca-trust/source/anchors/proxy.crt
