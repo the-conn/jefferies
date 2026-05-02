@@ -31,5 +31,6 @@ nodes:
           path: /etc/pki/ca-trust/source/anchors/proxy.crt
     steps:
       - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
+      - cat $QUAY_USERNAME
       - cat /etc/tube/secrets/files/KUBECONFIG
       - cat /etc/pki/ca-trust/source/anchors/proxy.crt
