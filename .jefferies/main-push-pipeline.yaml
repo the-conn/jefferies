@@ -10,8 +10,8 @@ nodes:
     image: quay.io/buildah/stable:latest
     checkout: true
     privileged: true
-    cpu: "2"
-    memory: 4Gi
+    cpu: "4"
+    memory: 8Gi
     timeout_secs: 1200
     env:
       STORAGE_DRIVER: vfs
