@@ -169,6 +169,10 @@ fn vault_annotations(
     "vault.hashicorp.com/secret-volume-path".to_string(),
     VAULT_SECRETS_MOUNT_PATH.to_string(),
   );
+  out.insert(
+    "vault.hashicorp.com/client-max-retries".to_string(),
+    "0".to_string(),
+  );
   out.insert("vault.hashicorp.com/role".to_string(), role.to_string());
   let primary = vault_primary_path(owner, repo);
   for key in secrets {
@@ -851,6 +855,12 @@ mod tests {
         .get("vault.hashicorp.com/secret-volume-path")
         .map(String::as_str),
       Some("/etc/tube/secrets")
+    );
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/client-max-retries")
+        .map(String::as_str),
+      Some("0")
     );
     assert_eq!(
       map.get("vault.hashicorp.com/role").map(String::as_str),
