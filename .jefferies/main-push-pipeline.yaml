@@ -14,5 +14,4 @@ nodes:
     memory: 4Gi
     timeout_secs: 1200
     steps:
-      - dnf install -y make
-      - make image
+      - buildah bud -f Containerfile -t quay.io/the-conn/jefferies .
