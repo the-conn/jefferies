@@ -10,8 +10,6 @@ nodes:
     image: quay.io/buildah/stable:latest
     privileged: true
     checkout: true
-    memory: 4Gi
-    cpu: "4"
     env:
       STORAGE_DRIVER: vfs
     secrets:
@@ -25,6 +23,7 @@ nodes:
 
   - name: Run CI Checks
     image: quay.io/the-conn/jefferies-test
+    after: ["Build Test Image"]
     checkout: true
     memory: 4Gi
     cpu: "4"
