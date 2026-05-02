@@ -286,6 +286,7 @@ fn build_env_vars(
   let poke_url = format!(
     "http://jefferies.jefferies.svc.cluster.local./api/v1/runs/{run_id}/nodes/{node_name}/poke"
   );
+  let secrets_env_dir = format!("{VAULT_SECRETS_MOUNT_PATH}/{VAULT_ENV_SUBDIR}");
   vec![
     env_var("TUBE__EXECUTION__USER_SCRIPT_PATH", "/etc/conn/script.sh"),
     env_var("TUBE__EXECUTION__RUN_ID", run_id),
@@ -297,6 +298,7 @@ fn build_env_vars(
     env_var("TUBE__LOG__LEVEL", "warn"),
     env_var("TUBE__WORKSPACE__GET_URL", get_url),
     env_var("TUBE__WORKSPACE__DIR", "/workspace"),
+    env_var("TUBE__SECRETS__DIR", &secrets_env_dir),
   ]
 }
 
@@ -908,6 +910,23 @@ mod tests {
          every TUBE__* var has to be set, with empty string meaning 'no checkout'",
       );
     assert_eq!(get_url.value.as_deref(), Some(""));
+  }
+
+  #[test]
+  fn build_env_vars_secrets_dir_matches_vault_env_subdir() {
+    let vars = build_env_vars("run", "node", "status", "logs", "");
+    let secrets_dir = vars
+      .iter()
+      .find(|v| v.name == "TUBE__SECRETS__DIR")
+      .expect("TUBE__SECRETS__DIR must be set so Tube can locate env-flavored secrets");
+    assert_eq!(secrets_dir.value.as_deref(), Some("/etc/tube/secrets/env"));
+    let env_file_annotation = format!("{VAULT_ENV_SUBDIR}/QUAY_USERNAME");
+    assert!(
+      env_file_annotation.starts_with(VAULT_ENV_SUBDIR),
+      "TUBE__SECRETS__DIR ({:?}) must point at the same subdir the vault \
+       agent-inject-file-env-<KEY> annotation writes to ({VAULT_ENV_SUBDIR}/<KEY>)",
+      secrets_dir.value
+    );
   }
 
   #[test]
