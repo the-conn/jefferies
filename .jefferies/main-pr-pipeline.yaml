@@ -5,32 +5,30 @@ on:
     branches:
       - main
 
-# nodes:
-#   - name: Format, Build, Lint and Test
-#     image: quay.io/the-conn/jefferies-test
-#     checkout: true
-#     memory: 4Gi
-#     cpu: "4"
-#     steps:
-#       - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
-#       - rustup component add clippy
-#       - make ci
 nodes:
-  - name: Test Secrets
+  - name: Build Test Image
     image: quay.io/buildah/stable:latest
     privileged: true
+    checkout: true
+    memory: 4Gi
+    cpu: "4"
     env:
-      KUBECONFIG: /etc/tube/secrets/files/KUBECONFIG
+      STORAGE_DRIVER: vfs
     secrets:
       env:
         - QUAY_USERNAME
         - QUAY_PASSWORD
-      files:
-        - KUBECONFIG
-        - name: PROXY_CERT
-          path: /etc/pki/ca-trust/source/anchors/proxy.crt
     steps:
       - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
-      - cat $QUAY_USERNAME
-      - cat /etc/tube/secrets/files/KUBECONFIG
-      - cat /etc/pki/ca-trust/source/anchors/proxy.crt
+      - buildah bud -f Containerfile-test -t quay.io/the-conn/jefferies-test .
+      - buildah push quay.io/the-conn/jefferies-test
+
+  - name: Run CI Checks
+    image: quay.io/the-conn/jefferies-test
+    checkout: true
+    memory: 4Gi
+    cpu: "4"
+    steps:
+      - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+      - rustup component add clippy
+      - make ci
