@@ -13,5 +13,8 @@ nodes:
     cpu: "2"
     memory: 4Gi
     timeout_secs: 1200
+    env:
+      - name: STORAGE_DRIVER
+        value: vfs
     steps:
       - buildah bud -f Containerfile -t quay.io/the-conn/jefferies .
