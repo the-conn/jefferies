@@ -11,8 +11,8 @@ nodes:
     checkout: true
     cache_size: 1Gi
     workspace_size: 5Gi
+    memory: 5Gi
     cpu: "2"
-    memory: 4Gi
     env:
       CARGO_HOME: /tmp/cache
     steps:
