@@ -131,6 +131,8 @@ const VAULT_SECRETS_MOUNT_PATH: &str = "/etc/tube/secrets";
 const VAULT_ENV_SUBDIR: &str = "env";
 const VAULT_FILES_SUBDIR: &str = "files";
 const REPO_SLUG_SEPARATOR: &str = "__";
+const VAULT_ENV_UNIQUE_PREFIX: &str = "env-";
+const VAULT_FILE_UNIQUE_PREFIX: &str = "f-";
 
 fn repo_slug(owner: &str, repo: &str) -> String {
   format!("{owner}{REPO_SLUG_SEPARATOR}{repo}")
@@ -189,7 +191,7 @@ fn vault_annotations(
   let path = vault_secret_path(owner, repo);
 
   for key in env_secrets {
-    let id = format!("env-{key}");
+    let id = format!("{VAULT_ENV_UNIQUE_PREFIX}{key}");
     out.insert(
       format!("vault.hashicorp.com/agent-inject-secret-{id}"),
       path.clone(),
@@ -205,7 +207,7 @@ fn vault_annotations(
   }
 
   for spec in file_secrets {
-    let id = format!("file-{}", spec.name);
+    let id = format!("{VAULT_FILE_UNIQUE_PREFIX}{}", spec.name);
     out.insert(
       format!("vault.hashicorp.com/agent-inject-secret-{id}"),
       path.clone(),
@@ -391,7 +393,11 @@ impl Dispatcher for KubeDispatcher {
       .put_status_url(run_id, &node.name)
       .await?;
     let logs_put_url = self.source_manager.put_logs_url(run_id, &node.name).await?;
-    let get_url = self.source_manager.get_source_url(run_id).await?;
+    let get_url = if node.checkout {
+      self.source_manager.get_source_url(run_id).await?
+    } else {
+      String::new()
+    };
 
     let cm_name = configmap_name(run_id, &node.name);
     let labels = run_labels(run_id);
@@ -892,8 +898,42 @@ mod tests {
   }
 
   #[test]
+  fn build_env_vars_get_url_is_empty_string_when_no_source() {
+    let vars = build_env_vars("run", "node", "status", "logs", "");
+    let get_url = vars
+      .iter()
+      .find(|v| v.name == "TUBE__WORKSPACE__GET_URL")
+      .expect(
+        "TUBE__WORKSPACE__GET_URL must always be present; Tube has no on-disk config so \
+         every TUBE__* var has to be set, with empty string meaning 'no checkout'",
+      );
+    assert_eq!(get_url.value.as_deref(), Some(""));
+  }
+
+  #[test]
+  fn build_env_vars_get_url_carries_presigned_url_when_source_present() {
+    let vars = build_env_vars("run", "node", "status", "logs", "https://signed-url");
+    let get_url = vars
+      .iter()
+      .find(|v| v.name == "TUBE__WORKSPACE__GET_URL")
+      .expect("checkout nodes must receive a presigned source URL");
+    assert_eq!(get_url.value.as_deref(), Some("https://signed-url"));
+  }
+
+  #[test]
   fn vault_role_uses_double_underscore_separator() {
     assert_eq!(vault_role("the-conn", "jefferies"), "the-conn__jefferies");
+  }
+
+  #[test]
+  fn file_unique_prefix_does_not_collide_with_template_file_annotation() {
+    assert!(
+      !VAULT_FILE_UNIQUE_PREFIX.starts_with("file-"),
+      "Vault treats `agent-inject-template-file-<UNIQUE>` as a path-to-template-file \
+       annotation; the file unique-id prefix must not start with `file-` or every \
+       inline template will be parsed as a filesystem path and the agent will fail \
+       with `no such file or directory`"
+    );
   }
 
   #[test]
@@ -983,12 +1023,12 @@ mod tests {
 
     assert_eq!(
       map
-        .get("vault.hashicorp.com/agent-inject-file-file-KUBECONFIG")
+        .get("vault.hashicorp.com/agent-inject-file-f-KUBECONFIG")
         .map(String::as_str),
       Some("files/KUBECONFIG")
     );
     assert!(
-      !map.contains_key("vault.hashicorp.com/secret-volume-path-file-KUBECONFIG"),
+      !map.contains_key("vault.hashicorp.com/secret-volume-path-f-KUBECONFIG"),
       "default-path file secret must not emit a per-secret volume path"
     );
   }
@@ -1003,19 +1043,19 @@ mod tests {
 
     assert_eq!(
       map
-        .get("vault.hashicorp.com/secret-volume-path-file-PROXY_CERT")
+        .get("vault.hashicorp.com/secret-volume-path-f-PROXY_CERT")
         .map(String::as_str),
       Some("/etc/pki/ca-trust/source/anchors")
     );
     assert_eq!(
       map
-        .get("vault.hashicorp.com/agent-inject-file-file-PROXY_CERT")
+        .get("vault.hashicorp.com/agent-inject-file-f-PROXY_CERT")
         .map(String::as_str),
       Some("proxy.crt")
     );
     assert_eq!(
       map
-        .get("vault.hashicorp.com/agent-inject-secret-file-PROXY_CERT")
+        .get("vault.hashicorp.com/agent-inject-secret-f-PROXY_CERT")
         .map(String::as_str),
       Some("secret/data/the-conn__jefferies")
     );
