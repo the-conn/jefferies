@@ -582,7 +582,14 @@ impl Coordinator {
         .unwrap_or_else(|| self.config.default_node_startup_timeout_secs());
       match self
         .dispatcher
-        .dispatch(&self.run_id, &node, &self.pipeline, &self.config)
+        .dispatch(
+          &self.run_id,
+          &self.run_context.owner,
+          &self.run_context.repo,
+          &node,
+          &self.pipeline,
+          &self.config,
+        )
         .await
       {
         Ok(()) => {
@@ -948,6 +955,8 @@ mod tests {
     async fn dispatch(
       &self,
       run_id: &str,
+      _owner: &str,
+      _repo: &str,
       node: &NodeInfo,
       _pipeline: &Pipeline,
       _config: &AppConfig,
@@ -1024,6 +1033,8 @@ mod tests {
     async fn dispatch(
       &self,
       _run_id: &str,
+      _owner: &str,
+      _repo: &str,
       _node: &NodeInfo,
       _pipeline: &Pipeline,
       _config: &AppConfig,
@@ -1583,6 +1594,8 @@ nodes:
     async fn dispatch(
       &self,
       _run_id: &str,
+      _owner: &str,
+      _repo: &str,
       _node: &NodeInfo,
       _pipeline: &Pipeline,
       _config: &AppConfig,

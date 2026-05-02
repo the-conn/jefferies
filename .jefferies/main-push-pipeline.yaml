@@ -10,10 +10,13 @@ nodes:
     image: quay.io/buildah/stable:latest
     checkout: true
     privileged: true
-    cpu: "3"
-    memory: 6Gi
+    cpu: "4"
+    memory: 8Gi
     timeout_secs: 1200
     env:
       STORAGE_DRIVER: vfs
+    secrets:
+      - QUAY_USERNAME
+      - QUAY_PASSWORD
     steps:
       - buildah bud -f Containerfile -t quay.io/the-conn/jefferies .

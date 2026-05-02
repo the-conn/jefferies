@@ -25,6 +25,12 @@ pub enum PipelineError {
     name: String,
     reason: String,
   },
+  #[error("Node '{node}' has invalid secret '{name}': {reason}")]
+  InvalidSecret {
+    node: String,
+    name: String,
+    reason: String,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +44,8 @@ pub struct Pipeline {
   on: Option<PipelineTriggers>,
   #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   env: HashMap<String, String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  secrets: Vec<String>,
   nodes: Vec<PipelineNode>,
 }
 
@@ -91,6 +99,8 @@ struct PipelineNode {
   #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   env: HashMap<String, String>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  secrets: Vec<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   steps: Vec<PipelineStep>,
   #[serde(default, skip_serializing_if = "is_false")]
   privileged: bool,
@@ -131,6 +141,7 @@ pub struct NodeInfo {
   pub startup_timeout_secs: Option<u64>,
   pub checkout: bool,
   pub env: HashMap<String, String>,
+  pub secrets: Vec<String>,
   pub privileged: bool,
   pub cache_size: Option<String>,
   pub cpu: Option<String>,
@@ -146,6 +157,7 @@ impl Pipeline {
         validate_steps_present(&pipeline)?;
         validate_quantities(&pipeline)?;
         validate_volumes(&pipeline)?;
+        validate_secrets(&pipeline)?;
         Ok(pipeline)
       }
       Err(e) => Err(PipelineError::YamlParseError(e.to_string())),
@@ -180,6 +192,7 @@ impl Pipeline {
       .map(|n| {
         let mut env = self.env.clone();
         env.extend(n.env.clone());
+        let secrets = merge_secrets(&self.secrets, &n.secrets);
         NodeInfo {
           name: n.name.clone(),
           image: n.image.clone().unwrap_or_default(),
@@ -189,6 +202,7 @@ impl Pipeline {
           startup_timeout_secs: n.startup_timeout_secs,
           checkout: n.checkout.unwrap_or(false),
           env,
+          secrets,
           privileged: n.privileged,
           cache_size: n.cache_size.clone(),
           cpu: n.cpu.clone(),
@@ -298,6 +312,58 @@ fn is_reserved_path(candidate: &str, reserved: &str) -> bool {
   candidate == reserved
     || candidate.starts_with(&format!("{reserved}/"))
     || reserved.starts_with(&format!("{candidate}/"))
+}
+
+const MAX_SECRET_NAME_LEN: usize = 200;
+
+fn merge_secrets(pipeline_secrets: &[String], node_secrets: &[String]) -> Vec<String> {
+  let mut set: std::collections::BTreeSet<String> = pipeline_secrets.iter().cloned().collect();
+  set.extend(node_secrets.iter().cloned());
+  set.into_iter().collect()
+}
+
+fn validate_secrets(pipeline: &Pipeline) -> Result<(), PipelineError> {
+  for node in &pipeline.nodes {
+    let merged = merge_secrets(&pipeline.secrets, &node.secrets);
+    for name in &merged {
+      if let Some(reason) = secret_name_violation(name) {
+        return Err(PipelineError::InvalidSecret {
+          node: node.name.clone(),
+          name: name.clone(),
+          reason,
+        });
+      }
+    }
+  }
+  Ok(())
+}
+
+fn secret_name_violation(name: &str) -> Option<String> {
+  if name.is_empty() {
+    return Some("name must not be empty".to_string());
+  }
+  if name.len() > MAX_SECRET_NAME_LEN {
+    return Some(format!(
+      "name must be at most {MAX_SECRET_NAME_LEN} characters"
+    ));
+  }
+  if !is_valid_env_var_name(name) {
+    return Some("name must match POSIX env-var pattern: [A-Za-z_][A-Za-z0-9_]*".to_string());
+  }
+  None
+}
+
+fn is_valid_env_var_name(s: &str) -> bool {
+  let bytes = s.as_bytes();
+  if bytes.is_empty() {
+    return false;
+  }
+  let is_first = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+  let is_rest = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+  if !is_first(bytes[0]) {
+    return false;
+  }
+  bytes[1..].iter().all(|&b| is_rest(b))
 }
 
 fn is_valid_dns1123_label(s: &str) -> bool {
@@ -1030,6 +1096,108 @@ nodes:
         "expected mount path '{path}' to be rejected"
       );
     }
+  }
+
+  #[test]
+  fn test_node_info_secrets_merged_deduped_and_sorted() {
+    let yaml = r#"
+name: Test Pipeline
+secrets:
+  - QUAY_PASSWORD
+  - GLOBAL_TOKEN
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      - QUAY_USERNAME
+      - QUAY_PASSWORD
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert_eq!(
+      infos[0].secrets,
+      vec![
+        "GLOBAL_TOKEN".to_string(),
+        "QUAY_PASSWORD".to_string(),
+        "QUAY_USERNAME".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn test_node_info_secrets_default_empty() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert!(infos[0].secrets.is_empty());
+  }
+
+  #[test]
+  fn test_invalid_secret_name_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      - 1BAD
+    steps:
+      - cargo build
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(
+      result,
+      Err(PipelineError::InvalidSecret { ref node, ref name, .. })
+        if node == "Build" && name == "1BAD"
+    ));
+  }
+
+  #[test]
+  fn test_valid_secret_name_forms_accepted() {
+    for name in ["_FOO", "A1", "QUAY_USERNAME", "_", "aB_9"] {
+      let yaml = format!(
+        r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      - {name}
+    steps:
+      - cargo build
+"#
+      );
+      assert!(
+        Pipeline::from_yaml(&yaml).is_ok(),
+        "expected secret name '{name}' to be accepted"
+      );
+    }
+  }
+
+  #[test]
+  fn test_pipeline_level_secret_invalid_name_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+secrets:
+  - has-dash
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(
+      result,
+      Err(PipelineError::InvalidSecret { ref name, .. }) if name == "has-dash"
+    ));
   }
 
   #[test]

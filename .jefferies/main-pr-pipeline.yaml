@@ -5,13 +5,22 @@ on:
     branches:
       - main
 
+# nodes:
+#   - name: Format, Build, Lint and Test
+#     image: quay.io/the-conn/jefferies-test
+#     checkout: true
+#     memory: 4Gi
+#     cpu: "4"
+#     steps:
+#       - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+#       - rustup component add clippy
+#       - make ci
 nodes:
-  - name: Format, Build, Lint and Test
-    image: quay.io/the-conn/jefferies-test
-    checkout: true
-    memory: 4Gi
-    cpu: "4"
+  - name: Test Login
+    image: quay.io/buildah/stable:latest
+    privileged: true
+    secrets:
+      - QUAY_USERNAME
+      - QUAY_PASSWORD
     steps:
-      - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
-      - rustup component add clippy
-      - make ci
+      - buildah login -u $QUAY_USERNAME -p QUAY_PASSWORD quay.io

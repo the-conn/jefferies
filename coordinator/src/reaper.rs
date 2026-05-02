@@ -222,6 +222,8 @@ mod tests {
     async fn dispatch(
       &self,
       _: &str,
+      _: &str,
+      _: &str,
       _: &NodeInfo,
       _: &Pipeline,
       _: &AppConfig,

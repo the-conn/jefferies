@@ -140,6 +140,7 @@ mod tests {
       startup_timeout_secs: None,
       checkout: false,
       env: std::collections::HashMap::new(),
+      secrets: vec![],
       privileged: false,
       cache_size: None,
       cpu: None,
