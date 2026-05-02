@@ -1,0 +1,4 @@
+ARG RUST_TAG=1.95-slim
+FROM rust:${RUST_TAG} as builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends make mold clang

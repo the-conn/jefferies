@@ -7,7 +7,7 @@ on:
 
 nodes:
   - name: Format, Build, Lint and Test
-    image: rust:1.95-slim
+    image: quay.io/the-conn/jefferies-test
     checkout: true
     memory: 6Gi
     cpu: "2"
@@ -19,7 +19,4 @@ nodes:
     steps:
       - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
       - rustup component add clippy
-      - cargo +nightly fmt --check
-      - cargo build --release --all-features --workspace
-      - cargo clippy --all-features --workspace -- -D warnings
-      - cargo test --all-features --workspace
+      - make ci
