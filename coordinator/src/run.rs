@@ -142,7 +142,6 @@ mod tests {
       env: std::collections::HashMap::new(),
       privileged: false,
       cache_size: None,
-      workspace_size: None,
       cpu: None,
       memory: None,
     }

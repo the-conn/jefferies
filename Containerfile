@@ -1,11 +1,9 @@
-ARG RUST_TAG=1.95-slim
-FROM rust:${RUST_TAG} as builder
+FROM quay.io/the-conn/jefferies-test as builder
 
 WORKDIR /usr/src/jefferies
 COPY . .
 
-RUN apt-get update && apt-get install -y --no-install-recommends make mold clang
-RUN cargo build --release
+RUN make build
 
 FROM debian:trixie-slim
 

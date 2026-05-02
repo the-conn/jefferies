@@ -33,7 +33,6 @@ pub struct KubeDispatcher {
   runtime_class: String,
   default_cpu: String,
   default_memory: String,
-  default_workspace_size: String,
 }
 
 impl KubeDispatcher {
@@ -54,7 +53,6 @@ impl KubeDispatcher {
       runtime_class: config.runtime_class().to_string(),
       default_cpu: config.default_node_cpu().to_string(),
       default_memory: config.default_node_memory().to_string(),
-      default_workspace_size: config.default_workspace_size().to_string(),
     })
   }
 }
@@ -386,10 +384,6 @@ impl KubeDispatcher {
     };
     let cpu = node.cpu.as_deref().unwrap_or(&self.default_cpu);
     let memory = node.memory.as_deref().unwrap_or(&self.default_memory);
-    let workspace_size = node
-      .workspace_size
-      .as_deref()
-      .unwrap_or(&self.default_workspace_size);
 
     let mut user_volume_mounts = vec![
       VolumeMount {
@@ -417,10 +411,7 @@ impl KubeDispatcher {
       },
       Volume {
         name: "workspace".to_string(),
-        empty_dir: Some(EmptyDirVolumeSource {
-          medium: Some("Memory".to_string()),
-          size_limit: Some(Quantity(workspace_size.to_string())),
-        }),
+        empty_dir: Some(EmptyDirVolumeSource::default()),
         ..Default::default()
       },
       Volume {
