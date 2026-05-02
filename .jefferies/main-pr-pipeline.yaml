@@ -13,7 +13,6 @@ nodes:
     workspace_size: 5Gi
     memory: 5Gi
     cpu: "2"
-    timeout_secs: 5
     env:
       CARGO_HOME: /tmp/cache
     steps:
