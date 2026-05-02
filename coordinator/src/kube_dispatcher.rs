@@ -459,8 +459,8 @@ impl KubeDispatcher {
           }),
           spec: Some(PodSpec {
             restart_policy: Some("Never".to_string()),
-            runtime_class_name: Some(self.runtime_class.clone()),
-            service_account_name: Some(self.service_account.clone()),
+            runtime_class_name: node.privileged.then(|| self.runtime_class.clone()),
+            service_account_name: node.privileged.then(|| self.service_account.clone()),
             init_containers: Some(vec![Container {
               name: "tube-init".to_string(),
               image: Some(self.tube_image.clone()),

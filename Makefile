@@ -33,6 +33,11 @@ fmt:
 	@echo "Formatting code..."
 	$(CARGO) +nightly fmt
 
+## fmt-check: Check if fmt is correct
+fmt-check:
+	@echo "Formatting code..."
+	$(CARGO) +nightly fmt --check
+
 ## image: Build the container image
 image:
 	@echo "Building $(FULL_IMAGE_NAME) using $(CONTAINER_ENGINE)..."
@@ -59,3 +64,6 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@grep -E '^##' $(MAKEFILE_LIST) | sed -e 's/## //' | column -t -s ':'
+
+## ci: Run the ci checks
+ci: fmt-check build lint test
