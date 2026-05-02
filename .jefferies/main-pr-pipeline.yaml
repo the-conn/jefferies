@@ -9,12 +9,11 @@ nodes:
   - name: Format, Lint and Test
     image: rust:1.95-slim
     checkout: true
-    cache_size: 1Gi
-    workspace_size: 5Gi
-    memory: 5Gi
-    cpu: "2"
+    memory: 6Gi
+    cpu: "3"
     env:
-      CARGO_HOME: /tmp/cache
+      CARGO_HOME: /dev/shm/cargo
+      CARGO_TARGET_DIR: /dev/shm/target
     steps:
       - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
       - rustup component add clippy
