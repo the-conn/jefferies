@@ -15,4 +15,4 @@ nodes:
     timeout_secs: 1200
     steps:
       - dnf install -y make
-      - make build
+      - make image
