@@ -15,5 +15,7 @@ nodes:
     timeout_secs: 1200
     env:
       STORAGE_DRIVER: overlay
+    volumes:
+      var-lib-containers: /var/lib/containers
     steps:
       - buildah bud -f Containerfile -t quay.io/the-conn/jefferies .

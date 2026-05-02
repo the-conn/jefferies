@@ -144,6 +144,7 @@ mod tests {
       cache_size: None,
       cpu: None,
       memory: None,
+      volumes: std::collections::HashMap::new(),
     }
   }
 

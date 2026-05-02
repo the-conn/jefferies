@@ -205,6 +205,28 @@ fn resource_requirements(cpu: &str, memory: &str) -> ResourceRequirements {
 
 const CACHE_MOUNT_PATH: &str = "/tmp/cache";
 
+fn append_user_volumes(
+  user_volumes: &std::collections::HashMap<String, String>,
+  mounts: &mut Vec<VolumeMount>,
+  volumes: &mut Vec<Volume>,
+) {
+  let mut names: Vec<&String> = user_volumes.keys().collect();
+  names.sort();
+  for name in names {
+    let mount_path = &user_volumes[name];
+    mounts.push(VolumeMount {
+      name: name.clone(),
+      mount_path: mount_path.clone(),
+      ..Default::default()
+    });
+    volumes.push(Volume {
+      name: name.clone(),
+      empty_dir: Some(EmptyDirVolumeSource::default()),
+      ..Default::default()
+    });
+  }
+}
+
 #[async_trait]
 impl Dispatcher for KubeDispatcher {
   async fn dispatch(
@@ -440,6 +462,8 @@ impl KubeDispatcher {
       });
     }
 
+    append_user_volumes(&node.volumes, &mut user_volume_mounts, &mut volumes);
+
     let security_context = node.privileged.then(|| SecurityContext {
       privileged: Some(true),
       ..Default::default()
@@ -629,6 +653,76 @@ mod tests {
       K8S_DNS_LABEL_MAX,
       cm
     );
+  }
+
+  #[test]
+  fn append_user_volumes_creates_paired_mount_and_empty_dir() {
+    let mut user_volumes = std::collections::HashMap::new();
+    user_volumes.insert(
+      "var-lib-containers".to_string(),
+      "/var/lib/containers".to_string(),
+    );
+    user_volumes.insert(
+      "buildah-cache".to_string(),
+      "/var/cache/buildah".to_string(),
+    );
+    let mut mounts = Vec::new();
+    let mut volumes = Vec::new();
+
+    append_user_volumes(&user_volumes, &mut mounts, &mut volumes);
+
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(volumes.len(), 2);
+    let by_name: std::collections::HashMap<_, _> = mounts
+      .iter()
+      .map(|m| (m.name.as_str(), m.mount_path.as_str()))
+      .collect();
+    assert_eq!(
+      by_name.get("var-lib-containers").copied(),
+      Some("/var/lib/containers")
+    );
+    assert_eq!(
+      by_name.get("buildah-cache").copied(),
+      Some("/var/cache/buildah")
+    );
+    for vol in &volumes {
+      assert!(
+        vol.empty_dir.is_some(),
+        "user volume {} must use emptyDir",
+        vol.name
+      );
+      assert!(
+        vol.empty_dir.as_ref().unwrap().medium.is_none(),
+        "default empty_dir must be disk-backed"
+      );
+      assert!(
+        vol.empty_dir.as_ref().unwrap().size_limit.is_none(),
+        "default empty_dir must have no size limit"
+      );
+    }
+  }
+
+  #[test]
+  fn append_user_volumes_is_a_noop_for_empty_input() {
+    let user_volumes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut mounts = Vec::new();
+    let mut volumes = Vec::new();
+    append_user_volumes(&user_volumes, &mut mounts, &mut volumes);
+    assert!(mounts.is_empty());
+    assert!(volumes.is_empty());
+  }
+
+  #[test]
+  fn append_user_volumes_emits_in_deterministic_order() {
+    let mut user_volumes = std::collections::HashMap::new();
+    user_volumes.insert("zeta".to_string(), "/zeta".to_string());
+    user_volumes.insert("alpha".to_string(), "/alpha".to_string());
+    user_volumes.insert("mu".to_string(), "/mu".to_string());
+    let mut mounts = Vec::new();
+    let mut volumes = Vec::new();
+    append_user_volumes(&user_volumes, &mut mounts, &mut volumes);
+    let names: Vec<&str> = mounts.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, vec!["alpha", "mu", "zeta"]);
   }
 
   #[test]

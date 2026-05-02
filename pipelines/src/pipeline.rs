@@ -19,6 +19,12 @@ pub enum PipelineError {
     field: &'static str,
     value: String,
   },
+  #[error("Node '{node}' has invalid volume '{name}': {reason}")]
+  InvalidVolume {
+    node: String,
+    name: String,
+    reason: String,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +100,8 @@ struct PipelineNode {
   cpu: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   memory: Option<String>,
+  #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+  volumes: HashMap<String, String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -127,6 +135,7 @@ pub struct NodeInfo {
   pub cache_size: Option<String>,
   pub cpu: Option<String>,
   pub memory: Option<String>,
+  pub volumes: HashMap<String, String>,
 }
 
 impl Pipeline {
@@ -136,6 +145,7 @@ impl Pipeline {
         validate_dependencies(&pipeline)?;
         validate_steps_present(&pipeline)?;
         validate_quantities(&pipeline)?;
+        validate_volumes(&pipeline)?;
         Ok(pipeline)
       }
       Err(e) => Err(PipelineError::YamlParseError(e.to_string())),
@@ -183,6 +193,7 @@ impl Pipeline {
           cache_size: n.cache_size.clone(),
           cpu: n.cpu.clone(),
           memory: n.memory.clone(),
+          volumes: n.volumes.clone(),
         }
       })
       .collect()
@@ -229,6 +240,76 @@ fn validate_quantities(pipeline: &Pipeline) -> Result<(), PipelineError> {
     }
   }
   Ok(())
+}
+
+pub const RESERVED_VOLUME_NAMES: &[&str] = &["tube-bin", "workspace", "user-script", "cache"];
+pub const RESERVED_MOUNT_PATHS: &[&str] = &["/shared", "/workspace", "/etc/conn", "/tmp/cache"];
+
+fn validate_volumes(pipeline: &Pipeline) -> Result<(), PipelineError> {
+  for node in &pipeline.nodes {
+    let mut seen_paths: HashSet<&str> = HashSet::new();
+    for (name, mount_path) in &node.volumes {
+      if !is_valid_dns1123_label(name) {
+        return Err(PipelineError::InvalidVolume {
+          node: node.name.clone(),
+          name: name.clone(),
+          reason: "name must be a valid DNS-1123 label (lowercase alphanumeric and '-', \
+                   1-63 chars, must start and end with an alphanumeric character)"
+            .to_string(),
+        });
+      }
+      if RESERVED_VOLUME_NAMES.contains(&name.as_str()) {
+        return Err(PipelineError::InvalidVolume {
+          node: node.name.clone(),
+          name: name.clone(),
+          reason: format!("name '{name}' is reserved for internal use"),
+        });
+      }
+      if !mount_path.starts_with('/') {
+        return Err(PipelineError::InvalidVolume {
+          node: node.name.clone(),
+          name: name.clone(),
+          reason: format!("mount path '{mount_path}' must be absolute"),
+        });
+      }
+      if RESERVED_MOUNT_PATHS
+        .iter()
+        .any(|reserved| is_reserved_path(mount_path, reserved))
+      {
+        return Err(PipelineError::InvalidVolume {
+          node: node.name.clone(),
+          name: name.clone(),
+          reason: format!("mount path '{mount_path}' overlaps a reserved mount"),
+        });
+      }
+      if !seen_paths.insert(mount_path.as_str()) {
+        return Err(PipelineError::InvalidVolume {
+          node: node.name.clone(),
+          name: name.clone(),
+          reason: format!("mount path '{mount_path}' is used by another volume on this node"),
+        });
+      }
+    }
+  }
+  Ok(())
+}
+
+fn is_reserved_path(candidate: &str, reserved: &str) -> bool {
+  candidate == reserved
+    || candidate.starts_with(&format!("{reserved}/"))
+    || reserved.starts_with(&format!("{candidate}/"))
+}
+
+fn is_valid_dns1123_label(s: &str) -> bool {
+  if s.is_empty() || s.len() > 63 {
+    return false;
+  }
+  let bytes = s.as_bytes();
+  let is_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+  if !is_alnum(bytes[0]) || !is_alnum(bytes[bytes.len() - 1]) {
+    return false;
+  }
+  bytes.iter().all(|&b| is_alnum(b) || b == b'-')
 }
 
 fn is_valid_quantity(s: &str) -> bool {
@@ -826,5 +907,145 @@ nodes:
     for q in ["", "abc", "Mi", "1.2.3", "1Q", "2ix", "e5", "."] {
       assert!(!is_valid_quantity(q), "expected '{q}' to be rejected");
     }
+  }
+
+  #[test]
+  fn test_volumes_parse_into_node_info() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    volumes:
+      var-lib-containers: /var/lib/containers
+      buildah-cache: /var/cache/buildah
+    steps:
+      - buildah bud .
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert_eq!(infos[0].volumes.len(), 2);
+    assert_eq!(
+      infos[0]
+        .volumes
+        .get("var-lib-containers")
+        .map(String::as_str),
+      Some("/var/lib/containers")
+    );
+    assert_eq!(
+      infos[0].volumes.get("buildah-cache").map(String::as_str),
+      Some("/var/cache/buildah")
+    );
+  }
+
+  #[test]
+  fn test_volumes_default_to_empty() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert!(infos[0].volumes.is_empty());
+  }
+
+  #[test]
+  fn test_volume_with_invalid_dns_name_is_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    volumes:
+      Invalid_Name: /data
+    steps:
+      - cargo build
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(
+      result,
+      Err(PipelineError::InvalidVolume { ref name, .. }) if name == "Invalid_Name"
+    ));
+  }
+
+  #[test]
+  fn test_reserved_volume_name_is_rejected() {
+    for reserved in RESERVED_VOLUME_NAMES {
+      let yaml = format!(
+        r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    volumes:
+      {reserved}: /data
+    steps:
+      - cargo build
+"#
+      );
+      let result = Pipeline::from_yaml(&yaml);
+      assert!(
+        matches!(result, Err(PipelineError::InvalidVolume { ref name, .. }) if name == reserved),
+        "expected reserved volume name '{reserved}' to be rejected"
+      );
+    }
+  }
+
+  #[test]
+  fn test_relative_mount_path_is_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    volumes:
+      data: relative/path
+    steps:
+      - cargo build
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(result, Err(PipelineError::InvalidVolume { .. })));
+  }
+
+  #[test]
+  fn test_mount_path_overlapping_reserved_path_is_rejected() {
+    for path in ["/workspace", "/workspace/sub", "/tmp/cache"] {
+      let yaml = format!(
+        r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    volumes:
+      data: {path}
+    steps:
+      - cargo build
+"#
+      );
+      let result = Pipeline::from_yaml(&yaml);
+      assert!(
+        matches!(result, Err(PipelineError::InvalidVolume { .. })),
+        "expected mount path '{path}' to be rejected"
+      );
+    }
+  }
+
+  #[test]
+  fn test_duplicate_mount_paths_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    volumes:
+      a: /data
+      b: /data
+    steps:
+      - cargo build
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(result, Err(PipelineError::InvalidVolume { .. })));
   }
 }
