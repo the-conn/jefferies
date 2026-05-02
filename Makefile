@@ -13,7 +13,8 @@ TEST_IMAGE_NAME = $(IMAGE_NAME)-test
 FULL_TEST_IMAGE_NAME = $(REGISTRY)/$(REPOSITORY)/$(TEST_IMAGE_NAME):$(TAG)
 TEST_CONTAINERFILE = Containerfile-test
 
-.PHONY: all build test lint fmt image push clean help run
+# Added all new targets to .PHONY to ensure they always run
+.PHONY: all build test lint fmt fmt-check image push image-test push-test clean clean-test help run ci
 
 all: fmt lint test build
 
@@ -39,45 +40,22 @@ fmt:
 
 ## fmt-check: Check if fmt is correct
 fmt-check:
-	@echo "Formatting code..."
+	@echo "Checking code format..."
 	$(CARGO) +nightly fmt --check
-
-## image: Build the container image
-image:
-	@echo "Building $(FULL_IMAGE_NAME) using $(CONTAINER_ENGINE)..."
-	$(CONTAINER_ENGINE) build -t $(IMAGE_NAME):$(TAG) -t $(FULL_IMAGE_NAME) .
-
-## push: Push the image to the remote registry
-push:
-	@echo "Pushing $(FULL_IMAGE_NAME) to registry..."
-	$(CONTAINER_ENGINE) push $(FULL_IMAGE_NAME)
 
 ## run: Run the backend locally
 run:
 	$(CARGO) run $(FLAGS)
 
-## clean: Remove build artifacts and local images
-clean: clean-test
-	@echo "Cleaning artifacts..."
-	$(CARGO) clean
-	$(CONTAINER_ENGINE) rmi $(FULL_IMAGE_NAME) || true
-
-## help: Show this help message
-help:
-	@echo "Usage: make [target] [VARIABLES...]"
-	@echo ""
-	@echo "Targets:"
-	@grep -E '^##' $(MAKEFILE_LIST) | sed -e 's/## //' | column -t -s ':'
-
 ## ci: Run the ci checks
 ci: fmt-check build lint test
 
-## image: Build the container image
+## image: Build the production container image
 image:
 	@echo "Building $(FULL_IMAGE_NAME) using $(CONTAINER_ENGINE)..."
 	$(CONTAINER_ENGINE) build -t $(IMAGE_NAME):$(TAG) -t $(FULL_IMAGE_NAME) .
 
-## push: Push the image to the remote registry
+## push: Push the production image to the remote registry
 push:
 	@echo "Pushing $(FULL_IMAGE_NAME) to registry..."
 	$(CONTAINER_ENGINE) push $(FULL_IMAGE_NAME)
@@ -94,6 +72,20 @@ push-test:
 	@echo "Pushing test image: $(FULL_TEST_IMAGE_NAME)..."
 	$(CONTAINER_ENGINE) push $(FULL_TEST_IMAGE_NAME)
 
+## clean: Remove build artifacts and local images
+clean: clean-test
+	@echo "Cleaning artifacts..."
+	$(CARGO) clean
+	$(CONTAINER_ENGINE) rmi $(FULL_IMAGE_NAME) || true
+
 ## clean-test: Remove local test images
 clean-test:
-	$(CONTAINER_ENGINE) rmi $(FULL_TEST_IMAGE_NAME) $(TEST_IMAGE_NAME):$(TAG)
+	@echo "Cleaning test images..."
+	$(CONTAINER_ENGINE) rmi $(FULL_TEST_IMAGE_NAME) $(TEST_IMAGE_NAME):$(TAG) || true
+
+## help: Show this help message
+help:
+	@echo "Usage: make [target] [VARIABLES...]"
+	@echo ""
+	@echo "Targets:"
+	@grep -E '^##' $(MAKEFILE_LIST) | sed -e 's/## //' | column -t -s ':'

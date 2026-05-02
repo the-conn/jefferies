@@ -9,10 +9,10 @@ nodes:
   - name: Format, Build, Lint and Test
     image: quay.io/the-conn/jefferies-test
     checkout: true
-    memory: 6Gi
-    cpu: "2"
-    workspace_size: 250Mi
-    cache_size: 5Gi
+    memory: 8Gi
+    cpu: "3"
+    workspace_size: 1Gi
+    cache_size: 7Gi
     env:
       CARGO_HOME: /tmp/cache/cargo
       CARGO_TARGET_DIR: /tmp/cache/target
