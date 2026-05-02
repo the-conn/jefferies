@@ -11,10 +11,14 @@ pub enum PipelineError {
   UnknownDependency { node: String, dependency: String },
   #[error("Node '{node}' depends on itself")]
   SelfDependency { node: String },
-  #[error("Node '{node}' of type 'exec' must have at least one step")]
+  #[error("Node '{node}' must have at least one step")]
   EmptySteps { node: String },
-  #[error("Node '{node}' of type 'build' is missing required 'config' field")]
-  MissingBuildConfig { node: String },
+  #[error("Node '{node}' has invalid quantity for '{field}': '{value}'")]
+  InvalidQuantity {
+    node: String,
+    field: &'static str,
+    value: String,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,30 +69,6 @@ struct Refs {
   tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum NodeType {
-  #[default]
-  Exec,
-  Build,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuildConfig {
-  pub containerfile: String,
-  #[serde(default)]
-  pub tags: Vec<String>,
-  #[serde(default)]
-  pub build_args: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeKind {
-  Exec,
-  Build(BuildConfig),
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PipelineNode {
   name: String,
@@ -106,10 +86,18 @@ struct PipelineNode {
   env: HashMap<String, String>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   steps: Vec<PipelineStep>,
-  #[serde(default, rename = "type")]
-  node_type: NodeType,
+  #[serde(default, skip_serializing_if = "is_false")]
+  privileged: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  config: Option<BuildConfig>,
+  cache_size: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  cpu: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  memory: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+  !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,7 +123,10 @@ pub struct NodeInfo {
   pub startup_timeout_secs: Option<u64>,
   pub checkout: bool,
   pub env: HashMap<String, String>,
-  pub kind: NodeKind,
+  pub privileged: bool,
+  pub cache_size: Option<String>,
+  pub cpu: Option<String>,
+  pub memory: Option<String>,
 }
 
 impl Pipeline {
@@ -143,7 +134,8 @@ impl Pipeline {
     match serde_saphyr::from_str(yaml) {
       Ok(pipeline) => {
         validate_dependencies(&pipeline)?;
-        validate_node_types(&pipeline)?;
+        validate_steps_present(&pipeline)?;
+        validate_quantities(&pipeline)?;
         Ok(pipeline)
       }
       Err(e) => Err(PipelineError::YamlParseError(e.to_string())),
@@ -178,10 +170,6 @@ impl Pipeline {
       .map(|n| {
         let mut env = self.env.clone();
         env.extend(n.env.clone());
-        let kind = match (&n.node_type, n.config.as_ref()) {
-          (NodeType::Build, Some(config)) => NodeKind::Build(config.clone()),
-          _ => NodeKind::Exec,
-        };
         NodeInfo {
           name: n.name.clone(),
           image: n.image.clone().unwrap_or_default(),
@@ -191,7 +179,10 @@ impl Pipeline {
           startup_timeout_secs: n.startup_timeout_secs,
           checkout: n.checkout.unwrap_or(false),
           env,
-          kind,
+          privileged: n.privileged,
+          cache_size: n.cache_size.clone(),
+          cpu: n.cpu.clone(),
+          memory: n.memory.clone(),
         }
       })
       .collect()
@@ -208,23 +199,100 @@ impl Pipeline {
   }
 }
 
-fn validate_node_types(pipeline: &Pipeline) -> Result<(), PipelineError> {
+fn validate_steps_present(pipeline: &Pipeline) -> Result<(), PipelineError> {
   for node in &pipeline.nodes {
-    match node.node_type {
-      NodeType::Exec if node.steps.is_empty() => {
-        return Err(PipelineError::EmptySteps {
-          node: node.name.clone(),
-        });
-      }
-      NodeType::Build if node.config.is_none() => {
-        return Err(PipelineError::MissingBuildConfig {
-          node: node.name.clone(),
-        });
-      }
-      _ => {}
+    if node.steps.is_empty() {
+      return Err(PipelineError::EmptySteps {
+        node: node.name.clone(),
+      });
     }
   }
   Ok(())
+}
+
+fn validate_quantities(pipeline: &Pipeline) -> Result<(), PipelineError> {
+  for node in &pipeline.nodes {
+    for (field, value) in [
+      ("cpu", node.cpu.as_deref()),
+      ("memory", node.memory.as_deref()),
+      ("cache_size", node.cache_size.as_deref()),
+    ] {
+      if let Some(v) = value
+        && !is_valid_quantity(v)
+      {
+        return Err(PipelineError::InvalidQuantity {
+          node: node.name.clone(),
+          field,
+          value: v.to_string(),
+        });
+      }
+    }
+  }
+  Ok(())
+}
+
+fn is_valid_quantity(s: &str) -> bool {
+  if s.is_empty() {
+    return false;
+  }
+  let bytes = s.as_bytes();
+  let mut i = 0;
+  if matches!(bytes[i], b'+' | b'-') {
+    i += 1;
+  }
+  let mut saw_digit = false;
+  let mut saw_dot = false;
+  while i < bytes.len() {
+    match bytes[i] {
+      b'0'..=b'9' => {
+        saw_digit = true;
+        i += 1;
+      }
+      b'.' if !saw_dot => {
+        saw_dot = true;
+        i += 1;
+      }
+      _ => break,
+    }
+  }
+  if !saw_digit {
+    return false;
+  }
+  if i == bytes.len() {
+    return true;
+  }
+  let is_exponent = matches!(bytes[i], b'e' | b'E')
+    && i + 1 < bytes.len()
+    && matches!(bytes[i + 1], b'0'..=b'9' | b'+' | b'-');
+  if is_exponent {
+    i += 1;
+    if matches!(bytes[i], b'+' | b'-') {
+      i += 1;
+    }
+    let mut any = false;
+    while i < bytes.len() {
+      if !bytes[i].is_ascii_digit() {
+        return false;
+      }
+      any = true;
+      i += 1;
+    }
+    return any;
+  }
+  match bytes[i] {
+    b'n' | b'u' | b'm' | b'k' => {
+      i += 1;
+      i == bytes.len()
+    }
+    b'K' | b'M' | b'G' | b'T' | b'P' | b'E' => {
+      i += 1;
+      if i < bytes.len() && bytes[i] == b'i' {
+        i += 1;
+      }
+      i == bytes.len()
+    }
+    _ => false,
+  }
 }
 
 fn validate_dependencies(pipeline: &Pipeline) -> Result<(), PipelineError> {
@@ -295,8 +363,8 @@ mod tests {
 
     let first_node = &pipeline.nodes[0];
     assert!(
-      first_node.image.as_deref().unwrap_or("").contains("rust"),
-      "First node should use a Rust image"
+      first_node.image.as_deref().is_some_and(|s| !s.is_empty()),
+      "First node should declare a non-empty image"
     );
 
     assert!(first_node.checkout.is_some());
@@ -672,36 +740,7 @@ nodes:
   }
 
   #[test]
-  fn test_build_node_parses_correctly() {
-    let yaml = r#"
-name: Test Pipeline
-nodes:
-  - name: Build Image
-    type: build
-    checkout: true
-    config:
-      containerfile: Containerfile
-      tags:
-        - quay.io/the-conn/jefferies
-      build_args:
-        - RUST_TAG=1.95-slim
-"#;
-    let pipeline = Pipeline::from_yaml(yaml).unwrap();
-    let infos = pipeline.node_info();
-    assert_eq!(infos.len(), 1);
-    assert_eq!(infos[0].name, "Build Image");
-    assert!(infos[0].checkout);
-    if let NodeKind::Build(config) = &infos[0].kind {
-      assert_eq!(config.containerfile, "Containerfile");
-      assert_eq!(config.tags, vec!["quay.io/the-conn/jefferies"]);
-      assert_eq!(config.build_args, vec!["RUST_TAG=1.95-slim"]);
-    } else {
-      panic!("Expected NodeKind::Build");
-    }
-  }
-
-  #[test]
-  fn test_exec_node_without_steps_fails_validation() {
+  fn test_node_without_steps_fails_validation() {
     let yaml = r#"
 name: Test Pipeline
 nodes:
@@ -716,18 +755,76 @@ nodes:
   }
 
   #[test]
-  fn test_build_node_without_config_fails_validation() {
+  fn test_node_info_runtime_knobs_default_when_absent() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert!(!infos[0].privileged);
+    assert!(infos[0].cache_size.is_none());
+    assert!(infos[0].cpu.is_none());
+    assert!(infos[0].memory.is_none());
+  }
+
+  #[test]
+  fn test_node_info_runtime_knobs_parse_when_present() {
     let yaml = r#"
 name: Test Pipeline
 nodes:
   - name: Build Image
-    type: build
-    checkout: true
+    image: quay.io/buildah/stable:latest
+    privileged: true
+    cache_size: 2Gi
+    cpu: "2"
+    memory: 4Gi
+    steps:
+      - buildah bud .
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert!(infos[0].privileged);
+    assert_eq!(infos[0].cache_size.as_deref(), Some("2Gi"));
+    assert_eq!(infos[0].cpu.as_deref(), Some("2"));
+    assert_eq!(infos[0].memory.as_deref(), Some("4Gi"));
+  }
+
+  #[test]
+  fn test_invalid_quantity_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    cpu: "garbage"
+    steps:
+      - cargo build
 "#;
     let result = Pipeline::from_yaml(yaml);
     assert!(matches!(
       result,
-      Err(PipelineError::MissingBuildConfig { ref node }) if node == "Build Image"
+      Err(PipelineError::InvalidQuantity { ref node, field: "cpu", ref value })
+        if node == "Build" && value == "garbage"
     ));
+  }
+
+  #[test]
+  fn test_quantity_validator_accepts_common_forms() {
+    for q in [
+      "1", "100m", "2", "2.5", "2Gi", "2G", "500Mi", "1.5", "100k", "2e3", "2E5", "2E", "2Ei", "0",
+      "+5", "0.5",
+    ] {
+      assert!(is_valid_quantity(q), "expected '{q}' to be valid");
+    }
+  }
+
+  #[test]
+  fn test_quantity_validator_rejects_garbage() {
+    for q in ["", "abc", "Mi", "1.2.3", "1Q", "2ix", "e5", "."] {
+      assert!(!is_valid_quantity(q), "expected '{q}' to be rejected");
+    }
   }
 }

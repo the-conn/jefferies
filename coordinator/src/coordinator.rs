@@ -568,9 +568,12 @@ impl Coordinator {
 
   async fn dispatch_ready_nodes(&mut self) {
     for node_name in self.run.ready_nodes() {
-      let Some(node) = self.node_info_cache.get(&node_name) else {
+      let Some(node) = self.node_info_cache.get(&node_name).cloned() else {
         error!(run_id = %self.run_id, node_name = %node_name, "Node info not found in pipeline");
         self.run.mark_dispatch_failed(&node_name);
+        self
+          .record_dispatch_failed(&node_name, "Node info not found in pipeline")
+          .await;
         continue;
       };
 
@@ -579,7 +582,7 @@ impl Coordinator {
         .unwrap_or_else(|| self.config.default_node_startup_timeout_secs());
       match self
         .dispatcher
-        .dispatch(&self.run_id, node, &self.pipeline, &self.config)
+        .dispatch(&self.run_id, &node, &self.pipeline, &self.config)
         .await
       {
         Ok(()) => {
@@ -587,7 +590,7 @@ impl Coordinator {
             warn!(run_id = %self.run_id, node_name = %node_name, "Unexpected state transition: node was not Pending");
           } else {
             info!(run_id = %self.run_id, node_name = %node_name, "Node dispatched");
-            self.record_node_dispatched(&node_name, node).await;
+            self.record_node_dispatched(&node_name, &node).await;
             let handle = self.spawn_startup_timeout(&node_name, startup_secs);
             self.node_phase_handles.insert(
               node_name,
@@ -599,10 +602,39 @@ impl Coordinator {
           }
         }
         Err(e) => {
-          error!(run_id = %self.run_id, node_name = %node_name, error = %e, "Failed to dispatch node");
+          let err_message = e.to_string();
+          error!(run_id = %self.run_id, node_name = %node_name, error = %err_message, "Failed to dispatch node");
           self.run.mark_dispatch_failed(&node_name);
+          self.record_dispatch_failed(&node_name, &err_message).await;
         }
       }
+    }
+  }
+
+  async fn record_dispatch_failed(&self, node_name: &str, error: &str) {
+    let node_definition = self
+      .node_info_cache
+      .get(node_name)
+      .and_then(|info| serde_json::to_string(info).ok())
+      .unwrap_or_default();
+    let now = Utc::now();
+    let node_record = NodeRunRecord {
+      run_id: self.run_id.clone(),
+      node_name: node_name.to_string(),
+      node_definition,
+      success: false,
+      created_at: now,
+      started_at: None,
+      completed_at: Some(now),
+      output_log: Some(format!("Dispatch failed: {error}")),
+      failure_reason: Some(
+        InfraFailureReason::DispatchFailed(error.to_string())
+          .stable_code()
+          .to_string(),
+      ),
+    };
+    if let Err(e) = self.run_history.record_node_run(node_record).await {
+      warn!(run_id = %self.run_id, node_name, error = %e, "Failed to record dispatch-failed node run history");
     }
   }
 
@@ -774,9 +806,20 @@ impl Coordinator {
     }
   }
 
-  async fn record_history(&self, status: RunStatus) {
-    let completed_at = Utc::now();
+  async fn record_history(&mut self, status: RunStatus) {
+    let running_nodes: Vec<String> = self
+      .run
+      .statuses()
+      .iter()
+      .filter(|(_, s)| **s == NodeStatus::Running)
+      .map(|(name, _)| name.clone())
+      .collect();
+    for node_name in &running_nodes {
+      self.record_running_node_terminated(node_name).await;
+      self.run.mark_failed(node_name);
+    }
 
+    let completed_at = Utc::now();
     let pipeline_record = PipelineRunRecord {
       run_id: self.run_id.clone(),
       pipeline_name: self.pipeline.name().to_string(),
@@ -796,17 +839,6 @@ impl Coordinator {
     };
     if let Err(e) = self.run_history.record_pipeline_run(pipeline_record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
-    }
-
-    let running_nodes: Vec<String> = self
-      .run
-      .statuses()
-      .iter()
-      .filter(|(_, s)| **s == NodeStatus::Running)
-      .map(|(name, _)| name.clone())
-      .collect();
-    for node_name in running_nodes {
-      self.record_running_node_terminated(&node_name).await;
     }
   }
 
@@ -1540,6 +1572,165 @@ nodes:
 
     let summary = handle.await.expect("Coordinator should complete");
     assert_eq!(summary.status, RunStatus::Success);
+  }
+
+  struct AlwaysFailDispatcher {
+    error_message: String,
+  }
+
+  #[async_trait::async_trait]
+  impl Dispatcher for AlwaysFailDispatcher {
+    async fn dispatch(
+      &self,
+      _run_id: &str,
+      _node: &NodeInfo,
+      _pipeline: &Pipeline,
+      _config: &AppConfig,
+    ) -> Result<(), DispatchError> {
+      Err(DispatchError::Kube(self.error_message.clone()))
+    }
+
+    async fn cancel_node(
+      &self,
+      _run_id: &str,
+      _node_name: &str,
+      _config: &AppConfig,
+    ) -> Result<(), DispatchError> {
+      Ok(())
+    }
+
+    async fn cleanup_run(&self, _run_id: &str) -> Result<(), DispatchError> {
+      Ok(())
+    }
+  }
+
+  #[tokio::test]
+  async fn dispatch_failure_records_node_run_with_failure_reason() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline();
+    let dispatcher = Arc::new(AlwaysFailDispatcher {
+      error_message:
+        "Pod \"build\" is invalid: spec.containers[0].resources.limits[memory]: Invalid value"
+          .into(),
+    });
+    let run_history = CapturingRunHistory::new();
+
+    let handle = start_coordinator(
+      "test-run-dispatch-fail".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(summary.node_statuses["build"], NodeStatus::Failed);
+
+    let recorded = run_history.node_runs();
+    let build_record = recorded
+      .iter()
+      .find(|r| r.node_name == "build")
+      .expect("dispatch failure must persist a node_runs row");
+    assert!(!build_record.success);
+    assert_eq!(
+      build_record.failure_reason.as_deref(),
+      Some("DispatchFailed")
+    );
+    assert!(build_record.completed_at.is_some());
+    assert!(
+      build_record
+        .output_log
+        .as_deref()
+        .unwrap_or("")
+        .contains("Pod \"build\" is invalid"),
+      "output_log should embed the underlying dispatch error so the user can see why"
+    );
+  }
+
+  fn make_pipeline_with_pipeline_timeout(pipeline_timeout_secs: u64) -> Arc<Pipeline> {
+    Arc::new(
+      Pipeline::from_yaml(&format!(
+        r#"
+name: test-pipeline
+timeout_secs: {pipeline_timeout_secs}
+on:
+  push:
+    branches: [main]
+nodes:
+  - name: build
+    image: rust:latest
+    timeout_secs: 600
+    startup_timeout_secs: 600
+    steps:
+      - cargo build
+"#,
+      ))
+      .unwrap(),
+    )
+  }
+
+  #[tokio::test]
+  async fn pipeline_timeout_records_completed_at_for_running_node() {
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline_with_pipeline_timeout(1);
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let signal_slot = dispatcher.signal_tx_slot();
+    let watcher_started = dispatcher.watcher_started_notify();
+    let dispatch_called = dispatcher.dispatch_called_notify();
+    let dispatch_done = dispatcher.dispatch_done_flag();
+    let run_history = CapturingRunHistory::new();
+
+    let handle = start_coordinator(
+      "test-run-pipeline-timeout".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: run_history.clone(),
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let signal_tx = wait_for_signal_tx(watcher_started, signal_slot).await;
+    wait_for_dispatch(dispatch_called, dispatch_done).await;
+
+    signal_tx
+      .send(PodSignal::PodRunning {
+        node_name: "build".into(),
+        pod_uid: "uid-1".into(),
+      })
+      .await
+      .expect("send running");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(summary.node_statuses["build"], NodeStatus::Failed);
+    let recorded = run_history.node_runs();
+    let build_record = recorded
+      .iter()
+      .find(|r| r.node_name == "build")
+      .expect("build node was recorded");
+    assert!(
+      build_record.completed_at.is_some(),
+      "completed_at should be set for the running node when the pipeline times out"
+    );
+    assert!(!build_record.success);
   }
 
   #[tokio::test]

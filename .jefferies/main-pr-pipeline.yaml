@@ -6,18 +6,12 @@ on:
       - main
 
 nodes:
-  - name: Lint and Format
-    image: rust:1.95-slim
+  - name: Format, Build, Lint and Test
+    image: quay.io/the-conn/jefferies-test
     checkout: true
+    memory: 4Gi
+    cpu: "4"
     steps:
       - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
-      - cargo +nightly fmt --check
       - rustup component add clippy
-      - cargo clippy -- -D warnings
-
-  - name: Unit Tests
-    image: rust:1.95-slim
-    after: ["Lint and Format"]
-    checkout: true
-    steps:
-      - cargo test --all-features --workspace
+      - make ci

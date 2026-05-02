@@ -31,8 +31,10 @@ secret_key = ""
 namespace = "jefferies-jobs"
 tube_image = "quay.io/the-conn/tube:latest"
 default_node_image = "fedora:45"
-builder_namespace = "jefferies-builder"
-buildah_image = "quay.io/buildah/stable:latest"
+service_account = "jefferies-jobs-sa"
+runtime_class = "kata"
+default_cpu = "1"
+default_memory = "2Gi"
 
 [postgres]
 host = "localhost"

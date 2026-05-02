@@ -1,2 +1,2 @@
 mod pipeline;
-pub use pipeline::{BuildConfig, NodeInfo, NodeKind, Pipeline};
+pub use pipeline::{NodeInfo, Pipeline};

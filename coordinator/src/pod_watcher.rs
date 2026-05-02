@@ -25,6 +25,7 @@ pub enum InfraFailureReason {
   PodStartTimeout,
   PodDeletedUnexpectedly,
   NodeLost,
+  DispatchFailed(String),
 }
 
 impl InfraFailureReason {
@@ -37,6 +38,7 @@ impl InfraFailureReason {
       Self::PodStartTimeout => "PodStartTimeout",
       Self::PodDeletedUnexpectedly => "PodDeletedUnexpectedly",
       Self::NodeLost => "NodeLost",
+      Self::DispatchFailed(_) => "DispatchFailed",
     }
   }
 
@@ -57,6 +59,7 @@ impl InfraFailureReason {
       }
       Self::PodDeletedUnexpectedly => "Pod was deleted while running".to_string(),
       Self::NodeLost => "Cluster node was lost while the pod was running".to_string(),
+      Self::DispatchFailed(msg) => format!("Failed to dispatch node to Kubernetes: {msg}"),
     }
   }
 
@@ -64,6 +67,10 @@ impl InfraFailureReason {
     match self {
       Self::ImagePullFailed { image, .. } => Some(format!(
         "Failed to pull image '{image}'. Verify the image name, tag, and registry permissions."
+      )),
+      Self::DispatchFailed(msg) => Some(format!(
+        "Kubernetes rejected the Pod for this node: {msg}. \
+         Check the node's resource limits, image, and any cluster admission policies (SCC, ResourceQuota, LimitRange)."
       )),
       Self::OOMKilled | Self::ContainerCreateError(_) | Self::PodStartTimeout => {
         Self::user_message_from_code(self.stable_code())
@@ -88,6 +95,10 @@ impl InfraFailureReason {
       ),
       "PodStartTimeout" => Some(
         "The pod did not start in time. The cluster may be out of capacity, or the image may be very large."
+          .to_string(),
+      ),
+      "DispatchFailed" => Some(
+        "Kubernetes rejected the Pod for this node. Check the node's resource limits, image, and any cluster admission policies (SCC, ResourceQuota, LimitRange)."
           .to_string(),
       ),
       _ => None,

@@ -14,7 +14,7 @@ The platform is built as a distributed state machine where the execution logic i
 * **`pipelines`**: Manages the parsing of `.jefferies/` YAML files and defines the shared state schema for execution tracking.
 * **`state_store`**: Provides a `StateStore` trait backed by Redis. Persists `RunState` with optimistic concurrency (Lua CAS / version fencing) and manages distributed TTL leases per run for exactly-once coordination.
 * **`backplane`**: Provides a `Backplane` trait backed by RabbitMQ. Replaces in-process MPSC channels with a cluster-wide topic exchange so any server node can route `NodeCompleted` and `Cancel` events to the appropriate coordinator.
-* **`coordinator`**: The reactive engine that acquires and heartbeats a Redis lease, consumes backplane events, persists node-state transitions, and runs the "Reaper" task for reclaiming orphaned runs and sweeping stranded resources. Contains the **`SourceManager`**, which streams repository tarballs from GitHub directly to S3 and generates presigned URLs for worker access. The **`KubeDispatcher`** actuates each pipeline node by creating a ConfigMap with the user script and submitting a Kubernetes Job with the Tube binary injected via an init container. A per-run **`PodWatcher`** observes Pod conditions through `kube::runtime::watcher`, surfacing infrastructure failures (`ImagePullBackOff`, `OOMKilled`, init-container errors, etc.) the moment Kubernetes reports them rather than waiting for the runtime timeout.
+* **`coordinator`**: The reactive engine that acquires and heartbeats a Redis lease, consumes backplane events, persists node-state transitions, and runs the "Reaper" task for reclaiming orphaned runs and sweeping stranded resources. Contains the **`SourceManager`**, which streams repository tarballs from GitHub directly to S3 and generates presigned URLs for worker access. The **`KubeDispatcher`** actuates each pipeline node by creating a ConfigMap with the user script and submitting a Kubernetes Job into a single namespace. Per-node YAML knobs (`privileged`, `cache_size`, `cpu`, `memory`) drive the security context, in-memory cache mount at `/tmp/cache`, and deterministic resource requests/limits. The workspace at `/workspace` is a plain disk-backed `emptyDir`. Sandboxing is conditional: privileged nodes run with `runtimeClassName: kata` under `jefferies-jobs-sa` for VM-level isolation, while non-privileged nodes run on the cluster's default runtime and ServiceAccount for full performance. A per-run **`PodWatcher`** observes Pod conditions through `kube::runtime::watcher`, surfacing infrastructure failures (`ImagePullBackOff`, `OOMKilled`, init-container errors, etc.) the moment Kubernetes reports them rather than waiting for the runtime timeout.
 * **`run_history`**: Persists every pipeline run and its constituent node runs to PostgreSQL. Records outcome, timestamps, trigger, raw pipeline YAML, and captured output logs. Written by the coordinator immediately before S3 artifact cleanup, while node status files are still available.
 * **`server`**: A stateless Axum-based interface that handles incoming webhooks and secure status callbacks from execution workers.
 
@@ -81,8 +81,10 @@ JEFFERIES__POSTGRES__PASSWORD=...
 JEFFERIES__KUBERNETES__NAMESPACE=jefferies-jobs
 JEFFERIES__KUBERNETES__TUBE_IMAGE=quay.io/the-conn/tube:latest
 JEFFERIES__KUBERNETES__DEFAULT_NODE_IMAGE=fedora:45
-JEFFERIES__KUBERNETES__BUILDER_NAMESPACE=jefferies-builder
-JEFFERIES__KUBERNETES__BUILDAH_IMAGE=quay.io/buildah/stable:latest
+JEFFERIES__KUBERNETES__SERVICE_ACCOUNT=jefferies-jobs-sa
+JEFFERIES__KUBERNETES__RUNTIME_CLASS=kata
+JEFFERIES__KUBERNETES__DEFAULT_CPU=1
+JEFFERIES__KUBERNETES__DEFAULT_MEMORY=2Gi
 
 # Pipeline Defaults (per-node overridable in YAML)
 JEFFERIES__PIPELINE__DEFAULT_PIPELINE_TIMEOUT_SECS=3600
