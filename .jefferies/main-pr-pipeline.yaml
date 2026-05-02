@@ -19,5 +19,7 @@ nodes:
     steps:
       - rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
       - rustup component add clippy
-      - apt-get update && apt-get install -y --no-install-recommends make mold clang
-      - make ci
+      - cargo +nightly fmt --check
+      - cargo build --release --all-features --workspace
+      - cargo clippy --all-features --workspace -- -D warnings
+      - cargo test --all-features --workspace
