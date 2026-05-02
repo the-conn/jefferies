@@ -10,9 +10,9 @@ nodes:
     image: quay.io/buildah/stable:latest
     checkout: true
     privileged: true
-    cache_size: 2Gi
     cpu: "2"
     memory: 4Gi
+    timeout_secs: 1200
     steps:
-      - buildah bud --network=host -f Containerfile -t quay.io/the-conn/jefferies --build-arg RUST_TAG=1.95-slim .
-      - buildah push quay.io/the-conn/jefferies
+      - dnf install -y make
+      - make build
