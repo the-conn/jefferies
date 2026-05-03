@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["app_config", "coordinator", "pipelines", "providers", "run_history", "server", "state_store", "backplane", "tenancy"]
+members = ["app_config", "auth", "coordinator", "pipelines", "providers", "run_history", "server", "state_store", "backplane", "tenancy"]
 
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
@@ -49,6 +49,13 @@ aws-sdk-s3 = "1.131.0"
 aws-smithy-runtime-api = { version = "1.12.0", features = ["client"] }
 aws-smithy-types = "1.4.7"
 http-body-util = "0.1.3"
+auth = { path = "auth" }
+openidconnect = "4.0.1"
+tower-sessions = "0.14.0"
+tower-sessions-redis-store = "0.16.0"
+fred = "10.1.0"
+url = "2.5.7"
+base64 = "0.22.1"
 
 [dependencies]
 tracing = { workspace = true }

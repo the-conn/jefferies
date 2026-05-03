@@ -76,6 +76,27 @@ struct PostgresConfig {
   password: String,
 }
 
+#[derive(Deserialize)]
+struct DexConfig {
+  client_id: String,
+  secret: String,
+  issuer: String,
+  redirect_uri: String,
+  post_login_redirect: String,
+}
+
+impl std::fmt::Debug for DexConfig {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("DexConfig")
+      .field("client_id", &self.client_id)
+      .field("secret", &"<redacted>")
+      .field("issuer", &self.issuer)
+      .field("redirect_uri", &self.redirect_uri)
+      .field("post_login_redirect", &self.post_login_redirect)
+      .finish()
+  }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
   server: ServerConfig,
@@ -86,6 +107,7 @@ pub struct AppConfig {
   s3: S3Config,
   kubernetes: KubernetesConfig,
   postgres: PostgresConfig,
+  dex: DexConfig,
 }
 
 impl AppConfig {
@@ -216,5 +238,25 @@ impl AppConfig {
 
   pub fn postgres_password(&self) -> &str {
     &self.postgres.password
+  }
+
+  pub fn dex_client_id(&self) -> &str {
+    &self.dex.client_id
+  }
+
+  pub fn dex_secret(&self) -> &str {
+    &self.dex.secret
+  }
+
+  pub fn dex_issuer(&self) -> &str {
+    &self.dex.issuer
+  }
+
+  pub fn dex_redirect_uri(&self) -> &str {
+    &self.dex.redirect_uri
+  }
+
+  pub fn dex_post_login_redirect(&self) -> &str {
+    &self.dex.post_login_redirect
   }
 }

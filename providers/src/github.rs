@@ -39,6 +39,7 @@ const GITHUB_EVENT_PUSH: &str = "push";
 const GITHUB_EVENT_PULL_REQUEST: &str = "pull_request";
 const GITHUB_EVENT_CHECK_RUN: &str = "check_run";
 const GITHUB_EVENT_CHECK_SUITE: &str = "check_suite";
+const GITHUB_EVENT_INSTALLATION: &str = "installation";
 const TRIGGER_RETRY: &str = "retry";
 const JEFFERIES_DIR: &str = ".jefferies";
 
@@ -64,26 +65,53 @@ pub struct GithubProvider;
 impl GithubProvider {
   pub async fn handle_webhook(
     State(state): State<Arc<ProviderState>>,
-    Path(tenant_slug): Path<String>,
     headers: HeaderMap,
     body: Bytes,
   ) -> StatusCode {
-    let Some(tenant) = state.tenants.by_slug(&tenant_slug) else {
-      warn!(tenant_slug, "Webhook received for unknown tenant");
-      return StatusCode::NOT_FOUND;
+    let event_type = get_header(&headers, "X-GitHub-Event");
+
+    if event_type == GITHUB_EVENT_INSTALLATION {
+      return handle_installation(&body, &state);
+    }
+
+    let Some(owner_info) = extract_owner_info(&body) else {
+      info!(
+        event_type,
+        "Webhook received without an extractable owner login; ignoring"
+      );
+      return StatusCode::OK;
+    };
+
+    if owner_info.kind != OwnerKind::Organization {
+      info!(
+        owner = %owner_info.login,
+        kind = ?owner_info.kind,
+        event_type,
+        "Webhook owner is not a GitHub organization; dropping"
+      );
+      return StatusCode::OK;
+    }
+
+    let owner = owner_info.login;
+    let Some(tenant) = state.tenants.by_slug(&owner) else {
+      info!(
+        owner,
+        event_type, "Webhook received for org that is not a registered tenant; dropping"
+      );
+      return StatusCode::OK;
     };
     let TenantProvider::Github(gh) = &tenant.provider;
 
     let signature = get_header(&headers, "X-Hub-Signature-256");
     if !signature_matches(&body, &signature, &gh.webhook_secret) {
       warn!(
-        tenant_slug,
+        tenant_slug = %tenant.slug,
         "Unauthorized webhook attempt: Signature mismatch"
       );
       return StatusCode::UNAUTHORIZED;
     }
 
-    let event_type = get_header(&headers, "X-GitHub-Event");
+    let tenant_slug = tenant.slug.clone();
     match event_type.as_str() {
       GITHUB_EVENT_PUSH => match handle_push(&body, tenant, state).await {
         Ok(status) => status,
@@ -122,9 +150,9 @@ impl GithubProvider {
 
   pub async fn retry_run(
     State(state): State<Arc<ProviderState>>,
-    Path(run_id): Path<String>,
+    Path((slug, run_id)): Path<(String, String)>,
   ) -> (StatusCode, Json<Option<RetryResponse>>) {
-    match retry_pipeline_run(state, &run_id).await {
+    match retry_pipeline_run(state, &slug, &run_id).await {
       Ok(new_run_id) => (
         StatusCode::OK,
         Json(Some(RetryResponse { run_id: new_run_id })),
@@ -143,7 +171,11 @@ enum RetryError {
   Backend(String),
 }
 
-async fn retry_pipeline_run(state: Arc<ProviderState>, run_id: &str) -> Result<String, RetryError> {
+async fn retry_pipeline_run(
+  state: Arc<ProviderState>,
+  expected_slug: &str,
+  run_id: &str,
+) -> Result<String, RetryError> {
   let original = state
     .run_history
     .get_pipeline_run(run_id)
@@ -161,6 +193,13 @@ async fn retry_pipeline_run(state: Arc<ProviderState>, run_id: &str) -> Result<S
     warn!(run_id, "Retry requested for run without tenant_slug");
     return Err(RetryError::Backend("missing tenant_slug".into()));
   };
+  if tenant_slug != expected_slug {
+    warn!(
+      run_id,
+      tenant_slug, expected_slug, "Retry requested for run that does not belong to this tenant"
+    );
+    return Err(RetryError::UnknownRun);
+  }
   let Some(tenant) = state.tenants.by_slug(&tenant_slug) else {
     warn!(
       run_id,
@@ -405,7 +444,7 @@ async fn handle_check_suite(
 }
 
 async fn trigger_retry_for_run(tenant: &TenantConfig, state: &Arc<ProviderState>, run_id: &str) {
-  match retry_pipeline_run(state.clone(), run_id).await {
+  match retry_pipeline_run(state.clone(), &tenant.slug, run_id).await {
     Ok(new_run_id) => info!(
       tenant_slug = %tenant.slug,
       original_run_id = run_id,
@@ -811,6 +850,100 @@ fn parse_push_ref(git_ref: &str) -> (Option<String>, Option<String>) {
   } else {
     (None, None)
   }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerKind {
+  User,
+  Organization,
+  Unknown,
+}
+
+struct OwnerInfo {
+  login: String,
+  kind: OwnerKind,
+}
+
+fn extract_owner_info(body: &[u8]) -> Option<OwnerInfo> {
+  let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+  if let Some(login) = value
+    .pointer("/repository/owner/login")
+    .and_then(|v| v.as_str())
+  {
+    return Some(OwnerInfo {
+      login: login.to_string(),
+      kind: parse_owner_kind(
+        value
+          .pointer("/repository/owner/type")
+          .and_then(|v| v.as_str()),
+      ),
+    });
+  }
+  if let Some(login) = value
+    .pointer("/organization/login")
+    .and_then(|v| v.as_str())
+  {
+    return Some(OwnerInfo {
+      login: login.to_string(),
+      kind: OwnerKind::Organization,
+    });
+  }
+  if let Some(login) = value
+    .pointer("/installation/account/login")
+    .and_then(|v| v.as_str())
+  {
+    return Some(OwnerInfo {
+      login: login.to_string(),
+      kind: parse_owner_kind(
+        value
+          .pointer("/installation/account/type")
+          .and_then(|v| v.as_str()),
+      ),
+    });
+  }
+  None
+}
+
+fn parse_owner_kind(raw: Option<&str>) -> OwnerKind {
+  match raw {
+    Some("Organization") => OwnerKind::Organization,
+    Some("User") => OwnerKind::User,
+    _ => OwnerKind::Unknown,
+  }
+}
+
+fn handle_installation(body: &[u8], state: &Arc<ProviderState>) -> StatusCode {
+  let value: serde_json::Value = match serde_json::from_slice(body) {
+    Ok(v) => v,
+    Err(e) => {
+      warn!(error = %e, "Failed to parse installation event body");
+      return StatusCode::OK;
+    }
+  };
+
+  let action = value
+    .get("action")
+    .and_then(|v| v.as_str())
+    .unwrap_or("unknown");
+  let account = value
+    .pointer("/installation/account/login")
+    .and_then(|v| v.as_str())
+    .unwrap_or("");
+  let kind = parse_owner_kind(
+    value
+      .pointer("/installation/account/type")
+      .and_then(|v| v.as_str()),
+  );
+  let registered = state.tenants.by_slug(account).is_some();
+
+  info!(
+    action,
+    account,
+    ?kind,
+    registered,
+    "Received GitHub App installation event"
+  );
+  StatusCode::OK
 }
 
 fn signature_matches(payload: &[u8], signature_header: &str, secret: &str) -> bool {
