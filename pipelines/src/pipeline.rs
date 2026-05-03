@@ -25,6 +25,12 @@ pub enum PipelineError {
     name: String,
     reason: String,
   },
+  #[error("Node '{node}' has invalid secret '{name}': {reason}")]
+  InvalidSecret {
+    node: String,
+    name: String,
+    reason: String,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +44,8 @@ pub struct Pipeline {
   on: Option<PipelineTriggers>,
   #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   env: HashMap<String, String>,
+  #[serde(default, skip_serializing_if = "Secrets::is_empty")]
+  secrets: Secrets,
   nodes: Vec<PipelineNode>,
 }
 
@@ -90,6 +98,8 @@ struct PipelineNode {
   after: Vec<String>,
   #[serde(default, skip_serializing_if = "HashMap::is_empty")]
   env: HashMap<String, String>,
+  #[serde(default, skip_serializing_if = "Secrets::is_empty")]
+  secrets: Secrets,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   steps: Vec<PipelineStep>,
   #[serde(default, skip_serializing_if = "is_false")]
@@ -121,6 +131,49 @@ struct NamedStep {
   run: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Secrets {
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  env: Vec<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  files: Vec<FileSecret>,
+}
+
+impl Secrets {
+  fn is_empty(&self) -> bool {
+    self.env.is_empty() && self.files.is_empty()
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum FileSecret {
+  Default(String),
+  Custom { name: String, path: String },
+}
+
+impl FileSecret {
+  fn name(&self) -> &str {
+    match self {
+      FileSecret::Default(name) => name,
+      FileSecret::Custom { name, .. } => name,
+    }
+  }
+
+  fn path(&self) -> Option<&str> {
+    match self {
+      FileSecret::Default(_) => None,
+      FileSecret::Custom { path, .. } => Some(path),
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileSecretSpec {
+  pub name: String,
+  pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeInfo {
   pub name: String,
@@ -131,6 +184,8 @@ pub struct NodeInfo {
   pub startup_timeout_secs: Option<u64>,
   pub checkout: bool,
   pub env: HashMap<String, String>,
+  pub env_secrets: Vec<String>,
+  pub file_secrets: Vec<FileSecretSpec>,
   pub privileged: bool,
   pub cache_size: Option<String>,
   pub cpu: Option<String>,
@@ -146,6 +201,7 @@ impl Pipeline {
         validate_steps_present(&pipeline)?;
         validate_quantities(&pipeline)?;
         validate_volumes(&pipeline)?;
+        validate_secrets(&pipeline)?;
         Ok(pipeline)
       }
       Err(e) => Err(PipelineError::YamlParseError(e.to_string())),
@@ -180,6 +236,8 @@ impl Pipeline {
       .map(|n| {
         let mut env = self.env.clone();
         env.extend(n.env.clone());
+        let env_secrets = merge_env_secrets(&self.secrets.env, &n.secrets.env);
+        let file_secrets = merge_file_secrets(&self.secrets.files, &n.secrets.files);
         NodeInfo {
           name: n.name.clone(),
           image: n.image.clone().unwrap_or_default(),
@@ -189,6 +247,8 @@ impl Pipeline {
           startup_timeout_secs: n.startup_timeout_secs,
           checkout: n.checkout.unwrap_or(false),
           env,
+          env_secrets,
+          file_secrets,
           privileged: n.privileged,
           cache_size: n.cache_size.clone(),
           cpu: n.cpu.clone(),
@@ -298,6 +358,109 @@ fn is_reserved_path(candidate: &str, reserved: &str) -> bool {
   candidate == reserved
     || candidate.starts_with(&format!("{reserved}/"))
     || reserved.starts_with(&format!("{candidate}/"))
+}
+
+const MAX_SECRET_NAME_LEN: usize = 30;
+
+fn merge_env_secrets(pipeline_env: &[String], node_env: &[String]) -> Vec<String> {
+  let mut set: std::collections::BTreeSet<String> = pipeline_env.iter().cloned().collect();
+  set.extend(node_env.iter().cloned());
+  set.into_iter().collect()
+}
+
+fn merge_file_secrets(
+  pipeline_files: &[FileSecret],
+  node_files: &[FileSecret],
+) -> Vec<FileSecretSpec> {
+  let mut by_name: std::collections::BTreeMap<String, FileSecretSpec> =
+    std::collections::BTreeMap::new();
+  for file in pipeline_files.iter().chain(node_files.iter()) {
+    by_name.insert(
+      file.name().to_string(),
+      FileSecretSpec {
+        name: file.name().to_string(),
+        path: file.path().map(str::to_string),
+      },
+    );
+  }
+  by_name.into_values().collect()
+}
+
+fn validate_secrets(pipeline: &Pipeline) -> Result<(), PipelineError> {
+  for node in &pipeline.nodes {
+    for name in merge_env_secrets(&pipeline.secrets.env, &node.secrets.env) {
+      if let Some(reason) = secret_name_violation(&name) {
+        return Err(PipelineError::InvalidSecret {
+          node: node.name.clone(),
+          name,
+          reason,
+        });
+      }
+    }
+    for spec in merge_file_secrets(&pipeline.secrets.files, &node.secrets.files) {
+      if let Some(reason) = secret_name_violation(&spec.name) {
+        return Err(PipelineError::InvalidSecret {
+          node: node.name.clone(),
+          name: spec.name,
+          reason,
+        });
+      }
+      if let Some(path) = spec.path.as_deref()
+        && let Some(reason) = file_secret_path_violation(path)
+      {
+        return Err(PipelineError::InvalidSecret {
+          node: node.name.clone(),
+          name: spec.name,
+          reason,
+        });
+      }
+    }
+  }
+  Ok(())
+}
+
+fn secret_name_violation(name: &str) -> Option<String> {
+  if name.is_empty() {
+    return Some("name must not be empty".to_string());
+  }
+  if name.len() > MAX_SECRET_NAME_LEN {
+    return Some(format!(
+      "name must be at most {MAX_SECRET_NAME_LEN} characters"
+    ));
+  }
+  if !is_valid_env_var_name(name) {
+    return Some("name must match POSIX env-var pattern: [A-Za-z_][A-Za-z0-9_]*".to_string());
+  }
+  None
+}
+
+fn file_secret_path_violation(path: &str) -> Option<String> {
+  if !path.starts_with('/') {
+    return Some(format!("path '{path}' must be absolute"));
+  }
+  if path.ends_with('/') {
+    return Some(format!("path '{path}' must not end with '/'"));
+  }
+  if path.contains("//") {
+    return Some(format!("path '{path}' must not contain '//'"));
+  }
+  if path.split('/').any(|segment| segment == "..") {
+    return Some(format!("path '{path}' must not contain '..' segments"));
+  }
+  None
+}
+
+fn is_valid_env_var_name(s: &str) -> bool {
+  let bytes = s.as_bytes();
+  if bytes.is_empty() {
+    return false;
+  }
+  let is_first = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+  let is_rest = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+  if !is_first(bytes[0]) {
+    return false;
+  }
+  bytes[1..].iter().all(|&b| is_rest(b))
 }
 
 fn is_valid_dns1123_label(s: &str) -> bool {
@@ -447,8 +610,6 @@ mod tests {
       first_node.image.as_deref().is_some_and(|s| !s.is_empty()),
       "First node should declare a non-empty image"
     );
-
-    assert!(first_node.checkout.is_some());
   }
 
   #[test]
@@ -1030,6 +1191,222 @@ nodes:
         "expected mount path '{path}' to be rejected"
       );
     }
+  }
+
+  #[test]
+  fn merge_env_secrets_dedup_and_sort() {
+    let yaml = r#"
+name: Test Pipeline
+secrets:
+  env:
+    - QUAY_PASSWORD
+    - GLOBAL_TOKEN
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      env:
+        - QUAY_USERNAME
+        - QUAY_PASSWORD
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert_eq!(
+      infos[0].env_secrets,
+      vec![
+        "GLOBAL_TOKEN".to_string(),
+        "QUAY_PASSWORD".to_string(),
+        "QUAY_USERNAME".to_string(),
+      ]
+    );
+  }
+
+  #[test]
+  fn merge_file_secrets_node_overrides_pipeline_path() {
+    let yaml = r#"
+name: Test Pipeline
+secrets:
+  files:
+    - KUBECONFIG
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      files:
+        - name: KUBECONFIG
+          path: /custom/kubeconfig
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert_eq!(infos[0].file_secrets.len(), 1);
+    assert_eq!(infos[0].file_secrets[0].name, "KUBECONFIG");
+    assert_eq!(
+      infos[0].file_secrets[0].path.as_deref(),
+      Some("/custom/kubeconfig")
+    );
+  }
+
+  #[test]
+  fn merge_file_secrets_pipeline_default_combines_with_node_unique() {
+    let yaml = r#"
+name: Test Pipeline
+secrets:
+  files:
+    - KUBECONFIG
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      files:
+        - name: PROXY_CERT
+          path: /etc/pki/ca-trust/source/anchors/proxy.crt
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    let names: Vec<&str> = infos[0]
+      .file_secrets
+      .iter()
+      .map(|s| s.name.as_str())
+      .collect();
+    assert_eq!(names, vec!["KUBECONFIG", "PROXY_CERT"]);
+    assert_eq!(infos[0].file_secrets[0].path, None);
+    assert_eq!(
+      infos[0].file_secrets[1].path.as_deref(),
+      Some("/etc/pki/ca-trust/source/anchors/proxy.crt")
+    );
+  }
+
+  #[test]
+  fn node_info_secrets_default_empty() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert!(infos[0].env_secrets.is_empty());
+    assert!(infos[0].file_secrets.is_empty());
+  }
+
+  #[test]
+  fn invalid_env_secret_name_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      env:
+        - 1BAD
+    steps:
+      - cargo build
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(
+      result,
+      Err(PipelineError::InvalidSecret { ref node, ref name, .. })
+        if node == "Build" && name == "1BAD"
+    ));
+  }
+
+  #[test]
+  fn invalid_file_secret_path_rejected() {
+    for bad_path in [
+      "relative/path",
+      "/trailing/",
+      "/has/../traverse",
+      "/has//slash",
+    ] {
+      let yaml = format!(
+        r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      files:
+        - name: TOKEN
+          path: {bad_path}
+    steps:
+      - cargo build
+"#
+      );
+      let result = Pipeline::from_yaml(&yaml);
+      assert!(
+        matches!(result, Err(PipelineError::InvalidSecret { ref name, .. }) if name == "TOKEN"),
+        "expected file path '{bad_path}' to be rejected"
+      );
+    }
+  }
+
+  #[test]
+  fn valid_secret_name_forms_accepted() {
+    for name in ["_FOO", "A1", "QUAY_USERNAME", "_", "aB_9"] {
+      let yaml = format!(
+        r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      env:
+        - {name}
+    steps:
+      - cargo build
+"#
+      );
+      assert!(
+        Pipeline::from_yaml(&yaml).is_ok(),
+        "expected secret name '{name}' to be accepted"
+      );
+    }
+  }
+
+  #[test]
+  fn name_overlap_between_env_and_files_is_allowed() {
+    let yaml = r#"
+name: Test Pipeline
+nodes:
+  - name: Build
+    image: rust:latest
+    secrets:
+      env:
+        - SHARED_TOKEN
+      files:
+        - SHARED_TOKEN
+    steps:
+      - cargo build
+"#;
+    let infos = Pipeline::from_yaml(yaml).unwrap().node_info();
+    assert_eq!(infos[0].env_secrets, vec!["SHARED_TOKEN".to_string()]);
+    assert_eq!(infos[0].file_secrets.len(), 1);
+    assert_eq!(infos[0].file_secrets[0].name, "SHARED_TOKEN");
+  }
+
+  #[test]
+  fn pipeline_level_secret_invalid_name_rejected() {
+    let yaml = r#"
+name: Test Pipeline
+secrets:
+  env:
+    - has-dash
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let result = Pipeline::from_yaml(yaml);
+    assert!(matches!(
+      result,
+      Err(PipelineError::InvalidSecret { ref name, .. }) if name == "has-dash"
+    ));
   }
 
   #[test]

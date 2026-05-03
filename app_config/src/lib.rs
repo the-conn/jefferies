@@ -69,7 +69,8 @@ struct KubernetesConfig {
   namespace: String,
   tube_image: String,
   default_node_image: String,
-  service_account: String,
+  service_account_privileged: String,
+  service_account_default: String,
   runtime_class: String,
   default_cpu: String,
   default_memory: String,
@@ -207,8 +208,12 @@ impl AppConfig {
     &self.kubernetes.default_node_image
   }
 
-  pub fn service_account(&self) -> &str {
-    &self.kubernetes.service_account
+  pub fn service_account_privileged(&self) -> &str {
+    &self.kubernetes.service_account_privileged
+  }
+
+  pub fn service_account_default(&self) -> &str {
+    &self.kubernetes.service_account_default
   }
 
   pub fn runtime_class(&self) -> &str {

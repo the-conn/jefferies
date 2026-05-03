@@ -1,0 +1,29 @@
+name: Jefferies Main Push Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+nodes:
+  - name: Build Jefferies Image and Update Deployments
+    image: quay.io/buildah/stable:latest
+    checkout: true
+    privileged: true
+    cpu: "4"
+    memory: 8Gi
+    timeout_secs: 1200
+    env:
+      STORAGE_DRIVER: vfs
+      KUBECONFIG: /etc/tube/serets/files/KUBECONFIG
+    secrets:
+      env:
+        - QUAY_USERNAME
+        - QUAY_PASSWORD
+      files:
+        - KUBECONFIG
+    steps:
+      - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
+      - buildah bud -f Containerfile -t quay.io/the-conn/jefferies .
+      - buildah push quay.io/the-conn/jefferies-test
+      - oc -n jefferies rollout restart deployment jefferies

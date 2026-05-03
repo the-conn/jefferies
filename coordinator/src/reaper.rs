@@ -171,22 +171,27 @@ async fn sweep_orphan_kube_resources(
   };
 
   for run_id in managed {
-    let load_result = match state_store.load_run(&run_id).await {
-      Ok(state) => state,
+    let state_unloadable = match state_store.load_run(&run_id).await {
+      Ok(Some(_)) => continue,
+      Ok(None) => false,
       Err(e) => {
-        warn!(run_id, error = %e, "Failed to load state while sweeping kube resources");
-        continue;
+        warn!(
+          run_id,
+          error = %e,
+          "State is unloadable; treating as orphan and reaping kube resources + corrupt state"
+        );
+        true
       }
     };
-    if load_result.is_some() {
-      continue;
-    }
     info!(
       run_id,
       "Reaping orphan Kubernetes resources for completed run"
     );
     if let Err(e) = dispatcher.cleanup_run(&run_id).await {
       warn!(run_id, error = %e, "Failed to cleanup orphan Kubernetes resources");
+    }
+    if state_unloadable && let Err(e) = state_store.delete_run(&run_id).await {
+      warn!(run_id, error = %e, "Failed to delete corrupt run state");
     }
   }
 }
@@ -221,6 +226,8 @@ mod tests {
   impl Dispatcher for TrackingDispatcher {
     async fn dispatch(
       &self,
+      _: &str,
+      _: &str,
       _: &str,
       _: &NodeInfo,
       _: &Pipeline,
@@ -307,5 +314,101 @@ nodes:
 
     let calls = dispatcher.cleanup_calls.lock().unwrap().clone();
     assert_eq!(calls, vec!["stranded-run".to_string()]);
+  }
+
+  struct CorruptStateStore {
+    corrupt_run_id: String,
+    inner: Arc<dyn StateStore>,
+    delete_calls: Mutex<Vec<String>>,
+  }
+
+  #[async_trait]
+  impl StateStore for CorruptStateStore {
+    async fn save_run(
+      &self,
+      run_id: &str,
+      state: &RunState,
+      expected_version: u64,
+    ) -> Result<bool, state_store::StateStoreError> {
+      self.inner.save_run(run_id, state, expected_version).await
+    }
+    async fn load_run(
+      &self,
+      run_id: &str,
+    ) -> Result<Option<RunState>, state_store::StateStoreError> {
+      if run_id == self.corrupt_run_id {
+        return Err(state_store::StateStoreError::Store(
+          "simulated deserialization failure".to_string(),
+        ));
+      }
+      self.inner.load_run(run_id).await
+    }
+    async fn delete_run(&self, run_id: &str) -> Result<(), state_store::StateStoreError> {
+      self.delete_calls.lock().unwrap().push(run_id.to_string());
+      self.inner.delete_run(run_id).await
+    }
+    async fn try_acquire_lease(
+      &self,
+      run_id: &str,
+      server_id: &str,
+      ttl_secs: u64,
+    ) -> Result<Option<u64>, state_store::StateStoreError> {
+      self
+        .inner
+        .try_acquire_lease(run_id, server_id, ttl_secs)
+        .await
+    }
+    async fn renew_lease(
+      &self,
+      run_id: &str,
+      server_id: &str,
+      version: u64,
+      ttl_secs: u64,
+    ) -> Result<bool, state_store::StateStoreError> {
+      self
+        .inner
+        .renew_lease(run_id, server_id, version, ttl_secs)
+        .await
+    }
+    async fn release_lease(&self, run_id: &str) -> Result<(), state_store::StateStoreError> {
+      self.inner.release_lease(run_id).await
+    }
+    async fn get_orphaned_runs(&self) -> Result<Vec<String>, state_store::StateStoreError> {
+      self.inner.get_orphaned_runs().await
+    }
+    async fn list_terminal_unleased_runs(
+      &self,
+    ) -> Result<Vec<String>, state_store::StateStoreError> {
+      self.inner.list_terminal_unleased_runs().await
+    }
+    async fn ping(&self) -> Result<(), state_store::StateStoreError> {
+      self.inner.ping().await
+    }
+  }
+
+  #[tokio::test]
+  async fn sweep_reaps_orphan_kube_resources_when_state_is_corrupt() {
+    let inner = InMemoryStateStore::new();
+    let state_store = Arc::new(CorruptStateStore {
+      corrupt_run_id: "corrupt-run".to_string(),
+      inner: inner.clone(),
+      delete_calls: Mutex::new(Vec::new()),
+    });
+
+    let dispatcher = Arc::new(TrackingDispatcher::new(vec!["corrupt-run".to_string()]));
+    sweep_orphan_kube_resources(dispatcher.clone(), state_store.clone()).await;
+
+    let cleanup = dispatcher.cleanup_calls.lock().unwrap().clone();
+    assert_eq!(
+      cleanup,
+      vec!["corrupt-run".to_string()],
+      "kube resources for the run with corrupt redis state must be reaped"
+    );
+    let deletes = state_store.delete_calls.lock().unwrap().clone();
+    assert_eq!(
+      deletes,
+      vec!["corrupt-run".to_string()],
+      "the corrupt redis state must be deleted so the warn stops repeating"
+    );
   }
 }

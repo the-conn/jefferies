@@ -13,7 +13,7 @@ use k8s_openapi::{
   apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::ObjectMeta},
 };
 use kube::api::{DeleteParams, ListParams, PostParams};
-use pipelines::{NodeInfo, Pipeline};
+use pipelines::{FileSecretSpec, NodeInfo, Pipeline};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{info, warn};
 
@@ -29,7 +29,8 @@ pub struct KubeDispatcher {
   namespace: String,
   tube_image: String,
   default_node_image: String,
-  service_account: String,
+  service_account_privileged: String,
+  service_account_default: String,
   runtime_class: String,
   default_cpu: String,
   default_memory: String,
@@ -49,7 +50,8 @@ impl KubeDispatcher {
       namespace: config.kubernetes_namespace().to_string(),
       tube_image: config.tube_image().to_string(),
       default_node_image: config.default_node_image().to_string(),
-      service_account: config.service_account().to_string(),
+      service_account_privileged: config.service_account_privileged().to_string(),
+      service_account_default: config.service_account_default().to_string(),
       runtime_class: config.runtime_class().to_string(),
       default_cpu: config.default_node_cpu().to_string(),
       default_memory: config.default_node_memory().to_string(),
@@ -125,6 +127,138 @@ fn node_annotations(node_name: &str) -> BTreeMap<String, String> {
   BTreeMap::from([(NODE_NAME_ANNOTATION.to_string(), node_name.to_string())])
 }
 
+const VAULT_SECRETS_MOUNT_PATH: &str = "/etc/tube/secrets";
+const VAULT_ENV_SUBDIR: &str = "env";
+const VAULT_FILES_SUBDIR: &str = "files";
+const REPO_SLUG_SEPARATOR: &str = "__";
+const VAULT_ENV_UNIQUE_PREFIX: &str = "env-";
+const VAULT_FILE_UNIQUE_PREFIX: &str = "f-";
+
+fn repo_slug(owner: &str, repo: &str) -> String {
+  format!("{owner}{REPO_SLUG_SEPARATOR}{repo}")
+}
+
+fn vault_secret_path(owner: &str, repo: &str) -> String {
+  format!("secret/data/{}", repo_slug(owner, repo))
+}
+
+fn vault_role(owner: &str, repo: &str) -> String {
+  repo_slug(owner, repo)
+}
+
+fn vault_template(owner: &str, repo: &str, key: &str) -> String {
+  let path = vault_secret_path(owner, repo);
+  format!(
+    "{{{{- with secret \"{path}\" -}}}}\n  {{{{ index .Data.data \"{key}\" }}}}\n{{{{- end -}}}}"
+  )
+}
+
+fn split_custom_path(path: &str) -> (String, String) {
+  match path.rsplit_once('/') {
+    Some(("", base)) => ("/".to_string(), base.to_string()),
+    Some((dir, base)) => (dir.to_string(), base.to_string()),
+    None => (String::new(), path.to_string()),
+  }
+}
+
+fn vault_annotations(
+  env_secrets: &[String],
+  file_secrets: &[FileSecretSpec],
+  owner: &str,
+  repo: &str,
+) -> BTreeMap<String, String> {
+  let mut out = BTreeMap::new();
+  if env_secrets.is_empty() && file_secrets.is_empty() {
+    return out;
+  }
+  out.insert(
+    "vault.hashicorp.com/agent-inject".to_string(),
+    "true".to_string(),
+  );
+  out.insert(
+    "vault.hashicorp.com/agent-pre-populate-only".to_string(),
+    "true".to_string(),
+  );
+  out.insert(
+    "vault.hashicorp.com/secret-volume-path".to_string(),
+    VAULT_SECRETS_MOUNT_PATH.to_string(),
+  );
+  out.insert(
+    "vault.hashicorp.com/role".to_string(),
+    vault_role(owner, repo),
+  );
+
+  let path = vault_secret_path(owner, repo);
+
+  for key in env_secrets {
+    let id = format!("{VAULT_ENV_UNIQUE_PREFIX}{key}");
+    out.insert(
+      format!("vault.hashicorp.com/agent-inject-secret-{id}"),
+      path.clone(),
+    );
+    out.insert(
+      format!("vault.hashicorp.com/agent-inject-template-{id}"),
+      vault_template(owner, repo, key),
+    );
+    out.insert(
+      format!("vault.hashicorp.com/agent-inject-file-{id}"),
+      format!("{VAULT_ENV_SUBDIR}/{key}"),
+    );
+  }
+
+  for spec in file_secrets {
+    let id = format!("{VAULT_FILE_UNIQUE_PREFIX}{}", spec.name);
+    out.insert(
+      format!("vault.hashicorp.com/agent-inject-secret-{id}"),
+      path.clone(),
+    );
+    out.insert(
+      format!("vault.hashicorp.com/agent-inject-template-{id}"),
+      vault_template(owner, repo, &spec.name),
+    );
+    match spec.path.as_deref() {
+      None => {
+        out.insert(
+          format!("vault.hashicorp.com/agent-inject-file-{id}"),
+          format!("{VAULT_FILES_SUBDIR}/{}", spec.name),
+        );
+      }
+      Some(custom) => {
+        let (dir, basename) = split_custom_path(custom);
+        out.insert(format!("vault.hashicorp.com/secret-volume-path-{id}"), dir);
+        out.insert(
+          format!("vault.hashicorp.com/agent-inject-file-{id}"),
+          basename,
+        );
+      }
+    }
+  }
+
+  out
+}
+
+fn log_vault_paths(
+  run_id: &str,
+  node_name: &str,
+  env_secrets: &[String],
+  file_secrets: &[FileSecretSpec],
+  owner: &str,
+  repo: &str,
+) {
+  if env_secrets.is_empty() && file_secrets.is_empty() {
+    return;
+  }
+  let file_names: Vec<&str> = file_secrets.iter().map(|s| s.name.as_str()).collect();
+  info!(
+    run_id,
+    node_name,
+    path = %vault_secret_path(owner, repo),
+    env_keys = ?env_secrets,
+    file_names = ?file_names,
+    "Vault Agent Injector annotations applied"
+  );
+}
+
 fn build_script(steps: &[String]) -> String {
   let mut script = String::from("#!/bin/bash\nset -euxo pipefail\n");
   for step in steps {
@@ -152,6 +286,7 @@ fn build_env_vars(
   let poke_url = format!(
     "http://jefferies.jefferies.svc.cluster.local./api/v1/runs/{run_id}/nodes/{node_name}/poke"
   );
+  let secrets_env_dir = format!("{VAULT_SECRETS_MOUNT_PATH}/{VAULT_ENV_SUBDIR}");
   vec![
     env_var("TUBE__EXECUTION__USER_SCRIPT_PATH", "/etc/conn/script.sh"),
     env_var("TUBE__EXECUTION__RUN_ID", run_id),
@@ -163,6 +298,7 @@ fn build_env_vars(
     env_var("TUBE__LOG__LEVEL", "warn"),
     env_var("TUBE__WORKSPACE__GET_URL", get_url),
     env_var("TUBE__WORKSPACE__DIR", "/workspace"),
+    env_var("TUBE__SECRETS__DIR", &secrets_env_dir),
   ]
 }
 
@@ -232,20 +368,54 @@ impl Dispatcher for KubeDispatcher {
   async fn dispatch(
     &self,
     run_id: &str,
+    owner: &str,
+    repo: &str,
     node: &NodeInfo,
     _pipeline: &Pipeline,
     config: &AppConfig,
   ) -> Result<(), DispatchError> {
+    let has_secrets = !node.env_secrets.is_empty() || !node.file_secrets.is_empty();
+    if has_secrets && (owner.is_empty() || repo.is_empty()) {
+      tracing::error!(
+        run_id,
+        node_name = %node.name,
+        owner,
+        repo,
+        env_keys = ?node.env_secrets,
+        file_names = ?node.file_secrets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        "Vault injection requested but owner/repo missing on RunContext; failing dispatch"
+      );
+      return Err(DispatchError::Failed(
+        "Vault injection requested but owner/repo missing on RunContext".to_string(),
+      ));
+    }
+
     let status_put_url = self
       .source_manager
       .put_status_url(run_id, &node.name)
       .await?;
     let logs_put_url = self.source_manager.put_logs_url(run_id, &node.name).await?;
-    let get_url = self.source_manager.get_source_url(run_id).await?;
+    let get_url = if node.checkout {
+      self.source_manager.get_source_url(run_id).await?
+    } else {
+      String::new()
+    };
 
     let cm_name = configmap_name(run_id, &node.name);
     let labels = run_labels(run_id);
-    let annotations = node_annotations(&node.name);
+    let mut annotations = node_annotations(&node.name);
+    let vault = vault_annotations(&node.env_secrets, &node.file_secrets, owner, repo);
+    if !vault.is_empty() {
+      log_vault_paths(
+        run_id,
+        &node.name,
+        &node.env_secrets,
+        &node.file_secrets,
+        owner,
+        repo,
+      );
+      annotations.extend(vault);
+    }
     let mut env_vars = build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
     env_vars.extend(node.env.iter().map(|(k, v)| env_var(k, v)));
 
@@ -499,7 +669,11 @@ impl KubeDispatcher {
           spec: Some(PodSpec {
             restart_policy: Some("Never".to_string()),
             runtime_class_name: node.privileged.then(|| self.runtime_class.clone()),
-            service_account_name: node.privileged.then(|| self.service_account.clone()),
+            service_account_name: Some(if node.privileged {
+              self.service_account_privileged.clone()
+            } else {
+              self.service_account_default.clone()
+            }),
             init_containers: Some(vec![Container {
               name: "tube-init".to_string(),
               image: Some(self.tube_image.clone()),
@@ -723,6 +897,187 @@ mod tests {
     append_user_volumes(&user_volumes, &mut mounts, &mut volumes);
     let names: Vec<&str> = mounts.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(names, vec!["alpha", "mu", "zeta"]);
+  }
+
+  #[test]
+  fn build_env_vars_get_url_is_empty_string_when_no_source() {
+    let vars = build_env_vars("run", "node", "status", "logs", "");
+    let get_url = vars
+      .iter()
+      .find(|v| v.name == "TUBE__WORKSPACE__GET_URL")
+      .expect(
+        "TUBE__WORKSPACE__GET_URL must always be present; Tube has no on-disk config so \
+         every TUBE__* var has to be set, with empty string meaning 'no checkout'",
+      );
+    assert_eq!(get_url.value.as_deref(), Some(""));
+  }
+
+  #[test]
+  fn build_env_vars_secrets_dir_matches_vault_env_subdir() {
+    let vars = build_env_vars("run", "node", "status", "logs", "");
+    let secrets_dir = vars
+      .iter()
+      .find(|v| v.name == "TUBE__SECRETS__DIR")
+      .expect("TUBE__SECRETS__DIR must be set so Tube can locate env-flavored secrets");
+    assert_eq!(secrets_dir.value.as_deref(), Some("/etc/tube/secrets/env"));
+    let env_file_annotation = format!("{VAULT_ENV_SUBDIR}/QUAY_USERNAME");
+    assert!(
+      env_file_annotation.starts_with(VAULT_ENV_SUBDIR),
+      "TUBE__SECRETS__DIR ({:?}) must point at the same subdir the vault \
+       agent-inject-file-env-<KEY> annotation writes to ({VAULT_ENV_SUBDIR}/<KEY>)",
+      secrets_dir.value
+    );
+  }
+
+  #[test]
+  fn build_env_vars_get_url_carries_presigned_url_when_source_present() {
+    let vars = build_env_vars("run", "node", "status", "logs", "https://signed-url");
+    let get_url = vars
+      .iter()
+      .find(|v| v.name == "TUBE__WORKSPACE__GET_URL")
+      .expect("checkout nodes must receive a presigned source URL");
+    assert_eq!(get_url.value.as_deref(), Some("https://signed-url"));
+  }
+
+  #[test]
+  fn vault_role_uses_double_underscore_separator() {
+    assert_eq!(vault_role("the-conn", "jefferies"), "the-conn__jefferies");
+  }
+
+  #[test]
+  fn file_unique_prefix_does_not_collide_with_template_file_annotation() {
+    assert!(
+      !VAULT_FILE_UNIQUE_PREFIX.starts_with("file-"),
+      "Vault treats `agent-inject-template-file-<UNIQUE>` as a path-to-template-file \
+       annotation; the file unique-id prefix must not start with `file-` or every \
+       inline template will be parsed as a filesystem path and the agent will fail \
+       with `no such file or directory`"
+    );
+  }
+
+  #[test]
+  fn vault_annotations_empty_when_no_secrets() {
+    let map = vault_annotations(&[], &[], "the-conn", "jefferies");
+    assert!(map.is_empty());
+  }
+
+  #[test]
+  fn vault_annotations_emits_globals_and_omits_retries_and_fallback() {
+    let env = vec!["QUAY_USERNAME".to_string()];
+    let map = vault_annotations(&env, &[], "the-conn", "jefferies");
+
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/agent-inject")
+        .map(String::as_str),
+      Some("true")
+    );
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/agent-pre-populate-only")
+        .map(String::as_str),
+      Some("true")
+    );
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/secret-volume-path")
+        .map(String::as_str),
+      Some("/etc/tube/secrets")
+    );
+    assert_eq!(
+      map.get("vault.hashicorp.com/role").map(String::as_str),
+      Some("the-conn__jefferies")
+    );
+    assert!(
+      !map.contains_key("vault.hashicorp.com/client-max-retries"),
+      "client-max-retries must not be emitted"
+    );
+    let template_key = "vault.hashicorp.com/agent-inject-template-env-QUAY_USERNAME";
+    let template = map
+      .get(template_key)
+      .expect("template annotation for env QUAY_USERNAME");
+    assert!(
+      !template.contains("else"),
+      "template must not contain a fallback else branch: {template}"
+    );
+  }
+
+  #[test]
+  fn vault_annotations_env_secret_lands_in_env_subdir() {
+    let env = vec!["QUAY_USERNAME".to_string()];
+    let map = vault_annotations(&env, &[], "the-conn", "jefferies");
+
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/agent-inject-secret-env-QUAY_USERNAME")
+        .map(String::as_str),
+      Some("secret/data/the-conn__jefferies")
+    );
+    let template = map
+      .get("vault.hashicorp.com/agent-inject-template-env-QUAY_USERNAME")
+      .expect("template annotation");
+    assert!(
+      template.contains("secret/data/the-conn__jefferies"),
+      "template missing repo path: {template}"
+    );
+    assert!(
+      template.contains("index .Data.data \"QUAY_USERNAME\""),
+      "template missing key index: {template}"
+    );
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/agent-inject-file-env-QUAY_USERNAME")
+        .map(String::as_str),
+      Some("env/QUAY_USERNAME")
+    );
+  }
+
+  #[test]
+  fn vault_annotations_default_path_file_secret_lands_in_files_subdir() {
+    let files = vec![FileSecretSpec {
+      name: "KUBECONFIG".to_string(),
+      path: None,
+    }];
+    let map = vault_annotations(&[], &files, "the-conn", "jefferies");
+
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/agent-inject-file-f-KUBECONFIG")
+        .map(String::as_str),
+      Some("files/KUBECONFIG")
+    );
+    assert!(
+      !map.contains_key("vault.hashicorp.com/secret-volume-path-f-KUBECONFIG"),
+      "default-path file secret must not emit a per-secret volume path"
+    );
+  }
+
+  #[test]
+  fn vault_annotations_custom_path_file_secret_splits_dir_and_basename() {
+    let files = vec![FileSecretSpec {
+      name: "PROXY_CERT".to_string(),
+      path: Some("/etc/pki/ca-trust/source/anchors/proxy.crt".to_string()),
+    }];
+    let map = vault_annotations(&[], &files, "the-conn", "jefferies");
+
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/secret-volume-path-f-PROXY_CERT")
+        .map(String::as_str),
+      Some("/etc/pki/ca-trust/source/anchors")
+    );
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/agent-inject-file-f-PROXY_CERT")
+        .map(String::as_str),
+      Some("proxy.crt")
+    );
+    assert_eq!(
+      map
+        .get("vault.hashicorp.com/agent-inject-secret-f-PROXY_CERT")
+        .map(String::as_str),
+      Some("secret/data/the-conn__jefferies")
+    );
   }
 
   #[test]

@@ -28,6 +28,8 @@ pub trait Dispatcher: Send + Sync {
   async fn dispatch(
     &self,
     run_id: &str,
+    owner: &str,
+    repo: &str,
     node: &NodeInfo,
     pipeline: &Pipeline,
     config: &AppConfig,
@@ -91,6 +93,8 @@ impl Dispatcher for LogDispatcher {
   async fn dispatch(
     &self,
     run_id: &str,
+    _owner: &str,
+    _repo: &str,
     node: &NodeInfo,
     _pipeline: &Pipeline,
     _config: &AppConfig,
