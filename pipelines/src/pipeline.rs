@@ -591,13 +591,11 @@ mod tests {
       }
     }
 
-    let path = workspace_root
-      .join(".jefferies")
-      .join("main-pr-pipeline.yaml");
+    let path = workspace_root.join(".jefferies").join("pr.yaml");
     let yaml_content = fs::read_to_string(&path).expect("Should be able to read the pipeline file");
 
-    let pipeline = Pipeline::from_yaml(&yaml_content)
-      .expect("Should successfully parse .jefferies/main-pr-pipeline.yaml");
+    let pipeline =
+      Pipeline::from_yaml(&yaml_content).expect("Should successfully parse .jefferies/pr.yaml");
 
     assert_eq!(pipeline.name, "Jefferies Main PR Pipeline");
     assert!(

@@ -96,6 +96,7 @@ async fn reclaim_orphaned_runs(
         pipeline_yaml: String::new(),
         created_at: Utc::now(),
         retry_of: None,
+        tenant_slug: None,
       },
     )
     .await

@@ -93,6 +93,7 @@ pub struct PipelineStartRecord {
   pub pipeline_definition: String,
   pub created_at: DateTime<Utc>,
   pub retry_of: Option<String>,
+  pub tenant_slug: Option<String>,
 }
 
 pub struct PipelineRunRecord {
@@ -111,6 +112,7 @@ pub struct PipelineRunRecord {
   pub created_at: DateTime<Utc>,
   pub completed_at: Option<DateTime<Utc>>,
   pub retry_of: Option<String>,
+  pub tenant_slug: Option<String>,
 }
 
 pub struct NodeDispatchRecord {
@@ -149,6 +151,7 @@ pub struct PipelineRunRow {
   pub created_at: DateTime<Utc>,
   pub completed_at: Option<DateTime<Utc>>,
   pub retry_of: Option<Uuid>,
+  pub tenant_slug: Option<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -303,8 +306,8 @@ impl RunHistory for PostgresRunHistory {
     sqlx::query(
       "INSERT INTO pipeline_runs \
        (run_id, pipeline_name, owner, repo, sha, branch, target_branch, tag, pr_number, \
-        trigger, pipeline_definition, created_at, retry_of) \
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (run_id) DO NOTHING",
+        trigger, pipeline_definition, created_at, retry_of, tenant_slug) \
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (run_id) DO NOTHING",
     )
     .bind(run_id)
     .bind(&r.pipeline_name)
@@ -319,6 +322,7 @@ impl RunHistory for PostgresRunHistory {
     .bind(&r.pipeline_definition)
     .bind(r.created_at)
     .bind(retry_of)
+    .bind(r.tenant_slug.as_deref())
     .execute(&self.pool)
     .await?;
     Ok(())
@@ -330,8 +334,8 @@ impl RunHistory for PostgresRunHistory {
     sqlx::query(
       "INSERT INTO pipeline_runs \
        (run_id, pipeline_name, owner, repo, sha, branch, target_branch, tag, pr_number, \
-        trigger, pipeline_definition, status, created_at, completed_at, retry_of) \
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+        trigger, pipeline_definition, status, created_at, completed_at, retry_of, tenant_slug) \
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
        ON CONFLICT (run_id) DO UPDATE SET \
          status = EXCLUDED.status, \
          completed_at = EXCLUDED.completed_at",
@@ -351,6 +355,7 @@ impl RunHistory for PostgresRunHistory {
     .bind(r.created_at)
     .bind(r.completed_at)
     .bind(retry_of)
+    .bind(r.tenant_slug.as_deref())
     .execute(&self.pool)
     .await?;
     Ok(())

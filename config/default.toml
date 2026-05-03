@@ -43,11 +43,3 @@ port = 5432
 db = "postgres"
 username = ""
 password = ""
-
-# These are placeholder values overridden in production via JEFFERIES__GITHUB__* env vars
-[github]
-app_id = ""
-webhook_secret = ""
-client_id = ""
-client_secret = ""
-private_key = ""

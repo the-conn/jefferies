@@ -59,10 +59,9 @@ JEFFERIES__RABBITMQ__URL=...
 JEFFERIES__RABBITMQ__USER=...
 JEFFERIES__RABBITMQ__PASSWORD=...
 
-# GitHub Integration
-JEFFERIES__GITHUB__APP_ID=...
-JEFFERIES__GITHUB__WEBHOOK_SECRET=...
-JEFFERIES__GITHUB__PRIVATE_KEY=...
+# Tenancy (per-tenant GitHub App credentials are loaded from the YAML file
+# below, mounted via Vault. See "Tenancy Configuration" for the schema.)
+JEFFERIES__TENANCY__PATH=/etc/jefferies/tenancy/tenants.yaml
 
 # S3 / NooBaa Storage
 JEFFERIES__S3__ENDPOINT=...
@@ -92,6 +91,49 @@ JEFFERIES__PIPELINE__DEFAULT_NODE_TIMEOUT_SECS=600
 JEFFERIES__PIPELINE__DEFAULT_NODE_STARTUP_TIMEOUT_SECS=300
 JEFFERIES__PIPELINE__FAIL_FAST=true
 ```
+
+---
+
+### **Tenancy Configuration**
+
+A single backend deployment can serve multiple GitHub Apps (one per tenant/org). Per-tenant credentials live in a YAML file mounted into the pod via the Vault Agent Injector — the same pattern used for pipeline secrets. The default mount path is `/etc/jefferies/tenancy/tenants.yaml`; override with `JEFFERIES__TENANCY__PATH`.
+
+**File schema:**
+
+```yaml
+tenants:
+  - slug: the-conn          # required; lowercase a-z, 0-9, '-'; max 63 chars; starts alnum
+    display_name: "..."     # optional; surfaced to operators / UI
+    provider: github        # discriminator (only `github` today)
+    app_id: "12345"         # GitHub App ID
+    webhook_secret: "..."   # GitHub App webhook secret
+    private_key: |
+      -----BEGIN RSA PRIVATE KEY-----
+      ...
+      -----END RSA PRIVATE KEY-----
+```
+
+Each tenant's GitHub App must point its webhook URL at `https://<backend>/webhooks/github/<slug>` so the inbound request carries the slug in the path. The slug is resolved before HMAC verification, so the correct per-tenant webhook secret is used.
+
+**Vault mount (deployment annotations):**
+
+```yaml
+metadata:
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/agent-pre-populate-only: "true"
+    vault.hashicorp.com/role: "jefferies-backend"
+
+    vault.hashicorp.com/agent-inject-secret-tenants: "secret/data/jefferies/tenancy"
+    vault.hashicorp.com/agent-inject-template-tenants: |
+      {{- with secret "secret/data/jefferies/tenancy" -}}
+      {{ .Data.data.yaml }}
+      {{- end -}}
+    vault.hashicorp.com/agent-inject-file-tenants: "tenants.yaml"
+    vault.hashicorp.com/secret-volume-path-tenants: "/etc/jefferies/tenancy"
+```
+
+The Vault role (`jefferies-backend` above) must be bound in Vault's Kubernetes auth method to the backend's ServiceAccount + namespace, with a policy granting `read` on `secret/data/jefferies/tenancy`. Adding or rotating a tenant requires updating the Vault secret and restarting the backend pod (no hot-reload yet).
 
 ---
 

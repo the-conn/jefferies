@@ -3183,6 +3183,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "state_store",
+ "tenancy",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3827,12 +3828,16 @@ dependencies = [
  "chrono",
  "coordinator",
  "futures-util",
+ "hex",
+ "hmac 0.13.0",
  "http-body-util",
  "providers",
  "run_history",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "state_store",
+ "tenancy",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -4317,6 +4322,15 @@ dependencies = [
  "cfg-if",
  "futures-io",
  "reactor-trait 2.8.0",
+]
+
+[[package]]
+name = "tenancy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde-saphyr",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
