@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use app_config::AppConfig;
+use async_trait::async_trait;
 use backplane::{Backplane, BackplaneEvent};
 use chrono::{DateTime, Utc};
 use pipelines::{NodeInfo, Pipeline};
@@ -39,6 +40,12 @@ pub struct CoordinatorServices {
   pub state_store: Arc<dyn StateStore>,
   pub backplane: Arc<dyn Backplane>,
   pub run_history: Arc<dyn RunHistory>,
+  pub status_reporter: Option<Arc<dyn RunStatusReporter>>,
+}
+
+#[async_trait]
+pub trait RunStatusReporter: Send + Sync {
+  async fn report_completed(&self, status: RunStatus);
 }
 
 pub struct RunSummary {
@@ -75,6 +82,7 @@ struct Coordinator {
   server_id: String,
   run_context: RunContext,
   run_history: Arc<dyn RunHistory>,
+  status_reporter: Option<Arc<dyn RunStatusReporter>>,
   pod_watcher_handle: Option<JoinHandle<()>>,
   signal_relay_handle: Option<JoinHandle<()>>,
   watcher_cmd_tx: Option<mpsc::Sender<WatcherCommand>>,
@@ -143,6 +151,7 @@ pub async fn start_coordinator(
     server_id,
     run_context,
     run_history: services.run_history,
+    status_reporter: services.status_reporter,
     pod_watcher_handle,
     signal_relay_handle,
     watcher_cmd_tx,
@@ -252,7 +261,7 @@ impl Coordinator {
 
     if self.run.is_complete() {
       let status = self.outcome_status();
-      self.record_history(status).await;
+      self.finalize_run(status).await;
       self.cleanup().await;
       return self.build_summary(status).await;
     }
@@ -265,7 +274,7 @@ impl Coordinator {
             timeout_secs = pipeline_timeout_secs,
             "Pipeline timeout exceeded"
           );
-          self.record_history(RunStatus::Failure).await;
+          self.finalize_run(RunStatus::Failure).await;
           self.cleanup().await;
           return self.terminate_running_nodes(RunStatus::Failure).await;
         }
@@ -283,7 +292,7 @@ impl Coordinator {
           match msg {
             Some(CoordinatorMessage::NodeTimedOut { node_name }) => {
               if self.handle_node_timed_out(&node_name).await {
-                self.record_history(RunStatus::Failure).await;
+                self.finalize_run(RunStatus::Failure).await;
                 self.cleanup().await;
                 return self.terminate_running_nodes(RunStatus::Failure).await;
               }
@@ -296,7 +305,7 @@ impl Coordinator {
             }
             Some(CoordinatorMessage::NodeInfraFailed { node_name, reason }) => {
               if self.handle_node_infra_failed(&node_name, &reason).await {
-                self.record_history(RunStatus::Failure).await;
+                self.finalize_run(RunStatus::Failure).await;
                 self.cleanup().await;
                 return self.terminate_running_nodes(RunStatus::Failure).await;
               }
@@ -306,7 +315,7 @@ impl Coordinator {
             }
             Some(CoordinatorMessage::NodePodStartTimedOut { node_name }) => {
               if self.handle_pod_start_timed_out(&node_name).await {
-                self.record_history(RunStatus::Failure).await;
+                self.finalize_run(RunStatus::Failure).await;
                 self.cleanup().await;
                 return self.terminate_running_nodes(RunStatus::Failure).await;
               }
@@ -322,7 +331,7 @@ impl Coordinator {
             Some(BackplaneEvent::NodeCompleted { node_name, success }) => {
               self.cancel_node_timeout(&node_name);
               if self.handle_node_completed(&node_name, success).await {
-                self.record_history(RunStatus::Failure).await;
+                self.finalize_run(RunStatus::Failure).await;
                 self.cleanup().await;
                 return self.terminate_running_nodes(RunStatus::Failure).await;
               }
@@ -332,13 +341,13 @@ impl Coordinator {
             }
             Some(BackplaneEvent::Cancel) => {
               info!(run_id = %self.run_id, "Received Cancel event from backplane");
-              self.record_history(RunStatus::Cancelled).await;
+              self.finalize_run(RunStatus::Cancelled).await;
               self.cleanup().await;
               return self.terminate_running_nodes(RunStatus::Cancelled).await;
             }
             None => {
               warn!(run_id = %self.run_id, "Backplane subscription closed unexpectedly");
-              self.record_history(RunStatus::Failure).await;
+              self.finalize_run(RunStatus::Failure).await;
               self.cleanup().await;
               return self.terminate_running_nodes(RunStatus::Failure).await;
             }
@@ -348,7 +357,7 @@ impl Coordinator {
     }
 
     let status = self.outcome_status();
-    self.record_history(status).await;
+    self.finalize_run(status).await;
     self.cleanup().await;
     self.build_summary(status).await
   }
@@ -852,6 +861,13 @@ impl Coordinator {
     }
   }
 
+  async fn finalize_run(&mut self, status: RunStatus) {
+    self.record_history(status).await;
+    if let Some(reporter) = self.status_reporter.as_ref() {
+      reporter.report_completed(status).await;
+    }
+  }
+
   async fn record_running_node_terminated(&self, node_name: &str) {
     let node_definition = self
       .node_info_cache
@@ -1236,6 +1252,7 @@ nodes:
         state_store,
         backplane,
         run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
       },
       RunContext {
         owner: String::new(),
@@ -1280,6 +1297,7 @@ nodes:
         state_store,
         backplane,
         run_history: run_history.clone(),
+        status_reporter: None,
       },
       make_run_context(),
     )
@@ -1365,6 +1383,7 @@ nodes:
         state_store,
         backplane,
         run_history: run_history.clone(),
+        status_reporter: None,
       },
       make_run_context(),
     )
@@ -1453,6 +1472,7 @@ nodes:
         state_store,
         backplane,
         run_history: run_history.clone(),
+        status_reporter: None,
       },
       make_run_context(),
     )
@@ -1501,6 +1521,7 @@ nodes:
         state_store,
         backplane,
         run_history: run_history.clone(),
+        status_reporter: None,
       },
       make_run_context(),
     )
@@ -1557,6 +1578,7 @@ nodes:
         state_store,
         backplane,
         run_history: run_history.clone(),
+        status_reporter: None,
       },
       make_run_context(),
     )
@@ -1644,6 +1666,7 @@ nodes:
         state_store,
         backplane,
         run_history: run_history.clone(),
+        status_reporter: None,
       },
       make_run_context(),
     )
@@ -1719,6 +1742,7 @@ nodes:
         state_store,
         backplane,
         run_history: run_history.clone(),
+        status_reporter: None,
       },
       make_run_context(),
     )
@@ -1776,6 +1800,7 @@ nodes:
         state_store,
         backplane,
         run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
       },
       RunContext {
         owner: String::new(),

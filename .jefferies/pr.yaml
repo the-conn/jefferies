@@ -8,7 +8,6 @@ on:
 nodes:
   - name: Run CI Checks
     image: quay.io/the-conn/jefferies-test
-    after: ["Build Test Image"]
     checkout: true
     memory: 4Gi
     cpu: "4"

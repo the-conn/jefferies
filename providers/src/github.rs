@@ -1,5 +1,6 @@
 use std::{fmt::Debug, sync::Arc};
 
+use async_trait::async_trait;
 use axum::{
   Json,
   body::Bytes,
@@ -7,16 +8,19 @@ use axum::{
   http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
-use coordinator::RunContext;
+use coordinator::{RunContext, RunStatusReporter};
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::EncodingKey;
 use octocrab::{
   Octocrab,
-  models::webhook_events::{
-    WebhookEvent, WebhookEventPayload, payload::PullRequestWebhookEventAction,
+  models::{
+    CheckRunId,
+    webhook_events::{WebhookEvent, WebhookEventPayload, payload::PullRequestWebhookEventAction},
   },
+  params::checks::{CheckRunConclusion, CheckRunStatus},
 };
 use pipelines::Pipeline;
+use run_history::RunStatus;
 use serde::{Serialize, de::Error};
 use sha2::Sha256;
 use tenancy::{GithubTenantConfig, TenantConfig, TenantProvider};
@@ -379,6 +383,16 @@ async fn launch_coordinator_for_pipeline(
     return None;
   }
 
+  let status_reporter = create_check_run_reporter(
+    install_crab,
+    &run_context.owner,
+    &run_context.repo,
+    &run_context.sha,
+    &run_id,
+    pipeline.name(),
+  )
+  .await;
+
   let pipeline_arc = Arc::new(pipeline.clone());
   let handle = coordinator::start_coordinator(
     run_id.clone(),
@@ -389,6 +403,7 @@ async fn launch_coordinator_for_pipeline(
       state_store: state.state_store.clone(),
       backplane: state.backplane.clone(),
       run_history: state.run_history.clone(),
+      status_reporter,
     },
     run_context,
   )
@@ -446,6 +461,80 @@ async fn build_installation_client(
     .await?;
 
   Ok(app_crab.installation(installation.id)?)
+}
+
+struct GithubCheckRunReporter {
+  crab: Octocrab,
+  owner: String,
+  repo: String,
+  check_run_id: CheckRunId,
+}
+
+#[async_trait]
+impl RunStatusReporter for GithubCheckRunReporter {
+  async fn report_completed(&self, status: RunStatus) {
+    let conclusion = match status {
+      RunStatus::Success => CheckRunConclusion::Success,
+      RunStatus::Failure => CheckRunConclusion::Failure,
+      RunStatus::Cancelled => CheckRunConclusion::Cancelled,
+      RunStatus::InProgress => CheckRunConclusion::Neutral,
+    };
+    if let Err(e) = self
+      .crab
+      .checks(&self.owner, &self.repo)
+      .update_check_run(self.check_run_id)
+      .status(CheckRunStatus::Completed)
+      .conclusion(conclusion)
+      .completed_at(Utc::now())
+      .send()
+      .await
+    {
+      warn!(
+        owner = %self.owner,
+        repo = %self.repo,
+        check_run_id = self.check_run_id.0,
+        error = %e,
+        "Failed to update GitHub check run on completion"
+      );
+    }
+  }
+}
+
+async fn create_check_run_reporter(
+  crab: &Octocrab,
+  owner: &str,
+  repo: &str,
+  sha: &str,
+  run_id: &str,
+  pipeline_name: &str,
+) -> Option<Arc<dyn RunStatusReporter>> {
+  match crab
+    .checks(owner, repo)
+    .create_check_run(pipeline_name, sha)
+    .external_id(run_id)
+    .status(CheckRunStatus::InProgress)
+    .send()
+    .await
+  {
+    Ok(check_run) => Some(Arc::new(GithubCheckRunReporter {
+      crab: crab.clone(),
+      owner: owner.to_string(),
+      repo: repo.to_string(),
+      check_run_id: check_run.id,
+    })),
+    Err(e) => {
+      warn!(
+        owner,
+        repo,
+        sha,
+        pipeline_name,
+        error = %e,
+        "Failed to create GitHub check run; continuing without check reporting \
+         (does this tenant's GH App have checks:write?)"
+      );
+      None
+    }
+  }
 }
 
 async fn find_matching_pipelines<F>(

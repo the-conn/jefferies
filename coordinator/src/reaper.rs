@@ -83,6 +83,7 @@ async fn reclaim_orphaned_runs(
         state_store: state_store.clone(),
         backplane: backplane.clone(),
         run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
       },
       RunContext {
         owner: String::new(),
