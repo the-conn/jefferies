@@ -47,10 +47,14 @@ pub enum ServerError {
   ConnectionFailed(String),
 }
 
-fn public_routes() -> Router<Arc<ProviderState>> {
+fn health_routes() -> Router<Arc<ProviderState>> {
   Router::new()
     .route("/health/live", get(health_live))
     .route("/health/ready", get(health_ready))
+}
+
+fn public_routes() -> Router<Arc<ProviderState>> {
+  Router::new()
     .route(
       "/api/v1/runs/{run_id}/nodes/{node_name}/poke",
       post(handle_node_poke),
@@ -91,14 +95,16 @@ fn build_router(state: Arc<ProviderState>, auth_router_state: AuthRouterState) -
 
   let protected = protected_routes().route_layer(from_extractor::<AuthorizedTenant>());
 
-  let main = Router::new()
+  let traced = Router::new()
     .merge(public_routes())
     .merge(protected)
-    .with_state(state);
-
-  main
+    .with_state(state.clone())
     .nest("/api/auth", auth::auth_router(auth_router_state))
-    .layer(trace)
+    .layer(trace);
+
+  Router::new()
+    .merge(traced)
+    .merge(health_routes().with_state(state))
     .layer(cors)
 }
 
@@ -118,7 +124,7 @@ fn make_span(request: &axum::http::Request<axum::body::Body>) -> tracing::Span {
   tracing::info_span!(
     "http_request",
     method = %request.method(),
-    uri = %request.uri(),
+    path = %request.uri().path(),
     trace_id = %trace_id,
   )
 }
@@ -627,6 +633,7 @@ mod tests {
   fn router_for_tests(state: Arc<ProviderState>) -> Router {
     let cors = build_cors_layer();
     let main = Router::new()
+      .merge(health_routes())
       .merge(public_routes())
       .merge(protected_routes())
       .with_state(state);
@@ -640,6 +647,7 @@ mod tests {
       .with_secure(false);
     let protected = protected_routes().route_layer(from_extractor::<AuthorizedTenant>());
     let main = Router::new()
+      .merge(health_routes())
       .merge(public_routes())
       .merge(protected)
       .with_state(state);

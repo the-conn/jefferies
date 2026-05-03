@@ -173,11 +173,7 @@ async fn callback(
     .and_then(|n| n.get(None).map(|v| v.as_str().to_string()));
 
   let groups = extract_groups(&id_token.to_string());
-  let authorized_slugs: Vec<String> = groups
-    .iter()
-    .filter(|g| state.tenants.by_slug(g).is_some())
-    .cloned()
-    .collect();
+  let authorized_slugs = resolve_authorized_slugs(&groups, &state.tenants);
   info!(
     user_id,
     ?groups,
@@ -273,6 +269,22 @@ async fn active_tenant(session: Session, Json(body): Json<ActiveTenantBody>) -> 
   StatusCode::NO_CONTENT.into_response()
 }
 
+fn org_from_group(group: &str) -> &str {
+  group.split_once(':').map(|(org, _)| org).unwrap_or(group)
+}
+
+fn resolve_authorized_slugs(groups: &[String], tenants: &TenantRegistry) -> Vec<String> {
+  let mut authorized: Vec<String> = Vec::new();
+  let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+  for group in groups {
+    let org = org_from_group(group);
+    if tenants.by_slug(org).is_some() && seen.insert(org.to_string()) {
+      authorized.push(org.to_string());
+    }
+  }
+  authorized
+}
+
 fn extract_groups(jwt: &str) -> Vec<String> {
   let mut parts = jwt.split('.');
   let _ = parts.next();
@@ -298,4 +310,88 @@ fn extract_groups(jwt: &str) -> Vec<String> {
         .collect()
     })
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+  use tenancy::{
+    GithubTenantConfig, TenancyDocument, TenantConfig, TenantProvider, TenantRegistry,
+  };
+
+  use super::*;
+
+  fn registry_with(slugs: &[&str]) -> TenantRegistry {
+    let tenants = slugs
+      .iter()
+      .map(|slug| TenantConfig {
+        slug: (*slug).to_string(),
+        display_name: None,
+        provider: TenantProvider::Github(GithubTenantConfig {
+          app_id: "1".to_string(),
+          webhook_secret: "shh".to_string(),
+          private_key: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+            .to_string(),
+        }),
+      })
+      .collect();
+    TenantRegistry::from_document(TenancyDocument { tenants }).expect("valid registry")
+  }
+
+  fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|s| (*s).to_string()).collect()
+  }
+
+  #[test]
+  fn org_from_group_strips_team_suffix() {
+    assert_eq!(org_from_group("the-conn:eng"), "the-conn");
+  }
+
+  #[test]
+  fn org_from_group_returns_input_when_no_colon() {
+    assert_eq!(org_from_group("the-conn"), "the-conn");
+  }
+
+  #[test]
+  fn org_from_group_handles_empty_team_suffix() {
+    assert_eq!(org_from_group("the-conn:"), "the-conn");
+  }
+
+  #[test]
+  fn org_from_group_splits_on_first_colon() {
+    assert_eq!(org_from_group("the-conn:nested:team"), "the-conn");
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_matches_team_prefixed_groups() {
+    let tenants = registry_with(&["the-conn"]);
+    let groups = strings(&["the-conn:eng", "the-conn:ops"]);
+    assert_eq!(
+      resolve_authorized_slugs(&groups, &tenants),
+      vec!["the-conn"]
+    );
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_dedupes_repeat_orgs() {
+    let tenants = registry_with(&["the-conn"]);
+    let groups = strings(&["the-conn", "the-conn:eng", "the-conn:ops"]);
+    assert_eq!(
+      resolve_authorized_slugs(&groups, &tenants),
+      vec!["the-conn"]
+    );
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_drops_unregistered_orgs() {
+    let tenants = registry_with(&["alpha"]);
+    let groups = strings(&["beta:eng", "alpha:ops", "gamma"]);
+    assert_eq!(resolve_authorized_slugs(&groups, &tenants), vec!["alpha"]);
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_returns_empty_when_no_match() {
+    let tenants = registry_with(&["alpha"]);
+    let groups = strings(&["beta:eng"]);
+    assert!(resolve_authorized_slugs(&groups, &tenants).is_empty());
+  }
 }
