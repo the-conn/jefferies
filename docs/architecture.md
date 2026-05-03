@@ -16,7 +16,7 @@
 #### **A'. tenancy (The Multi-Tenant Provider Registry)**
 * **Per-Tenant Credentials:** Loads a YAML document from a Vault-mounted file (default `/etc/jefferies/tenancy/tenants.yaml`, overridable via `JEFFERIES__TENANCY__PATH`) that holds one entry per tenant with its provider type and credentials.
 * **GitHub App Registry:** Each tenant entry currently carries a `slug`, optional `display_name`, and a `provider: github` block with `app_id`, `webhook_secret`, and `private_key`. The serde-tagged `provider` discriminator reserves the schema for future providers (`gitlab`, etc.) without breaking existing entries.
-* **Lookup by Slug:** Webhooks arrive at `/webhooks/github/{tenant_slug}`, allowing the correct webhook secret to be selected before HMAC verification (no body parsing required pre-auth). Run records persist `tenant_slug` so retries can re-resolve the tenant after a pod restart.
+* **Lookup by Owner:** Webhooks arrive at `/webhooks/github` (a single endpoint shared by all tenants — required because one GitHub App serves many orgs and webhooks all funnel through one URL). The backend extracts the owner login and type from the event body (`repository.owner.{login,type}`, `organization.login`, or `installation.account.{login,type}`), drops the event if the owner type is not `Organization`, then looks up the tenant by `slug == owner.login`, and only then validates HMAC against that tenant's `webhook_secret`. Tenant slugs are therefore required to equal the GitHub organization login, and personal-account webhooks are rejected even if a User login happens to match a slug. Run records persist `tenant_slug` so retries can re-resolve the tenant after a pod restart.
 * **Validation at Load:** Slugs are restricted to lowercase alnum + `-`, max 63 chars, must start alnum, and must be unique. `app_id` must parse as `u64`; `webhook_secret` and `private_key` must be non-empty. Bad config fails the pod fast at startup.
 * **Out of Scope (Today):** OAuth/OIDC user authentication (will be handled by Dex with its own GitHub OAuth credentials, not this registry), hot-reload of the tenancy file, per-tenant Vault role automation, and per-tenant `state_store` / `backplane` key namespacing.
 
@@ -78,7 +78,7 @@
 
 ### **3. Data & Execution Flow**
 
-1.  **Ingress:** A Webhook hits a **server** node at `/webhooks/github/{tenant_slug}`. **providers** resolves the tenant via the **tenancy** registry, validates the HMAC against that tenant's webhook secret, and reads the pipeline YAML using the tenant's GitHub App installation token.
+1.  **Ingress:** A Webhook hits a **server** node at `/webhooks/github`. **providers** extracts the owner login from the payload, resolves the tenant via the **tenancy** registry (slug == owner), validates the HMAC against that tenant's webhook secret, and reads the pipeline YAML using the tenant's GitHub App installation token.
 2.  **Source Upload:** If the pipeline has any node with `checkout: true`, **providers** calls the **SourceManager** to stream the repository tarball from GitHub directly to S3 at `runs/{run_id}/source.tar.gz` before the coordinator is started.
 3.  **Initialization:** **coordinator** acquires a Redis lease and persists the initial `RunState`. All nodes with no dependencies are dispatched immediately. The **Dispatcher** uses the **SourceManager** to generate presigned URLs that are passed to each worker as environment variables.
 4.  **Execution Loop:**
@@ -125,7 +125,7 @@ flowchart TD
         KDISP --> POD_A & POD_B
     end
 
-    GH -->|POST /webhooks/github/&#123;tenant_slug&#125;| SRV
+    GH -->|POST /webhooks/github| SRV
     SRV -->|stream repo tarball to S3| S3
     SRV --> COORD_INIT
     COORD_INIT -.->|heartbeat every 15 s| REDIS

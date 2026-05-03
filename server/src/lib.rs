@@ -69,10 +69,7 @@ fn router(state: Arc<ProviderState>) -> Router {
       "/api/v1/runs/{run_id}/retry",
       post(GithubProvider::retry_run),
     )
-    .route(
-      "/webhooks/github/{tenant_slug}",
-      post(GithubProvider::handle_webhook),
-    )
+    .route("/webhooks/github", post(GithubProvider::handle_webhook))
     .layer(
       TraceLayer::new_for_http()
         .make_span_with(make_span)
@@ -769,16 +766,26 @@ mod tests {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
   }
 
+  fn org_repo_body(login: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+      "repository": {
+        "owner": { "login": login, "type": "Organization" },
+        "name": "repo"
+      }
+    }))
+    .unwrap()
+  }
+
   #[tokio::test]
-  async fn webhook_unknown_tenant_returns_404() {
+  async fn webhook_for_unregistered_org_returns_200_and_drops() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
     let app = router(state);
-    let body = b"{}".to_vec();
+    let body = org_repo_body("outsider");
     let response = app
       .oneshot(
         Request::builder()
           .method("POST")
-          .uri("/webhooks/github/unknown-tenant")
+          .uri("/webhooks/github")
           .header("X-GitHub-Event", "push")
           .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
           .body(Body::from(body))
@@ -786,21 +793,71 @@ mod tests {
       )
       .await
       .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn webhook_for_user_owner_returns_200_and_drops() {
+    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let app = router(state);
+    let body = serde_json::to_vec(&serde_json::json!({
+      "repository": {
+        "owner": { "login": "the-conn", "type": "User" },
+        "name": "personal-fork"
+      }
+    }))
+    .unwrap();
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github")
+          .header("X-GitHub-Event", "push")
+          .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn webhook_for_owner_with_missing_type_returns_200_and_drops() {
+    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let app = router(state);
+    let body = serde_json::to_vec(&serde_json::json!({
+      "repository": { "owner": { "login": "the-conn" }, "name": "repo" }
+    }))
+    .unwrap();
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github")
+          .header("X-GitHub-Event", "push")
+          .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
   }
 
   #[tokio::test]
   async fn webhook_bad_signature_returns_401() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
     let app = router(state);
+    let body = org_repo_body("the-conn");
     let response = app
       .oneshot(
         Request::builder()
           .method("POST")
-          .uri("/webhooks/github/the-conn")
+          .uri("/webhooks/github")
           .header("X-GitHub-Event", "push")
           .header("X-Hub-Signature-256", "sha256=deadbeef")
-          .body(Body::from("{}"))
+          .body(Body::from(body))
           .unwrap(),
       )
       .await
@@ -815,13 +872,13 @@ mod tests {
       sample_github_tenant("beta", "beta-secret"),
     ]);
     let app = router(state);
-    let body = b"{}".to_vec();
+    let body = org_repo_body("beta");
     let signature_with_alpha_secret = hmac_sha256_hex("alpha-secret", &body);
     let response = app
       .oneshot(
         Request::builder()
           .method("POST")
-          .uri("/webhooks/github/beta")
+          .uri("/webhooks/github")
           .header("X-GitHub-Event", "push")
           .header("X-Hub-Signature-256", signature_with_alpha_secret)
           .body(Body::from(body))
@@ -836,13 +893,33 @@ mod tests {
   async fn webhook_unhandled_event_acks_with_200() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
     let app = router(state);
+    let body = org_repo_body("the-conn");
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github")
+          .header("X-GitHub-Event", "ping")
+          .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn webhook_without_owner_acks_with_200() {
+    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let app = router(state);
     let body = b"{}".to_vec();
     let response = app
       .oneshot(
         Request::builder()
           .method("POST")
-          .uri("/webhooks/github/the-conn")
-          .header("X-GitHub-Event", "ping")
+          .uri("/webhooks/github")
+          .header("X-GitHub-Event", "push")
           .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
           .body(Body::from(body))
           .unwrap(),

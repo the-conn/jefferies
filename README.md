@@ -113,7 +113,9 @@ tenants:
       -----END RSA PRIVATE KEY-----
 ```
 
-Each tenant's GitHub App must point its webhook URL at `https://<backend>/webhooks/github/<slug>` so the inbound request carries the slug in the path. The slug is resolved before HMAC verification, so the correct per-tenant webhook secret is used.
+Each tenant's GitHub App points its webhook URL at `https://<backend>/webhooks/github`. The backend resolves the tenant by reading the owner login out of the event payload (`repository.owner.login`, `organization.login`, or `installation.account.login` for installation events) and matching it against `tenant.slug`, so the slug must equal the GitHub organization login. HMAC is then verified using that tenant's `webhook_secret`. Multiple tenants may share a single GitHub App — they will share the same `app_id`, `private_key`, and `webhook_secret` values across their `tenants.yaml` entries.
+
+Only **organization** owners are allowed. A webhook whose `repository.owner.type` (or `installation.account.type`) is `User` is dropped before tenant lookup, even if the login matches a slug. Personal forks of a tenant repo, repos owned by a user account whose login was inadvertently added to `tenants.yaml`, and Apps installed on personal accounts are all rejected by this guard.
 
 **Vault mount (deployment annotations):**
 
