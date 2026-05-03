@@ -30,6 +30,7 @@ pub struct RunContext {
   pub pipeline_yaml: String,
   pub created_at: DateTime<Utc>,
   pub retry_of: Option<String>,
+  pub tenant_slug: Option<String>,
 }
 
 pub struct CoordinatorServices {
@@ -730,6 +731,7 @@ impl Coordinator {
       pipeline_definition: self.run_context.pipeline_yaml.clone(),
       created_at: self.run_context.created_at,
       retry_of: self.run_context.retry_of.clone(),
+      tenant_slug: self.run_context.tenant_slug.clone(),
     };
     if let Err(e) = self.run_history.record_pipeline_started(record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline start");
@@ -843,6 +845,7 @@ impl Coordinator {
       created_at: self.run_context.created_at,
       completed_at: Some(completed_at),
       retry_of: self.run_context.retry_of.clone(),
+      tenant_slug: self.run_context.tenant_slug.clone(),
     };
     if let Err(e) = self.run_history.record_pipeline_run(pipeline_record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
@@ -1167,6 +1170,7 @@ mod tests {
       pipeline_yaml: String::new(),
       created_at: Utc::now(),
       retry_of: None,
+      tenant_slug: None,
     }
   }
 
@@ -1245,6 +1249,7 @@ nodes:
         pipeline_yaml: String::new(),
         created_at: Utc::now(),
         retry_of: None,
+        tenant_slug: None,
       },
     )
     .await
@@ -1784,6 +1789,7 @@ nodes:
         pipeline_yaml: String::new(),
         created_at: Utc::now(),
         retry_of: None,
+        tenant_slug: None,
       },
     )
     .await;

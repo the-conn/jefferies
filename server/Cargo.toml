@@ -22,7 +22,10 @@ tenancy = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
 http-body-util = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 uuid = { workspace = true }

@@ -1,6 +1,5 @@
 use std::{fmt::Debug, sync::Arc};
 
-use app_config::AppConfig;
 use axum::{
   Json,
   body::Bytes,
@@ -20,6 +19,7 @@ use octocrab::{
 use pipelines::Pipeline;
 use serde::{Serialize, de::Error};
 use sha2::Sha256;
+use tenancy::{GithubTenantConfig, TenantConfig, TenantProvider};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -53,33 +53,43 @@ pub struct GithubProvider;
 impl GithubProvider {
   pub async fn handle_webhook(
     State(state): State<Arc<ProviderState>>,
+    Path(tenant_slug): Path<String>,
     headers: HeaderMap,
     body: Bytes,
   ) -> StatusCode {
+    let Some(tenant) = state.tenants.by_slug(&tenant_slug) else {
+      warn!(tenant_slug, "Webhook received for unknown tenant");
+      return StatusCode::NOT_FOUND;
+    };
+    let TenantProvider::Github(gh) = &tenant.provider;
+
     let signature = get_header(&headers, "X-Hub-Signature-256");
-    if !signature_matches(&body, &signature, state.config.github_webhook_secret()) {
-      warn!("Unauthorized webhook attempt: Signature mismatch");
+    if !signature_matches(&body, &signature, &gh.webhook_secret) {
+      warn!(
+        tenant_slug,
+        "Unauthorized webhook attempt: Signature mismatch"
+      );
       return StatusCode::UNAUTHORIZED;
     }
 
     let event_type = get_header(&headers, "X-GitHub-Event");
     match event_type.as_str() {
-      GITHUB_EVENT_PUSH => match handle_push(&body, state).await {
+      GITHUB_EVENT_PUSH => match handle_push(&body, tenant, state).await {
         Ok(status) => status,
         Err(e) => {
-          warn!(error = ?e, "Failed to handle push event");
+          warn!(tenant_slug, error = ?e, "Failed to handle push event");
           StatusCode::INTERNAL_SERVER_ERROR
         }
       },
-      GITHUB_EVENT_PULL_REQUEST => match handle_pull_request(&body, state).await {
+      GITHUB_EVENT_PULL_REQUEST => match handle_pull_request(&body, tenant, state).await {
         Ok(status) => status,
         Err(e) => {
-          warn!(error = ?e, "Failed to handle pull request event");
+          warn!(tenant_slug, error = ?e, "Failed to handle pull request event");
           StatusCode::INTERNAL_SERVER_ERROR
         }
       },
       _ => {
-        info!(event_type, "Received unsupported GitHub event");
+        info!(tenant_slug, event_type, "Received unsupported GitHub event");
         StatusCode::NOT_IMPLEMENTED
       }
     }
@@ -101,6 +111,19 @@ impl GithubProvider {
       }
     };
 
+    let Some(tenant_slug) = original.tenant_slug.clone() else {
+      warn!(run_id, "Retry requested for run without tenant_slug");
+      return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
+    };
+    let Some(tenant) = state.tenants.by_slug(&tenant_slug) else {
+      warn!(
+        run_id,
+        tenant_slug, "Retry requested for run whose tenant is no longer registered"
+      );
+      return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
+    };
+    let TenantProvider::Github(gh) = &tenant.provider;
+
     let pipeline = match Pipeline::from_yaml(&original.pipeline_definition) {
       Ok(p) => p,
       Err(e) => {
@@ -109,14 +132,13 @@ impl GithubProvider {
       }
     };
 
-    let install_crab =
-      match build_installation_client(&original.owner, &original.repo, &state.config).await {
-        Ok(c) => c,
-        Err(e) => {
-          warn!(run_id, error = %e, "Failed to build GitHub installation client for retry");
-          return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
-        }
-      };
+    let install_crab = match build_installation_client(&original.owner, &original.repo, gh).await {
+      Ok(c) => c,
+      Err(e) => {
+        warn!(run_id, error = %e, "Failed to build GitHub installation client for retry");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
+      }
+    };
 
     let run_context = RunContext {
       owner: original.owner,
@@ -130,6 +152,7 @@ impl GithubProvider {
       pipeline_yaml: original.pipeline_definition,
       created_at: Utc::now(),
       retry_of: Some(run_id),
+      tenant_slug: Some(tenant_slug),
     };
 
     match launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone())
@@ -144,7 +167,11 @@ impl GithubProvider {
   }
 }
 
-async fn handle_push(payload: &[u8], state: Arc<ProviderState>) -> Result<StatusCode, GithubError> {
+async fn handle_push(
+  payload: &[u8],
+  tenant: Arc<TenantConfig>,
+  state: Arc<ProviderState>,
+) -> Result<StatusCode, GithubError> {
   let event = WebhookEvent::try_from_header_and_body(GITHUB_EVENT_PUSH, payload)?;
   let WebhookEventPayload::Push(push_event) = event.specific else {
     return Err(GithubError::InvalidPayload(serde_json::Error::custom(
@@ -168,12 +195,13 @@ async fn handle_push(payload: &[u8], state: Arc<ProviderState>) -> Result<Status
   let repo_name = repo.name;
   let sha = push_event.after.clone();
 
-  start_push_pipelines(&owner, &repo_name, &sha, &push_event.r#ref, state).await?;
+  start_push_pipelines(&owner, &repo_name, &sha, &push_event.r#ref, tenant, state).await?;
   Ok(StatusCode::OK)
 }
 
 async fn handle_pull_request(
   payload: &[u8],
+  tenant: Arc<TenantConfig>,
   state: Arc<ProviderState>,
 ) -> Result<StatusCode, GithubError> {
   let event = WebhookEvent::try_from_header_and_body(GITHUB_EVENT_PULL_REQUEST, payload)?;
@@ -204,22 +232,25 @@ async fn handle_pull_request(
       ))
     })?
     .login;
-  let repo_name = head_repo.name;
-  let sha = pr.head.sha.clone();
-  let head_branch = pr.head.ref_field.clone();
-  let base_branch = pr.base.ref_field;
-  let pr_number = pr.number as i64;
-  start_pr_pipelines(
-    &owner,
-    &repo_name,
-    &sha,
-    &head_branch,
-    &base_branch,
-    pr_number,
-    state,
-  )
-  .await?;
+  let pr_event = PullRequestEventInfo {
+    owner,
+    repo: head_repo.name,
+    sha: pr.head.sha.clone(),
+    head_branch: pr.head.ref_field.clone(),
+    base_branch: pr.base.ref_field,
+    pr_number: pr.number as i64,
+  };
+  start_pr_pipelines(pr_event, tenant, state).await?;
   Ok(StatusCode::OK)
+}
+
+struct PullRequestEventInfo {
+  owner: String,
+  repo: String,
+  sha: String,
+  head_branch: String,
+  base_branch: String,
+  pr_number: i64,
 }
 
 async fn start_push_pipelines(
@@ -227,9 +258,11 @@ async fn start_push_pipelines(
   repo: &str,
   sha: &str,
   git_ref: &str,
+  tenant: Arc<TenantConfig>,
   state: Arc<ProviderState>,
 ) -> Result<(), GithubError> {
-  let install_crab = build_installation_client(owner, repo, &state.config).await?;
+  let TenantProvider::Github(gh) = &tenant.provider;
+  let install_crab = build_installation_client(owner, repo, gh).await?;
   let (branch, tag) = parse_push_ref(git_ref);
   let match_ref = branch.as_deref().unwrap_or(git_ref);
   let matching = find_matching_pipelines(&install_crab, owner, repo, sha, |pipeline| {
@@ -239,6 +272,7 @@ async fn start_push_pipelines(
 
   for (raw_yaml, pipeline) in matching {
     info!(
+      tenant_slug = %tenant.slug,
       pipeline_name = pipeline.name(),
       owner,
       repo,
@@ -259,6 +293,7 @@ async fn start_push_pipelines(
       pipeline_yaml: raw_yaml,
       created_at: Utc::now(),
       retry_of: None,
+      tenant_slug: Some(tenant.slug.clone()),
     };
     launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
@@ -267,43 +302,46 @@ async fn start_push_pipelines(
 }
 
 async fn start_pr_pipelines(
-  owner: &str,
-  repo: &str,
-  sha: &str,
-  head_branch: &str,
-  base_branch: &str,
-  pr_number: i64,
+  event: PullRequestEventInfo,
+  tenant: Arc<TenantConfig>,
   state: Arc<ProviderState>,
 ) -> Result<(), GithubError> {
-  let install_crab = build_installation_client(owner, repo, &state.config).await?;
-  let matching = find_matching_pipelines(&install_crab, owner, repo, sha, |pipeline| {
-    pipeline.triggered_by_pull_request(base_branch)
-  })
+  let TenantProvider::Github(gh) = &tenant.provider;
+  let install_crab = build_installation_client(&event.owner, &event.repo, gh).await?;
+  let matching = find_matching_pipelines(
+    &install_crab,
+    &event.owner,
+    &event.repo,
+    &event.sha,
+    |pipeline| pipeline.triggered_by_pull_request(&event.base_branch),
+  )
   .await?;
 
   for (raw_yaml, pipeline) in matching {
     info!(
+      tenant_slug = %tenant.slug,
       pipeline_name = pipeline.name(),
-      owner,
-      repo,
-      sha,
-      head_branch,
-      base_branch,
-      pr_number,
+      owner = %event.owner,
+      repo = %event.repo,
+      sha = %event.sha,
+      head_branch = %event.head_branch,
+      base_branch = %event.base_branch,
+      pr_number = event.pr_number,
       "Pipeline triggered by pull request event"
     );
     let run_context = RunContext {
-      owner: owner.to_string(),
-      repo: repo.to_string(),
-      sha: sha.to_string(),
-      branch: Some(head_branch.to_string()),
-      target_branch: Some(base_branch.to_string()),
+      owner: event.owner.clone(),
+      repo: event.repo.clone(),
+      sha: event.sha.clone(),
+      branch: Some(event.head_branch.clone()),
+      target_branch: Some(event.base_branch.clone()),
       tag: None,
-      pr_number: Some(pr_number),
+      pr_number: Some(event.pr_number),
       trigger: GITHUB_EVENT_PULL_REQUEST.to_string(),
       pipeline_yaml: raw_yaml,
       created_at: Utc::now(),
       retry_of: None,
+      tenant_slug: Some(tenant.slug.clone()),
     };
     launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
@@ -393,12 +431,12 @@ async fn launch_coordinator_for_pipeline(
 async fn build_installation_client(
   owner: &str,
   repo: &str,
-  config: &AppConfig,
+  github: &GithubTenantConfig,
 ) -> Result<Octocrab, GithubError> {
   let app_crab = Octocrab::builder()
     .app(
-      config.github_app_id().parse::<u64>()?.into(),
-      EncodingKey::from_rsa_pem(config.github_private_key().as_bytes())?,
+      github.app_id.parse::<u64>()?.into(),
+      EncodingKey::from_rsa_pem(github.private_key.as_bytes())?,
     )
     .build()?;
 

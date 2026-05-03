@@ -69,7 +69,10 @@ fn router(state: Arc<ProviderState>) -> Router {
       "/api/v1/runs/{run_id}/retry",
       post(GithubProvider::retry_run),
     )
-    .route("/webhooks/github", post(GithubProvider::handle_webhook))
+    .route(
+      "/webhooks/github/{tenant_slug}",
+      post(GithubProvider::handle_webhook),
+    )
     .layer(
       TraceLayer::new_for_http()
         .make_span_with(make_span)
@@ -548,6 +551,10 @@ mod tests {
   use super::*;
 
   fn make_test_state() -> Arc<ProviderState> {
+    make_test_state_with_tenants(vec![])
+  }
+
+  fn make_test_state_with_tenants(tenants: Vec<tenancy::TenantConfig>) -> Arc<ProviderState> {
     let config = Arc::new(AppConfig::load().expect("test config"));
     let state_store = InMemoryStateStore::new();
     let backplane = InMemoryBackplane::new();
@@ -558,8 +565,8 @@ mod tests {
     ));
     let run_history = Arc::new(NoOpRunHistory);
     let tenants = Arc::new(
-      tenancy::TenantRegistry::from_document(tenancy::TenancyDocument { tenants: vec![] })
-        .expect("empty registry"),
+      tenancy::TenantRegistry::from_document(tenancy::TenancyDocument { tenants })
+        .expect("test registry"),
     );
     Arc::new(ProviderState::new(
       config,
@@ -570,6 +577,28 @@ mod tests {
       run_history,
       tenants,
     ))
+  }
+
+  fn sample_github_tenant(slug: &str, webhook_secret: &str) -> tenancy::TenantConfig {
+    tenancy::TenantConfig {
+      slug: slug.to_string(),
+      display_name: None,
+      provider: tenancy::TenantProvider::Github(tenancy::GithubTenantConfig {
+        app_id: "12345".to_string(),
+        webhook_secret: webhook_secret.to_string(),
+        private_key: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+          .to_string(),
+      }),
+    }
+  }
+
+  fn hmac_sha256_hex(secret: &str, body: &[u8]) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    let mut mac =
+      Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key from any size");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
   }
 
   #[tokio::test]
@@ -738,5 +767,68 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+  }
+
+  #[tokio::test]
+  async fn webhook_unknown_tenant_returns_404() {
+    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let app = router(state);
+    let body = b"{}".to_vec();
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github/unknown-tenant")
+          .header("X-GitHub-Event", "push")
+          .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+  }
+
+  #[tokio::test]
+  async fn webhook_bad_signature_returns_401() {
+    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let app = router(state);
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github/the-conn")
+          .header("X-GitHub-Event", "push")
+          .header("X-Hub-Signature-256", "sha256=deadbeef")
+          .body(Body::from("{}"))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+  }
+
+  #[tokio::test]
+  async fn webhook_other_tenants_secret_returns_401() {
+    let state = make_test_state_with_tenants(vec![
+      sample_github_tenant("alpha", "alpha-secret"),
+      sample_github_tenant("beta", "beta-secret"),
+    ]);
+    let app = router(state);
+    let body = b"{}".to_vec();
+    let signature_with_alpha_secret = hmac_sha256_hex("alpha-secret", &body);
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github/beta")
+          .header("X-GitHub-Event", "push")
+          .header("X-Hub-Signature-256", signature_with_alpha_secret)
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
   }
 }
