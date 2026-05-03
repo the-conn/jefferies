@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+auth = { workspace = true }
 axum = { workspace = true }
 backplane = { workspace = true }
 chrono = { workspace = true }
@@ -19,6 +20,7 @@ app_config = { workspace = true }
 providers = { workspace = true }
 run_history = { workspace = true }
 tenancy = { workspace = true }
+tower-sessions = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }

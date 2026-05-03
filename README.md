@@ -90,6 +90,13 @@ JEFFERIES__PIPELINE__DEFAULT_PIPELINE_TIMEOUT_SECS=3600
 JEFFERIES__PIPELINE__DEFAULT_NODE_TIMEOUT_SECS=600
 JEFFERIES__PIPELINE__DEFAULT_NODE_STARTUP_TIMEOUT_SECS=300
 JEFFERIES__PIPELINE__FAIL_FAST=true
+
+# Dex (human authentication via OIDC)
+JEFFERIES__DEX__CLIENT_ID=...
+JEFFERIES__DEX__SECRET=...
+JEFFERIES__DEX__ISSUER=https://dex.the-conn.com
+JEFFERIES__DEX__REDIRECT_URI=https://the-conn.com/api/auth/callback
+JEFFERIES__DEX__POST_LOGIN_REDIRECT=/
 ```
 
 ---
@@ -136,6 +143,31 @@ metadata:
 ```
 
 The Vault role (`jefferies-backend` above) must be bound in Vault's Kubernetes auth method to the backend's ServiceAccount + namespace, with a policy granting `read` on `secret/data/jefferies/tenancy`. Adding or rotating a tenant requires updating the Vault secret and restarting the backend pod (no hot-reload yet).
+
+---
+
+### **Human Authentication (Dex)**
+
+Operator/UI authentication is delegated to **Dex**, deployed separately and registered as the OIDC provider for Jefferies. The backend is a standard OIDC client.
+
+**Flow:**
+1. The browser hits `GET /api/auth/login` (optionally with `?return_to=/some/path` — relative paths only). The backend generates state + PKCE + nonce, stores them in a server-side session record, and 302-redirects to Dex's authorize URL with scopes `openid profile email groups`.
+2. Dex authenticates the user against GitHub (using its own GitHub OAuth credentials), receives the user's org memberships from the GitHub API, and 302-redirects back to `GET /api/auth/callback` with `code` and `state`.
+3. The backend verifies state, exchanges the code for tokens (with PKCE), validates the ID token (signature, issuer, audience, nonce, exp), and reads the `groups` claim — a list of GitHub org logins.
+4. The backend intersects `groups` with the registered tenants in `tenants.yaml`. If empty → 403 with `{ "error": "no_authorized_tenants" }`. Otherwise the user gets a session with `authorized_slugs` populated and `active_tenant_context` defaulted to the first match. Browser is 302'd to `return_to` (validated relative path) or `JEFFERIES__DEX__POST_LOGIN_REDIRECT`.
+
+**Endpoints:**
+- `GET /api/auth/login` — initiates the OIDC flow.
+- `GET /api/auth/callback` — Dex redirects here.
+- `POST /api/auth/logout` — clears the session.
+- `GET /api/auth/me` — returns the current `AuthSession` JSON (`user_id`, `email`, `name`, `authorized_slugs`, `active_tenant_context`); 401 without a session.
+- `POST /api/auth/active-tenant` — body `{ "slug": "..." }`; updates `active_tenant_context`. 403 if slug not in `authorized_slugs`.
+
+**Sessions** are server-side, stored in the same Redis instance the rest of the backend uses (a dedicated `tower-sessions/` keyspace via `fred` — separate pool from the `state_store` deadpool). Session cookies are HttpOnly, Secure, SameSite=Lax, with a 7-day inactivity expiry.
+
+**Tenant-scoped routes** live under `/api/{slug}/...`. Every request to one of these is gated by an `AuthorizedTenant` extractor that checks the session's `authorized_slugs` against the URL slug. The handlers additionally scope data by slug (e.g. `GET /api/{slug}/runs` filters `run_history` by `owner == slug`; `GET /api/{slug}/runs/{run_id}` returns 404 if the run's `tenant_slug` does not match). The Tube callback `POST /api/v1/runs/{run_id}/nodes/{node_name}/poke` and webhooks at `/webhooks/github` are public — they do not flow through the session/auth layer.
+
+The deployment must make `JEFFERIES__DEX__ISSUER` reachable from the backend pod (the URL is used for both OIDC discovery and JWKS fetches during ID token validation).
 
 ---
 

@@ -43,3 +43,10 @@ port = 5432
 db = "postgres"
 username = ""
 password = ""
+
+[dex]
+client_id = ""
+secret = ""
+issuer = "https://dex.the-conn.com"
+redirect_uri = "https://the-conn.com/api/auth/callback"
+post_login_redirect = "/"

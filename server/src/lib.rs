@@ -1,10 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use app_config::AppConfig;
+use auth::{AuthError, AuthRouterState, AuthorizedTenant};
 use axum::{
   Json, Router,
   extract::{Path, Query, State},
   http::{HeaderMap, StatusCode},
+  middleware::from_extractor,
   routing::{get, post},
 };
 use backplane::RabbitmqBackplane;
@@ -39,49 +41,65 @@ pub enum ServerError {
   RunHistory(#[from] run_history::RunHistoryError),
   #[error("Tenancy configuration error: {0}")]
   Tenancy(#[from] tenancy::TenancyError),
+  #[error("Auth setup error: {0}")]
+  Auth(#[from] AuthError),
   #[error("Connection check failed: {0}")]
   ConnectionFailed(String),
 }
 
-fn router(state: Arc<ProviderState>) -> Router {
-  let cors = build_cors_layer();
-
-  let health_routes = Router::new()
+fn public_routes() -> Router<Arc<ProviderState>> {
+  Router::new()
     .route("/health/live", get(health_live))
-    .route("/health/ready", get(health_ready));
-
-  let api_routes = Router::new()
+    .route("/health/ready", get(health_ready))
     .route(
       "/api/v1/runs/{run_id}/nodes/{node_name}/poke",
       post(handle_node_poke),
     )
-    .route("/api/v1/runs/{run_id}/cancel", post(cancel_pipeline_run))
-    .route("/api/v1/runs/{run_id}/status", get(get_run_status))
-    .route("/api/v1/runs", get(list_runs))
-    .route("/api/v1/runs/{run_id}", get(get_run))
-    .route("/api/v1/runs/{run_id}/nodes", get(list_run_nodes))
-    .route("/api/v1/runs/{run_id}/nodes/{node_name}", get(get_run_node))
+    .route("/webhooks/github", post(GithubProvider::handle_webhook))
+}
+
+fn protected_routes() -> Router<Arc<ProviderState>> {
+  Router::new()
     .route(
-      "/api/v1/runs/{run_id}/nodes/{node_name}/logs",
+      "/api/{slug}/runs/{run_id}/cancel",
+      post(cancel_pipeline_run),
+    )
+    .route("/api/{slug}/runs/{run_id}/status", get(get_run_status))
+    .route("/api/{slug}/runs", get(list_runs))
+    .route("/api/{slug}/runs/{run_id}", get(get_run))
+    .route("/api/{slug}/runs/{run_id}/nodes", get(list_run_nodes))
+    .route(
+      "/api/{slug}/runs/{run_id}/nodes/{node_name}",
+      get(get_run_node),
+    )
+    .route(
+      "/api/{slug}/runs/{run_id}/nodes/{node_name}/logs",
       get(get_node_log),
     )
     .route(
-      "/api/v1/runs/{run_id}/retry",
+      "/api/{slug}/runs/{run_id}/retry",
       post(GithubProvider::retry_run),
     )
-    .route("/webhooks/github", post(GithubProvider::handle_webhook))
-    .layer(
-      TraceLayer::new_for_http()
-        .make_span_with(make_span)
-        .on_request(DefaultOnRequest::new().level(Level::INFO))
-        .on_response(DefaultOnResponse::new().level(Level::INFO)),
-    );
+}
 
-  Router::new()
-    .merge(health_routes)
-    .merge(api_routes)
+fn build_router(state: Arc<ProviderState>, auth_router_state: AuthRouterState) -> Router {
+  let cors = build_cors_layer();
+  let trace = TraceLayer::new_for_http()
+    .make_span_with(make_span)
+    .on_request(DefaultOnRequest::new().level(Level::INFO))
+    .on_response(DefaultOnResponse::new().level(Level::INFO));
+
+  let protected = protected_routes().route_layer(from_extractor::<AuthorizedTenant>());
+
+  let main = Router::new()
+    .merge(public_routes())
+    .merge(protected)
+    .with_state(state);
+
+  main
+    .nest("/api/auth", auth::auth_router(auth_router_state))
+    .layer(trace)
     .layer(cors)
-    .with_state(state)
 }
 
 fn build_cors_layer() -> CorsLayer {
@@ -235,7 +253,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     dispatcher,
     source_manager,
     run_history,
-    tenants,
+    tenants.clone(),
   ));
 
   verify_connections(&state, true).await?;
@@ -247,10 +265,24 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     state.backplane.clone(),
   );
 
+  let auth_state = auth::build_auth_state(&shared_config)
+    .await
+    .map_err(AuthError::from)?;
+  let auth_router_state = AuthRouterState {
+    auth: auth_state,
+    tenants,
+  };
+  let session_layer =
+    auth::build_session_layer(shared_config.redis_url(), shared_config.redis_password())
+      .await
+      .map_err(AuthError::from)?;
+
+  let app = build_router(state, auth_router_state).layer(session_layer);
+
   let addr = format!("{}:{}", shared_config.host(), shared_config.port());
   let listener = tokio::net::TcpListener::bind(&addr).await?;
   info!(address = %addr, "Starting server...");
-  axum::serve(listener, router(state))
+  axum::serve(listener, app)
     .with_graceful_shutdown(shutdown_signal())
     .await?;
   Ok(())
@@ -309,8 +341,12 @@ async fn handle_node_poke(
 
 async fn cancel_pipeline_run(
   State(state): State<Arc<ProviderState>>,
-  Path(run_id): Path<String>,
+  Path((slug, run_id)): Path<(String, String)>,
 ) -> StatusCode {
+  match check_run_in_slug(&state, &run_id, &slug).await {
+    Ok(()) => {}
+    Err(status) => return status,
+  }
   if let Err(e) = state.backplane.publish_cancel(&run_id).await {
     warn!(run_id, error = %e, "Failed to publish cancel event");
     return StatusCode::INTERNAL_SERVER_ERROR;
@@ -320,8 +356,11 @@ async fn cancel_pipeline_run(
 
 async fn get_run_status(
   State(state): State<Arc<ProviderState>>,
-  Path(run_id): Path<String>,
+  Path((slug, run_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<Option<RunState>>) {
+  if let Err(status) = check_run_in_slug(&state, &run_id, &slug).await {
+    return (status, Json(None));
+  }
   match state.state_store.load_run(&run_id).await {
     Ok(Some(run_state)) => (StatusCode::OK, Json(Some(run_state))),
     Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
@@ -338,7 +377,6 @@ struct ListRunsParams {
   offset: Option<i64>,
   sort_by: Option<String>,
   order: Option<String>,
-  owner: Option<String>,
   repo: Option<String>,
   pipeline_name: Option<String>,
 }
@@ -351,6 +389,7 @@ struct ListRunsResponse {
 
 async fn list_runs(
   State(state): State<Arc<ProviderState>>,
+  Path(slug): Path<String>,
   Query(params): Query<ListRunsParams>,
 ) -> Result<Json<ListRunsResponse>, StatusCode> {
   let limit = params.limit.unwrap_or(50).clamp(1, 200);
@@ -361,7 +400,7 @@ async fn list_runs(
     SortOrder::parse(params.order.as_deref().unwrap_or("desc")).ok_or(StatusCode::BAD_REQUEST)?;
 
   let filters = RunFilters {
-    owner: params.owner,
+    owner: Some(slug),
     repo: params.repo,
     pipeline_name: params.pipeline_name,
   };
@@ -387,11 +426,13 @@ async fn list_runs(
 
 async fn get_run(
   State(state): State<Arc<ProviderState>>,
-  Path(run_id): Path<String>,
+  Path((slug, run_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<Option<PipelineRunRow>>) {
   match state.run_history.get_pipeline_run(&run_id).await {
-    Ok(Some(row)) => (StatusCode::OK, Json(Some(row))),
-    Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
+    Ok(Some(row)) if row.tenant_slug.as_deref() == Some(slug.as_str()) => {
+      (StatusCode::OK, Json(Some(row)))
+    }
+    Ok(Some(_)) | Ok(None) => (StatusCode::NOT_FOUND, Json(None)),
     Err(e) => {
       warn!(run_id, error = %e, "Failed to get pipeline run");
       (StatusCode::INTERNAL_SERVER_ERROR, Json(None))
@@ -416,8 +457,11 @@ fn build_node_run_response(row: NodeRunRow) -> NodeRunResponse {
 
 async fn list_run_nodes(
   State(state): State<Arc<ProviderState>>,
-  Path(run_id): Path<String>,
+  Path((slug, run_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<Vec<NodeRunResponse>>) {
+  if let Err(status) = check_run_in_slug(&state, &run_id, &slug).await {
+    return (status, Json(vec![]));
+  }
   match state.run_history.list_node_runs(&run_id).await {
     Ok(rows) => {
       let augmented = join_all(
@@ -439,8 +483,11 @@ async fn list_run_nodes(
 
 async fn get_run_node(
   State(state): State<Arc<ProviderState>>,
-  Path((run_id, node_name)): Path<(String, String)>,
+  Path((slug, run_id, node_name)): Path<(String, String, String)>,
 ) -> (StatusCode, Json<Option<NodeRunResponse>>) {
+  if let Err(status) = check_run_in_slug(&state, &run_id, &slug).await {
+    return (status, Json(None));
+  }
   match state.run_history.get_node_run(&run_id, &node_name).await {
     Ok(Some(row)) => {
       let augmented = augment_with_live(row, &state.source_manager).await;
@@ -459,8 +506,11 @@ async fn get_run_node(
 
 async fn get_node_log(
   State(state): State<Arc<ProviderState>>,
-  Path((run_id, node_name)): Path<(String, String)>,
+  Path((slug, run_id, node_name)): Path<(String, String, String)>,
 ) -> (StatusCode, String) {
+  if let Err(status) = check_run_in_slug(&state, &run_id, &slug).await {
+    return (status, String::new());
+  }
   let in_progress = match state.run_history.get_node_run(&run_id, &node_name).await {
     Ok(Some(row)) => row.completed_at.is_none(),
     Ok(None) => return (StatusCode::NOT_FOUND, String::new()),
@@ -491,6 +541,21 @@ async fn get_node_log(
     Err(e) => {
       warn!(run_id, node_name, error = %e, "Failed to get node log");
       (StatusCode::INTERNAL_SERVER_ERROR, String::new())
+    }
+  }
+}
+
+async fn check_run_in_slug(
+  state: &ProviderState,
+  run_id: &str,
+  slug: &str,
+) -> Result<(), StatusCode> {
+  match state.run_history.get_pipeline_run(run_id).await {
+    Ok(Some(row)) if row.tenant_slug.as_deref() == Some(slug) => Ok(()),
+    Ok(_) => Err(StatusCode::NOT_FOUND),
+    Err(e) => {
+      warn!(run_id, error = %e, "Failed to load run for ownership check");
+      Err(StatusCode::INTERNAL_SERVER_ERROR)
     }
   }
 }
@@ -535,6 +600,7 @@ fn millis_to_datetime(ms: u128) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+  use auth::AuthSession;
   use axum::{body::Body, http::Request};
   use backplane::InMemoryBackplane;
   use coordinator::LogDispatcher;
@@ -543,9 +609,63 @@ mod tests {
   use serde_json::Value;
   use state_store::InMemoryStateStore;
   use tower::ServiceExt;
+  use tower_sessions::{
+    MemoryStore, SessionManagerLayer,
+    cookie::time::OffsetDateTime,
+    session::{Id, Record},
+    session_store::SessionStore,
+  };
   use uuid::Uuid;
 
   use super::*;
+
+  const TEST_SLUG: &str = "the-conn";
+  const TEST_SESSION_COOKIE: &str = "jefferies_session";
+
+  fn router_for_tests(state: Arc<ProviderState>) -> Router {
+    let cors = build_cors_layer();
+    let main = Router::new()
+      .merge(public_routes())
+      .merge(protected_routes())
+      .with_state(state);
+    main.layer(cors)
+  }
+
+  fn auth_gated_router(state: Arc<ProviderState>, store: MemoryStore) -> Router {
+    let cors = build_cors_layer();
+    let session_layer = SessionManagerLayer::new(store)
+      .with_name(TEST_SESSION_COOKIE)
+      .with_secure(false);
+    let protected = protected_routes().route_layer(from_extractor::<AuthorizedTenant>());
+    let main = Router::new()
+      .merge(public_routes())
+      .merge(protected)
+      .with_state(state);
+    main.layer(session_layer).layer(cors)
+  }
+
+  async fn seed_auth_session(store: &MemoryStore, auth: &AuthSession) -> Id {
+    let id = Id::default();
+    let mut data = std::collections::HashMap::new();
+    data.insert(
+      "auth".to_string(),
+      serde_json::to_value(auth).expect("AuthSession serializes"),
+    );
+    let record = Record {
+      id,
+      data,
+      expiry_date: OffsetDateTime::now_utc() + tower_sessions::cookie::time::Duration::days(1),
+    };
+    store
+      .save(&record)
+      .await
+      .expect("MemoryStore save succeeds");
+    id
+  }
+
+  fn cookie_for(id: Id) -> String {
+    format!("{TEST_SESSION_COOKIE}={id}")
+  }
 
   fn make_test_state() -> Arc<ProviderState> {
     make_test_state_with_tenants(vec![])
@@ -600,7 +720,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_health_live_returns_200() {
-    let app = router(make_test_state());
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
@@ -615,11 +735,11 @@ mod tests {
 
   #[tokio::test]
   async fn test_get_run_status_unknown_run_returns_404() {
-    let app = router(make_test_state());
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
-          .uri("/api/v1/runs/nonexistent-run/status")
+          .uri(format!("/api/{TEST_SLUG}/runs/nonexistent-run/status"))
           .body(Body::empty())
           .unwrap(),
       )
@@ -629,28 +749,28 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_cancel_pipeline_run_returns_200() {
-    let app = router(make_test_state());
+  async fn test_cancel_unknown_run_returns_404() {
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
           .method("POST")
-          .uri("/api/v1/runs/test-run/cancel")
+          .uri(format!("/api/{TEST_SLUG}/runs/test-run/cancel"))
           .body(Body::empty())
           .unwrap(),
       )
       .await
       .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
   }
 
   #[tokio::test]
   async fn test_list_runs_returns_envelope_with_total() {
-    let app = router(make_test_state());
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
-          .uri("/api/v1/runs")
+          .uri(format!("/api/{TEST_SLUG}/runs"))
           .body(Body::empty())
           .unwrap(),
       )
@@ -667,11 +787,13 @@ mod tests {
 
   #[tokio::test]
   async fn test_get_run_unknown_returns_404() {
-    let app = router(make_test_state());
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
-          .uri("/api/v1/runs/00000000-0000-0000-0000-000000000000")
+          .uri(format!(
+            "/api/{TEST_SLUG}/runs/00000000-0000-0000-0000-000000000000"
+          ))
           .body(Body::empty())
           .unwrap(),
       )
@@ -682,11 +804,13 @@ mod tests {
 
   #[tokio::test]
   async fn test_get_run_node_unknown_returns_404() {
-    let app = router(make_test_state());
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
-          .uri("/api/v1/runs/00000000-0000-0000-0000-000000000000/nodes/missing")
+          .uri(format!(
+            "/api/{TEST_SLUG}/runs/00000000-0000-0000-0000-000000000000/nodes/missing"
+          ))
           .body(Body::empty())
           .unwrap(),
       )
@@ -697,11 +821,11 @@ mod tests {
 
   #[tokio::test]
   async fn test_list_runs_invalid_sort_returns_400() {
-    let app = router(make_test_state());
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
-          .uri("/api/v1/runs?sort_by=evil_column")
+          .uri(format!("/api/{TEST_SLUG}/runs?sort_by=evil_column"))
           .body(Body::empty())
           .unwrap(),
       )
@@ -753,11 +877,11 @@ mod tests {
 
   #[tokio::test]
   async fn test_list_runs_invalid_order_returns_400() {
-    let app = router(make_test_state());
+    let app = router_for_tests(make_test_state());
     let response = app
       .oneshot(
         Request::builder()
-          .uri("/api/v1/runs?order=sideways")
+          .uri(format!("/api/{TEST_SLUG}/runs?order=sideways"))
           .body(Body::empty())
           .unwrap(),
       )
@@ -779,7 +903,7 @@ mod tests {
   #[tokio::test]
   async fn webhook_for_unregistered_org_returns_200_and_drops() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
-    let app = router(state);
+    let app = router_for_tests(state);
     let body = org_repo_body("outsider");
     let response = app
       .oneshot(
@@ -799,7 +923,7 @@ mod tests {
   #[tokio::test]
   async fn webhook_for_user_owner_returns_200_and_drops() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
-    let app = router(state);
+    let app = router_for_tests(state);
     let body = serde_json::to_vec(&serde_json::json!({
       "repository": {
         "owner": { "login": "the-conn", "type": "User" },
@@ -825,7 +949,7 @@ mod tests {
   #[tokio::test]
   async fn webhook_for_owner_with_missing_type_returns_200_and_drops() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
-    let app = router(state);
+    let app = router_for_tests(state);
     let body = serde_json::to_vec(&serde_json::json!({
       "repository": { "owner": { "login": "the-conn" }, "name": "repo" }
     }))
@@ -848,7 +972,7 @@ mod tests {
   #[tokio::test]
   async fn webhook_bad_signature_returns_401() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
-    let app = router(state);
+    let app = router_for_tests(state);
     let body = org_repo_body("the-conn");
     let response = app
       .oneshot(
@@ -871,7 +995,7 @@ mod tests {
       sample_github_tenant("alpha", "alpha-secret"),
       sample_github_tenant("beta", "beta-secret"),
     ]);
-    let app = router(state);
+    let app = router_for_tests(state);
     let body = org_repo_body("beta");
     let signature_with_alpha_secret = hmac_sha256_hex("alpha-secret", &body);
     let response = app
@@ -892,7 +1016,7 @@ mod tests {
   #[tokio::test]
   async fn webhook_unhandled_event_acks_with_200() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
-    let app = router(state);
+    let app = router_for_tests(state);
     let body = org_repo_body("the-conn");
     let response = app
       .oneshot(
@@ -912,7 +1036,7 @@ mod tests {
   #[tokio::test]
   async fn webhook_without_owner_acks_with_200() {
     let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
-    let app = router(state);
+    let app = router_for_tests(state);
     let body = b"{}".to_vec();
     let response = app
       .oneshot(
@@ -922,6 +1046,90 @@ mod tests {
           .header("X-GitHub-Event", "push")
           .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
           .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  fn sample_auth_session(slugs: &[&str]) -> AuthSession {
+    AuthSession {
+      user_id: "user-123".to_string(),
+      email: Some("user@example.com".to_string()),
+      name: Some("Test User".to_string()),
+      authorized_slugs: slugs.iter().map(|s| s.to_string()).collect(),
+      active_tenant_context: slugs.first().copied().unwrap_or("").to_string(),
+    }
+  }
+
+  #[tokio::test]
+  async fn protected_route_without_session_returns_401() {
+    let state = make_test_state();
+    let store = MemoryStore::default();
+    let app = auth_gated_router(state, store);
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri(format!("/api/{TEST_SLUG}/runs"))
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+  }
+
+  #[tokio::test]
+  async fn protected_route_with_wrong_slug_returns_403() {
+    let state = make_test_state();
+    let store = MemoryStore::default();
+    let auth = sample_auth_session(&["alpha"]);
+    let id = seed_auth_session(&store, &auth).await;
+    let app = auth_gated_router(state, store);
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/beta/runs")
+          .header("Cookie", cookie_for(id))
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+  }
+
+  #[tokio::test]
+  async fn protected_route_with_authorized_slug_passes_through() {
+    let state = make_test_state();
+    let store = MemoryStore::default();
+    let auth = sample_auth_session(&["alpha"]);
+    let id = seed_auth_session(&store, &auth).await;
+    let app = auth_gated_router(state, store);
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/api/alpha/runs")
+          .header("Cookie", cookie_for(id))
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn public_route_does_not_require_session() {
+    let state = make_test_state();
+    let store = MemoryStore::default();
+    let app = auth_gated_router(state, store);
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri("/health/live")
+          .body(Body::empty())
           .unwrap(),
       )
       .await

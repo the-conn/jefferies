@@ -150,9 +150,9 @@ impl GithubProvider {
 
   pub async fn retry_run(
     State(state): State<Arc<ProviderState>>,
-    Path(run_id): Path<String>,
+    Path((slug, run_id)): Path<(String, String)>,
   ) -> (StatusCode, Json<Option<RetryResponse>>) {
-    match retry_pipeline_run(state, &run_id).await {
+    match retry_pipeline_run(state, &slug, &run_id).await {
       Ok(new_run_id) => (
         StatusCode::OK,
         Json(Some(RetryResponse { run_id: new_run_id })),
@@ -171,7 +171,11 @@ enum RetryError {
   Backend(String),
 }
 
-async fn retry_pipeline_run(state: Arc<ProviderState>, run_id: &str) -> Result<String, RetryError> {
+async fn retry_pipeline_run(
+  state: Arc<ProviderState>,
+  expected_slug: &str,
+  run_id: &str,
+) -> Result<String, RetryError> {
   let original = state
     .run_history
     .get_pipeline_run(run_id)
@@ -189,6 +193,13 @@ async fn retry_pipeline_run(state: Arc<ProviderState>, run_id: &str) -> Result<S
     warn!(run_id, "Retry requested for run without tenant_slug");
     return Err(RetryError::Backend("missing tenant_slug".into()));
   };
+  if tenant_slug != expected_slug {
+    warn!(
+      run_id,
+      tenant_slug, expected_slug, "Retry requested for run that does not belong to this tenant"
+    );
+    return Err(RetryError::UnknownRun);
+  }
   let Some(tenant) = state.tenants.by_slug(&tenant_slug) else {
     warn!(
       run_id,
@@ -433,7 +444,7 @@ async fn handle_check_suite(
 }
 
 async fn trigger_retry_for_run(tenant: &TenantConfig, state: &Arc<ProviderState>, run_id: &str) {
-  match retry_pipeline_run(state.clone(), run_id).await {
+  match retry_pipeline_run(state.clone(), &tenant.slug, run_id).await {
     Ok(new_run_id) => info!(
       tenant_slug = %tenant.slug,
       original_run_id = run_id,
