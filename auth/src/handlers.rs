@@ -174,9 +174,16 @@ async fn callback(
 
   let groups = extract_groups(&id_token.to_string());
   let authorized_slugs: Vec<String> = groups
-    .into_iter()
+    .iter()
     .filter(|g| state.tenants.by_slug(g).is_some())
+    .cloned()
     .collect();
+  info!(
+    user_id,
+    ?groups,
+    ?authorized_slugs,
+    "Resolved OIDC groups to authorized tenant slugs"
+  );
 
   if authorized_slugs.is_empty() {
     info!(
