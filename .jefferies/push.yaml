@@ -6,8 +6,24 @@ on:
       - main
 
 nodes:
+  - name: Build Test Image
+    image: quay.io/buildah/stable:latest
+    privileged: true
+    checkout: true
+    env:
+      STORAGE_DRIVER: vfs
+    secrets:
+      env:
+        - QUAY_USERNAME
+        - QUAY_PASSWORD
+    steps:
+      - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
+      - buildah bud -f Containerfile-test -t quay.io/the-conn/jefferies-test .
+      - buildah push quay.io/the-conn/jefferies-test
+
   - name: Build Jefferies Image
     image: quay.io/buildah/stable:latest
+    after: ["Build Test Image"]
     checkout: true
     privileged: true
     cpu: "4"

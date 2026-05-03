@@ -11,11 +11,18 @@
 
 #### **A. app_config (The Foundation)**
 * **Layered Configuration:** Loads defaults from TOML and overrides them via environment variables using a double-underscore (`__`) separator for nested fields.
-* **Secrets Management:** Handles sensitive credentials for **Redis**, **RabbitMQ**, **GitHub**, **S3/NooBaa**, and **PostgreSQL** injected via OpenShift SecretKeyRefs.
+* **Secrets Management:** Handles sensitive credentials for **Redis**, **RabbitMQ**, **S3/NooBaa**, and **PostgreSQL** injected via OpenShift SecretKeyRefs. Per-tenant GitHub App credentials live in **tenancy** instead, mounted via Vault.
+
+#### **A'. tenancy (The Multi-Tenant Provider Registry)**
+* **Per-Tenant Credentials:** Loads a YAML document from a Vault-mounted file (default `/etc/jefferies/tenancy/tenants.yaml`, overridable via `JEFFERIES__TENANCY__PATH`) that holds one entry per tenant with its provider type and credentials.
+* **GitHub App Registry:** Each tenant entry currently carries a `slug`, optional `display_name`, and a `provider: github` block with `app_id`, `webhook_secret`, and `private_key`. The serde-tagged `provider` discriminator reserves the schema for future providers (`gitlab`, etc.) without breaking existing entries.
+* **Lookup by Slug:** Webhooks arrive at `/webhooks/github/{tenant_slug}`, allowing the correct webhook secret to be selected before HMAC verification (no body parsing required pre-auth). Run records persist `tenant_slug` so retries can re-resolve the tenant after a pod restart.
+* **Validation at Load:** Slugs are restricted to lowercase alnum + `-`, max 63 chars, must start alnum, and must be unique. `app_id` must parse as `u64`; `webhook_secret` and `private_key` must be non-empty. Bad config fails the pod fast at startup.
+* **Out of Scope (Today):** OAuth/OIDC user authentication (will be handled by Dex with its own GitHub OAuth credentials, not this registry), hot-reload of the tenancy file, per-tenant Vault role automation, and per-tenant `state_store` / `backplane` key namespacing.
 
 #### **B. providers (The Gatekeeper)**
-* **GitHub Logic:** Contains the HMAC-SHA256 signature verification logic to ensure webhooks are authentic.
-* **Repository Access:** Manages GitHub App authentication (JWT and Installation Tokens) to read `.jefferies/` YAML files directly from the source repository via the Contents API.
+* **GitHub Logic:** Contains the HMAC-SHA256 signature verification logic to ensure webhooks are authentic. Each tenant's webhook secret is resolved from the **tenancy** registry by slug before signature verification.
+* **Repository Access:** Manages GitHub App authentication (JWT and Installation Tokens) using the per-tenant `app_id` + `private_key` to read `.jefferies/` YAML files directly from the source repository via the Contents API.
 
 #### **C. pipelines (The Logic)**
 * **Discovery:** Parses YAML to match incoming events (e.g., `push`) to specific execution plans.
@@ -71,7 +78,7 @@
 
 ### **3. Data & Execution Flow**
 
-1.  **Ingress:** A Webhook hits a **server** node. **providers** validates the signature and reads the pipeline YAML.
+1.  **Ingress:** A Webhook hits a **server** node at `/webhooks/github/{tenant_slug}`. **providers** resolves the tenant via the **tenancy** registry, validates the HMAC against that tenant's webhook secret, and reads the pipeline YAML using the tenant's GitHub App installation token.
 2.  **Source Upload:** If the pipeline has any node with `checkout: true`, **providers** calls the **SourceManager** to stream the repository tarball from GitHub directly to S3 at `runs/{run_id}/source.tar.gz` before the coordinator is started.
 3.  **Initialization:** **coordinator** acquires a Redis lease and persists the initial `RunState`. All nodes with no dependencies are dispatched immediately. The **Dispatcher** uses the **SourceManager** to generate presigned URLs that are passed to each worker as environment variables.
 4.  **Execution Loop:**
@@ -118,7 +125,7 @@ flowchart TD
         KDISP --> POD_A & POD_B
     end
 
-    GH -->|POST /webhooks/github| SRV
+    GH -->|POST /webhooks/github/&#123;tenant_slug&#125;| SRV
     SRV -->|stream repo tarball to S3| S3
     SRV --> COORD_INIT
     COORD_INIT -.->|heartbeat every 15 s| REDIS
