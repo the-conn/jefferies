@@ -6,7 +6,7 @@ on:
       - main
 
 nodes:
-  - name: Build Jefferies Image and Update Deployments
+  - name: Build Jefferies Image
     image: quay.io/buildah/stable:latest
     checkout: true
     privileged: true
@@ -26,4 +26,14 @@ nodes:
       - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
       - buildah bud -f Containerfile -t quay.io/the-conn/jefferies .
       - buildah push quay.io/the-conn/jefferies-test
+      - oc -n jefferies rollout restart deployment jefferies
+
+  - name: Rollout Jefferies Deployment
+    image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    env:
+      KUBECONFIG: /etc/tube/serets/files/KUBECONFIG
+    secrets:
+      files:
+        - KUBECONFIG
+    steps:
       - oc -n jefferies rollout restart deployment jefferies
