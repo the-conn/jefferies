@@ -30,6 +30,7 @@ nodes:
 
   - name: Rollout Jefferies Deployment
     image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    after: ["Build Jefferies Image"]
     env:
       KUBECONFIG: /etc/tube/serets/files/KUBECONFIG
     secrets:
