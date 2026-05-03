@@ -15,7 +15,12 @@ use octocrab::{
   Octocrab,
   models::{
     CheckRunId,
-    webhook_events::{WebhookEvent, WebhookEventPayload, payload::PullRequestWebhookEventAction},
+    webhook_events::{
+      WebhookEvent, WebhookEventPayload,
+      payload::{
+        CheckRunWebhookEventAction, CheckSuiteWebhookEventAction, PullRequestWebhookEventAction,
+      },
+    },
   },
   params::checks::{CheckRunConclusion, CheckRunStatus},
 };
@@ -32,6 +37,8 @@ use super::{ProviderState, get_header};
 
 const GITHUB_EVENT_PUSH: &str = "push";
 const GITHUB_EVENT_PULL_REQUEST: &str = "pull_request";
+const GITHUB_EVENT_CHECK_RUN: &str = "check_run";
+const GITHUB_EVENT_CHECK_SUITE: &str = "check_suite";
 const TRIGGER_RETRY: &str = "retry";
 const JEFFERIES_DIR: &str = ".jefferies";
 
@@ -92,9 +99,23 @@ impl GithubProvider {
           StatusCode::INTERNAL_SERVER_ERROR
         }
       },
+      GITHUB_EVENT_CHECK_RUN => match handle_check_run(&body, tenant, state).await {
+        Ok(status) => status,
+        Err(e) => {
+          warn!(tenant_slug, error = ?e, "Failed to handle check_run event");
+          StatusCode::INTERNAL_SERVER_ERROR
+        }
+      },
+      GITHUB_EVENT_CHECK_SUITE => match handle_check_suite(&body, tenant, state).await {
+        Ok(status) => status,
+        Err(e) => {
+          warn!(tenant_slug, error = ?e, "Failed to handle check_suite event");
+          StatusCode::INTERNAL_SERVER_ERROR
+        }
+      },
       _ => {
-        info!(tenant_slug, event_type, "Received unsupported GitHub event");
-        StatusCode::NOT_IMPLEMENTED
+        tracing::debug!(tenant_slug, event_type, "Ignoring unsupported GitHub event");
+        StatusCode::OK
       }
     }
   }
@@ -103,72 +124,82 @@ impl GithubProvider {
     State(state): State<Arc<ProviderState>>,
     Path(run_id): Path<String>,
   ) -> (StatusCode, Json<Option<RetryResponse>>) {
-    let original = match state.run_history.get_pipeline_run(&run_id).await {
-      Ok(Some(row)) => row,
-      Ok(None) => {
-        warn!(run_id, "Retry requested for unknown run");
-        return (StatusCode::NOT_FOUND, Json(None));
-      }
-      Err(e) => {
-        warn!(run_id, error = %e, "Failed to fetch run for retry");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
-      }
-    };
-
-    let Some(tenant_slug) = original.tenant_slug.clone() else {
-      warn!(run_id, "Retry requested for run without tenant_slug");
-      return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
-    };
-    let Some(tenant) = state.tenants.by_slug(&tenant_slug) else {
-      warn!(
-        run_id,
-        tenant_slug, "Retry requested for run whose tenant is no longer registered"
-      );
-      return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
-    };
-    let TenantProvider::Github(gh) = &tenant.provider;
-
-    let pipeline = match Pipeline::from_yaml(&original.pipeline_definition) {
-      Ok(p) => p,
-      Err(e) => {
-        warn!(run_id, error = %e, "Stored pipeline YAML failed to parse during retry");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
-      }
-    };
-
-    let install_crab = match build_installation_client(&original.owner, &original.repo, gh).await {
-      Ok(c) => c,
-      Err(e) => {
-        warn!(run_id, error = %e, "Failed to build GitHub installation client for retry");
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(None));
-      }
-    };
-
-    let run_context = RunContext {
-      owner: original.owner,
-      repo: original.repo,
-      sha: original.sha,
-      branch: original.branch,
-      target_branch: original.target_branch,
-      tag: original.tag,
-      pr_number: original.pr_number,
-      trigger: TRIGGER_RETRY.to_string(),
-      pipeline_yaml: original.pipeline_definition,
-      created_at: Utc::now(),
-      retry_of: Some(run_id),
-      tenant_slug: Some(tenant_slug),
-    };
-
-    match launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone())
-      .await
-    {
-      Some(new_run_id) => (
+    match retry_pipeline_run(state, &run_id).await {
+      Ok(new_run_id) => (
         StatusCode::OK,
         Json(Some(RetryResponse { run_id: new_run_id })),
       ),
-      None => (StatusCode::INTERNAL_SERVER_ERROR, Json(None)),
+      Err(RetryError::UnknownRun) => (StatusCode::NOT_FOUND, Json(None)),
+      Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(None)),
     }
   }
+}
+
+#[derive(Debug, Error)]
+enum RetryError {
+  #[error("unknown run")]
+  UnknownRun,
+  #[error("{0}")]
+  Backend(String),
+}
+
+async fn retry_pipeline_run(state: Arc<ProviderState>, run_id: &str) -> Result<String, RetryError> {
+  let original = state
+    .run_history
+    .get_pipeline_run(run_id)
+    .await
+    .map_err(|e| {
+      warn!(run_id, error = %e, "Failed to fetch run for retry");
+      RetryError::Backend(format!("history lookup: {e}"))
+    })?;
+  let Some(original) = original else {
+    warn!(run_id, "Retry requested for unknown run");
+    return Err(RetryError::UnknownRun);
+  };
+
+  let Some(tenant_slug) = original.tenant_slug.clone() else {
+    warn!(run_id, "Retry requested for run without tenant_slug");
+    return Err(RetryError::Backend("missing tenant_slug".into()));
+  };
+  let Some(tenant) = state.tenants.by_slug(&tenant_slug) else {
+    warn!(
+      run_id,
+      tenant_slug, "Retry requested for run whose tenant is no longer registered"
+    );
+    return Err(RetryError::Backend("tenant unregistered".into()));
+  };
+  let TenantProvider::Github(gh) = &tenant.provider;
+
+  let pipeline = Pipeline::from_yaml(&original.pipeline_definition).map_err(|e| {
+    warn!(run_id, error = %e, "Stored pipeline YAML failed to parse during retry");
+    RetryError::Backend(format!("pipeline parse: {e}"))
+  })?;
+
+  let install_crab = build_installation_client(&original.owner, &original.repo, gh)
+    .await
+    .map_err(|e| {
+      warn!(run_id, error = %e, "Failed to build GitHub installation client for retry");
+      RetryError::Backend(format!("install client: {e}"))
+    })?;
+
+  let run_context = RunContext {
+    owner: original.owner,
+    repo: original.repo,
+    sha: original.sha,
+    branch: original.branch,
+    target_branch: original.target_branch,
+    tag: original.tag,
+    pr_number: original.pr_number,
+    trigger: TRIGGER_RETRY.to_string(),
+    pipeline_yaml: original.pipeline_definition,
+    created_at: Utc::now(),
+    retry_of: Some(run_id.to_string()),
+    tenant_slug: Some(tenant_slug),
+  };
+
+  launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone())
+    .await
+    .ok_or_else(|| RetryError::Backend("coordinator launch failed".into()))
 }
 
 async fn handle_push(
@@ -246,6 +277,148 @@ async fn handle_pull_request(
   };
   start_pr_pipelines(pr_event, tenant, state).await?;
   Ok(StatusCode::OK)
+}
+
+async fn handle_check_run(
+  payload: &[u8],
+  tenant: Arc<TenantConfig>,
+  state: Arc<ProviderState>,
+) -> Result<StatusCode, GithubError> {
+  let event = WebhookEvent::try_from_header_and_body(GITHUB_EVENT_CHECK_RUN, payload)?;
+  let WebhookEventPayload::CheckRun(cr_event) = event.specific else {
+    return Err(GithubError::InvalidPayload(serde_json::Error::custom(
+      "Bad check_run event payload",
+    )));
+  };
+
+  if cr_event.action != CheckRunWebhookEventAction::Rerequested {
+    tracing::debug!(
+      tenant_slug = %tenant.slug,
+      action = ?cr_event.action,
+      "Ignoring check_run event with unsupported action"
+    );
+    return Ok(StatusCode::OK);
+  }
+
+  let Some(external_id) = cr_event
+    .check_run
+    .get("external_id")
+    .and_then(|v| v.as_str())
+    .filter(|s| !s.is_empty())
+  else {
+    warn!(
+      tenant_slug = %tenant.slug,
+      "check_run.rerequested received without external_id; cannot map to a pipeline run"
+    );
+    return Ok(StatusCode::OK);
+  };
+
+  trigger_retry_for_run(&tenant, &state, external_id).await;
+  Ok(StatusCode::OK)
+}
+
+async fn handle_check_suite(
+  payload: &[u8],
+  tenant: Arc<TenantConfig>,
+  state: Arc<ProviderState>,
+) -> Result<StatusCode, GithubError> {
+  let event = WebhookEvent::try_from_header_and_body(GITHUB_EVENT_CHECK_SUITE, payload)?;
+  let WebhookEventPayload::CheckSuite(cs_event) = event.specific else {
+    return Err(GithubError::InvalidPayload(serde_json::Error::custom(
+      "Bad check_suite event payload",
+    )));
+  };
+
+  if cs_event.action != CheckSuiteWebhookEventAction::Rerequested {
+    tracing::debug!(
+      tenant_slug = %tenant.slug,
+      action = ?cs_event.action,
+      "Ignoring check_suite event with unsupported action"
+    );
+    return Ok(StatusCode::OK);
+  }
+
+  let repo = event.repository.ok_or_else(|| {
+    GithubError::InvalidPayload(serde_json::Error::custom(
+      "Missing repository information in check_suite event",
+    ))
+  })?;
+  let owner = repo
+    .owner
+    .ok_or_else(|| {
+      GithubError::InvalidPayload(serde_json::Error::custom(
+        "Missing owner information in check_suite event",
+      ))
+    })?
+    .login;
+  let repo_name = repo.name;
+
+  let Some(head_sha) = cs_event
+    .check_suite
+    .get("head_sha")
+    .and_then(|v| v.as_str())
+    .filter(|s| !s.is_empty())
+  else {
+    warn!(
+      tenant_slug = %tenant.slug,
+      owner,
+      repo = %repo_name,
+      "check_suite.rerequested received without head_sha"
+    );
+    return Ok(StatusCode::OK);
+  };
+
+  let originating = match state
+    .run_history
+    .list_originating_runs_for_sha(&tenant.slug, &owner, &repo_name, head_sha)
+    .await
+  {
+    Ok(rows) => rows,
+    Err(e) => {
+      warn!(
+        tenant_slug = %tenant.slug,
+        owner,
+        repo = %repo_name,
+        sha = head_sha,
+        error = %e,
+        "Failed to load originating runs for check_suite re-run"
+      );
+      return Ok(StatusCode::OK);
+    }
+  };
+
+  if originating.is_empty() {
+    info!(
+      tenant_slug = %tenant.slug,
+      owner,
+      repo = %repo_name,
+      sha = head_sha,
+      "check_suite.rerequested received but no originating runs found for SHA"
+    );
+    return Ok(StatusCode::OK);
+  }
+
+  for row in originating {
+    trigger_retry_for_run(&tenant, &state, &row.run_id.to_string()).await;
+  }
+  Ok(StatusCode::OK)
+}
+
+async fn trigger_retry_for_run(tenant: &TenantConfig, state: &Arc<ProviderState>, run_id: &str) {
+  match retry_pipeline_run(state.clone(), run_id).await {
+    Ok(new_run_id) => info!(
+      tenant_slug = %tenant.slug,
+      original_run_id = run_id,
+      new_run_id,
+      "GitHub check re-run triggered new pipeline run"
+    ),
+    Err(e) => warn!(
+      tenant_slug = %tenant.slug,
+      original_run_id = run_id,
+      error = %e,
+      "GitHub check re-run failed to trigger new pipeline run"
+    ),
+  }
 }
 
 struct PullRequestEventInfo {

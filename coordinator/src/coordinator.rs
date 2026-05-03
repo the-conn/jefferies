@@ -1159,6 +1159,15 @@ mod tests {
     async fn get_pipeline_run(&self, _: &str) -> Result<Option<PipelineRunRow>, RunHistoryError> {
       Ok(None)
     }
+    async fn list_originating_runs_for_sha(
+      &self,
+      _: &str,
+      _: &str,
+      _: &str,
+      _: &str,
+    ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
+      Ok(vec![])
+    }
     async fn list_node_runs(&self, _: &str) -> Result<Vec<NodeRunRow>, RunHistoryError> {
       Ok(vec![])
     }

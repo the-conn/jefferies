@@ -258,6 +258,13 @@ pub trait RunHistory: Send + Sync {
   async fn count_pipeline_runs(&self, filters: &RunFilters) -> Result<i64, RunHistoryError>;
   async fn get_pipeline_run(&self, run_id: &str)
   -> Result<Option<PipelineRunRow>, RunHistoryError>;
+  async fn list_originating_runs_for_sha(
+    &self,
+    tenant_slug: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+  ) -> Result<Vec<PipelineRunRow>, RunHistoryError>;
   async fn list_node_runs(&self, run_id: &str) -> Result<Vec<NodeRunRow>, RunHistoryError>;
   async fn get_node_run(
     &self,
@@ -448,6 +455,27 @@ impl RunHistory for PostgresRunHistory {
     Ok(row)
   }
 
+  async fn list_originating_runs_for_sha(
+    &self,
+    tenant_slug: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+  ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
+    let rows = sqlx::query_as::<_, PipelineRunRow>(
+      "SELECT * FROM pipeline_runs \
+       WHERE tenant_slug = $1 AND owner = $2 AND repo = $3 AND sha = $4 AND retry_of IS NULL \
+       ORDER BY created_at ASC",
+    )
+    .bind(tenant_slug)
+    .bind(owner)
+    .bind(repo)
+    .bind(sha)
+    .fetch_all(&self.pool)
+    .await?;
+    Ok(rows)
+  }
+
   async fn list_node_runs(&self, run_id: &str) -> Result<Vec<NodeRunRow>, RunHistoryError> {
     let uuid = parse_run_id(run_id)?;
     let rows = sqlx::query_as::<_, NodeRunRow>(
@@ -531,6 +559,16 @@ impl RunHistory for NoOpRunHistory {
 
   async fn get_pipeline_run(&self, _: &str) -> Result<Option<PipelineRunRow>, RunHistoryError> {
     Ok(None)
+  }
+
+  async fn list_originating_runs_for_sha(
+    &self,
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &str,
+  ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
+    Ok(vec![])
   }
 
   async fn list_node_runs(&self, _: &str) -> Result<Vec<NodeRunRow>, RunHistoryError> {

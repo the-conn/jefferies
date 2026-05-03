@@ -831,4 +831,24 @@ mod tests {
       .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
   }
+
+  #[tokio::test]
+  async fn webhook_unhandled_event_acks_with_200() {
+    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let app = router(state);
+    let body = b"{}".to_vec();
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github/the-conn")
+          .header("X-GitHub-Event", "ping")
+          .header("X-Hub-Signature-256", hmac_sha256_hex("shh", &body))
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
 }
