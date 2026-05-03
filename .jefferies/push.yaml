@@ -49,4 +49,4 @@ nodes:
       files:
         - KUBECONFIG
     steps:
-      - oc --kubeconfig=$KUBECONFIG -n jefferies rollout restart deployment jefferies
+      - oc --kubeconfig=$KUBECONFIG -n the-conn rollout restart deployment jefferies

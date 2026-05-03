@@ -27,6 +27,7 @@ pub struct KubeDispatcher {
   source_manager: Arc<SourceManager>,
   client: kube::Client,
   namespace: String,
+  backend_namespace: String,
   tube_image: String,
   default_node_image: String,
   service_account_privileged: String,
@@ -44,10 +45,12 @@ impl KubeDispatcher {
     let client = kube::Client::try_default()
       .await
       .map_err(|e| DispatchError::Kube(e.to_string()))?;
+    let backend_namespace = client.default_namespace().to_string();
     Ok(Self {
       source_manager,
       client,
       namespace: config.kubernetes_namespace().to_string(),
+      backend_namespace,
       tube_image: config.tube_image().to_string(),
       default_node_image: config.default_node_image().to_string(),
       service_account_privileged: config.service_account_privileged().to_string(),
@@ -276,16 +279,20 @@ fn env_var(name: &str, value: &str) -> EnvVar {
   }
 }
 
+fn poke_url_for(backend_namespace: &str, run_id: &str, node_name: &str) -> String {
+  format!(
+    "http://jefferies.{backend_namespace}.svc.cluster.local./api/v1/runs/{run_id}/nodes/{node_name}/poke"
+  )
+}
+
 fn build_env_vars(
   run_id: &str,
   node_name: &str,
   status_put_url: &str,
   logs_put_url: &str,
   get_url: &str,
+  poke_url: &str,
 ) -> Vec<EnvVar> {
-  let poke_url = format!(
-    "http://jefferies.jefferies.svc.cluster.local./api/v1/runs/{run_id}/nodes/{node_name}/poke"
-  );
   let secrets_env_dir = format!("{VAULT_SECRETS_MOUNT_PATH}/{VAULT_ENV_SUBDIR}");
   vec![
     env_var("TUBE__EXECUTION__USER_SCRIPT_PATH", "/etc/conn/script.sh"),
@@ -293,7 +300,7 @@ fn build_env_vars(
     env_var("TUBE__EXECUTION__NODE_NAME", node_name),
     env_var("TUBE__EXECUTION__STATUS_PUT_URL", status_put_url),
     env_var("TUBE__EXECUTION__LOGS_PUT_URL", logs_put_url),
-    env_var("TUBE__EXECUTION__POKE_URL", &poke_url),
+    env_var("TUBE__EXECUTION__POKE_URL", poke_url),
     env_var("TUBE__EXECUTION__LOG_LEVEL", "info"),
     env_var("TUBE__LOG__LEVEL", "warn"),
     env_var("TUBE__WORKSPACE__GET_URL", get_url),
@@ -416,7 +423,15 @@ impl Dispatcher for KubeDispatcher {
       );
       annotations.extend(vault);
     }
-    let mut env_vars = build_env_vars(run_id, &node.name, &status_put_url, &logs_put_url, &get_url);
+    let poke_url = poke_url_for(&self.backend_namespace, run_id, &node.name);
+    let mut env_vars = build_env_vars(
+      run_id,
+      &node.name,
+      &status_put_url,
+      &logs_put_url,
+      &get_url,
+      &poke_url,
+    );
     env_vars.extend(node.env.iter().map(|(k, v)| env_var(k, v)));
 
     let safety_deadline_secs = compute_safety_deadline_secs(node, config);
@@ -899,9 +914,12 @@ mod tests {
     assert_eq!(names, vec!["alpha", "mu", "zeta"]);
   }
 
+  const TEST_POKE_URL: &str =
+    "http://jefferies.test.svc.cluster.local./api/v1/runs/run/nodes/node/poke";
+
   #[test]
   fn build_env_vars_get_url_is_empty_string_when_no_source() {
-    let vars = build_env_vars("run", "node", "status", "logs", "");
+    let vars = build_env_vars("run", "node", "status", "logs", "", TEST_POKE_URL);
     let get_url = vars
       .iter()
       .find(|v| v.name == "TUBE__WORKSPACE__GET_URL")
@@ -914,7 +932,7 @@ mod tests {
 
   #[test]
   fn build_env_vars_secrets_dir_matches_vault_env_subdir() {
-    let vars = build_env_vars("run", "node", "status", "logs", "");
+    let vars = build_env_vars("run", "node", "status", "logs", "", TEST_POKE_URL);
     let secrets_dir = vars
       .iter()
       .find(|v| v.name == "TUBE__SECRETS__DIR")
@@ -931,12 +949,27 @@ mod tests {
 
   #[test]
   fn build_env_vars_get_url_carries_presigned_url_when_source_present() {
-    let vars = build_env_vars("run", "node", "status", "logs", "https://signed-url");
+    let vars = build_env_vars(
+      "run",
+      "node",
+      "status",
+      "logs",
+      "https://signed-url",
+      TEST_POKE_URL,
+    );
     let get_url = vars
       .iter()
       .find(|v| v.name == "TUBE__WORKSPACE__GET_URL")
       .expect("checkout nodes must receive a presigned source URL");
     assert_eq!(get_url.value.as_deref(), Some("https://signed-url"));
+  }
+
+  #[test]
+  fn poke_url_for_uses_backend_namespace() {
+    assert_eq!(
+      poke_url_for("the-conn", "abc123", "build"),
+      "http://jefferies.the-conn.svc.cluster.local./api/v1/runs/abc123/nodes/build/poke"
+    );
   }
 
   #[test]

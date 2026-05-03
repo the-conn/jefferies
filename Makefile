@@ -62,7 +62,7 @@ push:
 
 ## rollout: Update the deployment on openshift
 rollout:
-	oc -n jefferies rollout restart deployment jefferies
+	oc -n the-conn rollout restart deployment jefferies
 
 ## update: Builds the image from source, pushes, and rolls out the deployment
 update: image push rollout
