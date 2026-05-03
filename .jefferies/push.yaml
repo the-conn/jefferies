@@ -38,7 +38,7 @@ nodes:
     steps:
       - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
       - buildah bud -f Containerfile -t quay.io/the-conn/jefferies .
-      - buildah push quay.io/the-conn/jefferies-test
+      - buildah push quay.io/the-conn/jefferies
 
   - name: Rollout Jefferies Deployment
     image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
