@@ -227,6 +227,7 @@ pub struct RunFilters {
   pub owner: Option<String>,
   pub repo: Option<String>,
   pub pipeline_name: Option<String>,
+  pub sha: Option<String>,
 }
 
 pub struct ListRunsQuery {
@@ -239,7 +240,8 @@ pub struct ListRunsQuery {
 
 const FILTER_WHERE: &str = "WHERE ($1::text IS NULL OR owner = $1) \
                              AND ($2::text IS NULL OR repo = $2) \
-                             AND ($3::text IS NULL OR pipeline_name = $3)";
+                             AND ($3::text IS NULL OR pipeline_name = $3) \
+                             AND ($4::text IS NULL OR sha = $4)";
 
 #[async_trait]
 pub trait RunHistory: Send + Sync {
@@ -417,7 +419,7 @@ impl RunHistory for PostgresRunHistory {
     let sql = format!(
       "SELECT * FROM pipeline_runs {FILTER_WHERE} \
        ORDER BY {} {} NULLS LAST \
-       LIMIT $4 OFFSET $5",
+       LIMIT $5 OFFSET $6",
       q.sort_by.as_sql(),
       q.order.as_sql(),
     );
@@ -425,6 +427,7 @@ impl RunHistory for PostgresRunHistory {
       .bind(q.filters.owner.as_deref())
       .bind(q.filters.repo.as_deref())
       .bind(q.filters.pipeline_name.as_deref())
+      .bind(q.filters.sha.as_deref())
       .bind(q.limit)
       .bind(q.offset)
       .fetch_all(&self.pool)
@@ -438,6 +441,7 @@ impl RunHistory for PostgresRunHistory {
       .bind(filters.owner.as_deref())
       .bind(filters.repo.as_deref())
       .bind(filters.pipeline_name.as_deref())
+      .bind(filters.sha.as_deref())
       .fetch_one(&self.pool)
       .await?;
     Ok(count)

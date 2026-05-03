@@ -379,6 +379,7 @@ struct ListRunsParams {
   order: Option<String>,
   repo: Option<String>,
   pipeline_name: Option<String>,
+  sha: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -403,6 +404,7 @@ async fn list_runs(
     owner: Some(slug),
     repo: params.repo,
     pipeline_name: params.pipeline_name,
+    sha: params.sha,
   };
   let query = ListRunsQuery {
     limit,
@@ -832,6 +834,25 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+  }
+
+  #[tokio::test]
+  async fn test_list_runs_accepts_sha_filter() {
+    let app = router_for_tests(make_test_state());
+    let response = app
+      .oneshot(
+        Request::builder()
+          .uri(format!("/api/{TEST_SLUG}/runs?sha=abc123"))
+          .body(Body::empty())
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).expect("response is JSON");
+    assert_eq!(json["total"], 0);
+    assert_eq!(json["runs"].as_array().map(|a| a.len()), Some(0));
   }
 
   fn make_node_row(failure_reason: Option<&str>) -> NodeRunRow {
