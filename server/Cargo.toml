@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 app_config = { workspace = true }
 providers = { workspace = true }
 run_history = { workspace = true }
+tenancy = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }

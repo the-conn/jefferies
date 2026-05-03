@@ -19,6 +19,7 @@ pipelines = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 state_store = { workspace = true }
+tenancy = { workspace = true }
 tracing = { workspace = true }
 octocrab = { workspace = true }
 thiserror = { workspace = true }

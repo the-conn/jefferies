@@ -37,6 +37,8 @@ pub enum ServerError {
   Source(#[from] SourceError),
   #[error("Run history error: {0}")]
   RunHistory(#[from] run_history::RunHistoryError),
+  #[error("Tenancy configuration error: {0}")]
+  Tenancy(#[from] tenancy::TenancyError),
   #[error("Connection check failed: {0}")]
   ConnectionFailed(String),
 }
@@ -223,6 +225,9 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     .await
     .map_err(|e| ServerError::ConnectionFailed(format!("PostgreSQL migration: {e}")))?;
 
+  let tenants = Arc::new(tenancy::TenantRegistry::load_from_env()?);
+  info!(tenant_count = tenants.len(), "Loaded tenancy registry");
+
   let state = Arc::new(ProviderState::new(
     shared_config.clone(),
     state_store,
@@ -230,6 +235,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     dispatcher,
     source_manager,
     run_history,
+    tenants,
   ));
 
   verify_connections(&state, true).await?;
@@ -551,6 +557,10 @@ mod tests {
       source_manager.clone(),
     ));
     let run_history = Arc::new(NoOpRunHistory);
+    let tenants = Arc::new(
+      tenancy::TenantRegistry::from_document(tenancy::TenancyDocument { tenants: vec![] })
+        .expect("empty registry"),
+    );
     Arc::new(ProviderState::new(
       config,
       state_store,
@@ -558,6 +568,7 @@ mod tests {
       dispatcher,
       source_manager,
       run_history,
+      tenants,
     ))
   }
 
