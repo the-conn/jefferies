@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
   Pending,
   Running,
@@ -309,8 +309,7 @@ impl StateStore for RedisStateStore {
         continue;
       };
 
-      let has_running = state.statuses.values().any(|s| *s == NodeStatus::Running);
-      if !has_running {
+      if run_state_is_terminal(&state) {
         continue;
       }
 
@@ -501,12 +500,7 @@ impl StateStore for InMemoryStateStore {
     let orphaned = runs
       .iter()
       .filter(|(run_id, entry)| {
-        let has_running = entry
-          .state
-          .statuses
-          .values()
-          .any(|s| *s == NodeStatus::Running);
-        has_running && !leases.contains_key(*run_id)
+        !run_state_is_terminal(&entry.state) && !leases.contains_key(*run_id)
       })
       .map(|(run_id, _)| run_id.clone())
       .collect();
@@ -637,6 +631,19 @@ nodes:
       .unwrap();
     let orphans = store.get_orphaned_runs().await.unwrap();
     assert!(orphans.is_empty(), "Should not be orphaned when lease held");
+  }
+
+  #[tokio::test]
+  async fn pending_unleased_run_is_orphan() {
+    // Regression: if the original coordinator died after writing initial state but
+    // before dispatch_ready_nodes, the only node is Pending (not Running).
+    // The reaper must still pick this up as an orphan.
+    let store = InMemoryStateStore::new();
+    let state = make_run_state(0); // build = Pending
+    store.save_run("run1", &state, 0).await.unwrap();
+
+    let orphans = store.get_orphaned_runs().await.unwrap();
+    assert_eq!(orphans, vec!["run1"]);
   }
 
   #[tokio::test]

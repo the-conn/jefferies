@@ -134,7 +134,7 @@ pub struct NodeRunRecord {
   pub failure_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct PipelineRunRow {
   pub run_id: Uuid,
   pub pipeline_name: String,
@@ -154,7 +154,7 @@ pub struct PipelineRunRow {
   pub tenant_slug: Option<String>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct NodeRunRow {
   pub id: i64,
   pub run_id: Uuid,
@@ -250,6 +250,13 @@ pub trait RunHistory: Send + Sync {
     record: PipelineStartRecord,
   ) -> Result<(), RunHistoryError>;
   async fn record_pipeline_run(&self, record: PipelineRunRecord) -> Result<(), RunHistoryError>;
+  async fn finalize_pipeline_run_status(
+    &self,
+    run_id: &str,
+    status: RunStatus,
+    completed_at: DateTime<Utc>,
+  ) -> Result<bool, RunHistoryError>;
+  async fn list_in_progress_runs(&self) -> Result<Vec<PipelineRunRow>, RunHistoryError>;
   async fn record_node_dispatched(&self, record: NodeDispatchRecord)
   -> Result<(), RunHistoryError>;
   async fn record_node_run(&self, record: NodeRunRecord) -> Result<(), RunHistoryError>;
@@ -370,6 +377,25 @@ impl RunHistory for PostgresRunHistory {
     Ok(())
   }
 
+  async fn finalize_pipeline_run_status(
+    &self,
+    run_id: &str,
+    status: RunStatus,
+    completed_at: DateTime<Utc>,
+  ) -> Result<bool, RunHistoryError> {
+    let run_id = parse_run_id(run_id)?;
+    let result = sqlx::query(
+      "UPDATE pipeline_runs SET status = $2, completed_at = $3 \
+       WHERE run_id = $1 AND status = 'in_progress'",
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(completed_at)
+    .execute(&self.pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+  }
+
   async fn record_node_dispatched(&self, r: NodeDispatchRecord) -> Result<(), RunHistoryError> {
     let run_id = parse_run_id(&r.run_id)?;
     sqlx::query(
@@ -432,6 +458,15 @@ impl RunHistory for PostgresRunHistory {
       .bind(q.offset)
       .fetch_all(&self.pool)
       .await?;
+    Ok(rows)
+  }
+
+  async fn list_in_progress_runs(&self) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
+    let rows = sqlx::query_as::<_, PipelineRunRow>(
+      "SELECT * FROM pipeline_runs WHERE status = 'in_progress'",
+    )
+    .fetch_all(&self.pool)
+    .await?;
     Ok(rows)
   }
 
@@ -542,6 +577,15 @@ impl RunHistory for NoOpRunHistory {
     Ok(())
   }
 
+  async fn finalize_pipeline_run_status(
+    &self,
+    _: &str,
+    _: RunStatus,
+    _: DateTime<Utc>,
+  ) -> Result<bool, RunHistoryError> {
+    Ok(false)
+  }
+
   async fn record_node_dispatched(&self, _: NodeDispatchRecord) -> Result<(), RunHistoryError> {
     Ok(())
   }
@@ -554,6 +598,10 @@ impl RunHistory for NoOpRunHistory {
     &self,
     _: ListRunsQuery,
   ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
+    Ok(vec![])
+  }
+
+  async fn list_in_progress_runs(&self) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
     Ok(vec![])
   }
 

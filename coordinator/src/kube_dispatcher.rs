@@ -6,7 +6,7 @@ use k8s_openapi::{
   api::{
     batch::v1::{Job, JobSpec},
     core::v1::{
-      ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, PodSpec,
+      ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec,
       PodTemplateSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
     },
   },
@@ -526,6 +526,24 @@ impl Dispatcher for KubeDispatcher {
 
     self.source_manager.cleanup_run(run_id).await?;
     Ok(())
+  }
+
+  async fn node_pod_exists(&self, run_id: &str, node_name: &str) -> Result<bool, DispatchError> {
+    let api: kube::Api<Pod> = kube::Api::namespaced(self.client.clone(), &self.namespace);
+    let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
+    let pods = api
+      .list(&lp)
+      .await
+      .map_err(|e| DispatchError::Kube(e.to_string()))?;
+    let exists = pods.items.iter().any(|p| {
+      p.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(NODE_NAME_ANNOTATION))
+        .map(|s| s == node_name)
+        .unwrap_or(false)
+    });
+    Ok(exists)
   }
 
   async fn get_node_outcome(

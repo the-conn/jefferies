@@ -316,11 +316,16 @@ impl Coordinator {
     tokio::pin!(pipeline_deadline);
 
     if self.is_rehydrate {
-      let outcomes = self.read_outcomes_for_running().await;
+      let outcomes = self.read_outcomes_for_non_terminal().await;
       if self
         .fold_completions_from_outcomes(&outcomes, "rehydrate")
         .await
       {
+        self.finalize_run(RunStatus::Failure).await;
+        self.cleanup().await;
+        return self.terminate_running_nodes(RunStatus::Failure).await;
+      }
+      if self.promote_started_pending_to_running(&outcomes).await {
         self.finalize_run(RunStatus::Failure).await;
         self.cleanup().await;
         return self.terminate_running_nodes(RunStatus::Failure).await;
@@ -349,9 +354,7 @@ impl Coordinator {
     let mut s3_reconcile = interval(Duration::from_secs(reconcile_secs));
     s3_reconcile.tick().await;
 
-    if !self.is_rehydrate {
-      self.dispatch_ready_nodes().await;
-    }
+    self.dispatch_ready_nodes().await;
 
     if self.run.is_complete() {
       let status = self.outcome_status();
@@ -646,22 +649,22 @@ impl Coordinator {
     }
   }
 
-  async fn read_outcomes_for_running(
+  async fn read_outcomes_for_non_terminal(
     &self,
   ) -> std::collections::HashMap<String, crate::source_manager::ReconcileResult> {
-    let running_nodes: Vec<String> = self
+    let nodes: Vec<String> = self
       .run
       .statuses()
       .iter()
       .filter_map(|(name, status)| {
-        if matches!(status, NodeStatus::Running) {
+        if matches!(status, NodeStatus::Running | NodeStatus::Pending) {
           Some(name.clone())
         } else {
           None
         }
       })
       .collect();
-    if running_nodes.is_empty() {
+    if nodes.is_empty() {
       return std::collections::HashMap::new();
     }
     let budget = Duration::from_secs(7);
@@ -669,7 +672,7 @@ impl Coordinator {
       budget,
       self
         .dispatcher
-        .read_outcomes_for_running_nodes(&self.run_id, &running_nodes),
+        .read_outcomes_for_running_nodes(&self.run_id, &nodes),
     )
     .await
     {
@@ -677,7 +680,7 @@ impl Coordinator {
       Err(_) => {
         warn!(
           run_id = %self.run_id,
-          running = running_nodes.len(),
+          nodes = nodes.len(),
           "S3 reconcile exceeded per-tick budget; skipping this tick"
         );
         std::collections::HashMap::new()
@@ -692,10 +695,12 @@ impl Coordinator {
   ) -> bool {
     for (node_name, result) in outcomes {
       if let crate::source_manager::ReconcileResult::Completed { success, .. } = *result {
+        let prior_status = self.run.statuses().get(node_name).copied();
         info!(
           run_id = %self.run_id,
           node_name,
           success,
+          ?prior_status,
           branch,
           "Folding S3-observed completion via reconcile"
         );
@@ -708,8 +713,75 @@ impl Coordinator {
     false
   }
 
+  async fn promote_started_pending_to_running(
+    &mut self,
+    outcomes: &std::collections::HashMap<String, crate::source_manager::ReconcileResult>,
+  ) -> bool {
+    let to_promote: Vec<String> = outcomes
+      .iter()
+      .filter_map(|(name, result)| {
+        if matches!(
+          result,
+          crate::source_manager::ReconcileResult::InProgress { .. }
+        ) && matches!(self.run.statuses().get(name), Some(NodeStatus::Pending))
+        {
+          Some(name.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+    for node_name in to_promote {
+      if !self.run.mark_running(&node_name) {
+        continue;
+      }
+      info!(
+        run_id = %self.run_id,
+        node_name,
+        "Rehydrate: S3 shows node already started; promoting Pending -> Running without re-dispatch"
+      );
+      if let Err(e) = self.persist_state().await {
+        warn!(
+          run_id = %self.run_id,
+          node_name,
+          error = %e,
+          "Failed to persist Pending->Running promotion during rehydrate"
+        );
+      }
+      match self
+        .dispatcher
+        .node_pod_exists(&self.run_id, &node_name)
+        .await
+      {
+        Ok(true) => {}
+        Ok(false) => {
+          info!(
+            run_id = %self.run_id,
+            node_name,
+            "Rehydrate: K8s has no pod for promoted node; treating as PodDeletedUnexpectedly"
+          );
+          if self
+            .handle_node_infra_failed(&node_name, &InfraFailureReason::PodDeletedUnexpectedly)
+            .await
+          {
+            return true;
+          }
+        }
+        Err(e) => {
+          warn!(
+            run_id = %self.run_id,
+            node_name,
+            error = %e,
+            "Rehydrate: failed to query K8s for promoted node's pod; deferring to runtime timer"
+          );
+        }
+      }
+    }
+    false
+  }
+
   async fn reconcile_running_against_s3(&mut self, branch: &'static str) -> bool {
-    let outcomes = self.read_outcomes_for_running().await;
+    let outcomes = self.read_outcomes_for_non_terminal().await;
     self.fold_completions_from_outcomes(&outcomes, branch).await
   }
 
@@ -1385,6 +1457,14 @@ mod tests {
     async fn record_pipeline_run(&self, _: PipelineRunRecord) -> Result<(), RunHistoryError> {
       Ok(())
     }
+    async fn finalize_pipeline_run_status(
+      &self,
+      _: &str,
+      _: RunStatus,
+      _: chrono::DateTime<Utc>,
+    ) -> Result<bool, RunHistoryError> {
+      Ok(false)
+    }
     async fn record_node_dispatched(&self, _: NodeDispatchRecord) -> Result<(), RunHistoryError> {
       Ok(())
     }
@@ -1396,6 +1476,9 @@ mod tests {
       &self,
       _: ListRunsQuery,
     ) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
+      Ok(vec![])
+    }
+    async fn list_in_progress_runs(&self) -> Result<Vec<PipelineRunRow>, RunHistoryError> {
       Ok(vec![])
     }
     async fn count_pipeline_runs(&self, _: &RunFilters) -> Result<i64, RunHistoryError> {
@@ -1488,6 +1571,23 @@ nodes:
 
   struct RehydrateDispatcher {
     outcomes: std::collections::HashMap<String, crate::source_manager::ReconcileResult>,
+    missing_pods: std::collections::HashSet<String>,
+  }
+
+  impl RehydrateDispatcher {
+    fn new(
+      outcomes: std::collections::HashMap<String, crate::source_manager::ReconcileResult>,
+    ) -> Self {
+      Self {
+        outcomes,
+        missing_pods: std::collections::HashSet::new(),
+      }
+    }
+
+    fn with_missing_pod(mut self, node_name: &str) -> Self {
+      self.missing_pods.insert(node_name.to_string());
+      self
+    }
   }
 
   #[async_trait::async_trait]
@@ -1524,6 +1624,9 @@ nodes:
       }
       out
     }
+    async fn node_pod_exists(&self, _: &str, node_name: &str) -> Result<bool, DispatchError> {
+      Ok(!self.missing_pods.contains(node_name))
+    }
   }
 
   #[tokio::test]
@@ -1556,7 +1659,7 @@ nodes:
         finished_at_ms: 1_700_000_010_000,
       },
     );
-    let dispatcher = Arc::new(RehydrateDispatcher { outcomes });
+    let dispatcher = Arc::new(RehydrateDispatcher::new(outcomes));
     let backplane = InMemoryBackplane::new();
     let config = make_config();
 
@@ -1581,6 +1684,130 @@ nodes:
     assert_eq!(
       summary.node_statuses.get("build"),
       Some(&NodeStatus::Success)
+    );
+  }
+
+  #[tokio::test]
+  async fn rehydration_folds_completion_when_redis_state_is_stale_pending() {
+    // The user's scenario: coordinator dispatched a node (in-memory state was
+    // Running, record_node_dispatched written), but died before persist_state.
+    // Redis still has the node as Pending. Reaper reclaims; rehydrate fold must
+    // notice the S3 completion and fold it straight from Pending -> Success
+    // without re-dispatching.
+    let state_store = InMemoryStateStore::new();
+    let pipeline = make_pipeline();
+    let run_id = "rehydrate-stale-pending";
+
+    let mut statuses = HashMap::new();
+    statuses.insert("build".to_string(), NodeStatus::Pending);
+    let mut deps = HashMap::new();
+    deps.insert("build".to_string(), vec![]);
+    let pre_existing = state_store::RunState {
+      version: 1,
+      statuses,
+      dependencies: deps,
+      pipeline: (*pipeline).clone(),
+    };
+    state_store
+      .save_run(run_id, &pre_existing, 0)
+      .await
+      .unwrap();
+
+    let mut outcomes = std::collections::HashMap::new();
+    outcomes.insert(
+      "build".to_string(),
+      crate::source_manager::ReconcileResult::Completed {
+        success: true,
+        started_at_ms: Some(1_700_000_000_000),
+        finished_at_ms: 1_700_000_010_000,
+      },
+    );
+    let dispatcher = Arc::new(RehydrateDispatcher::new(outcomes));
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+
+    let handle = start_coordinator(
+      run_id.to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store: state_store.clone(),
+        backplane,
+        run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Success);
+    assert_eq!(
+      summary.node_statuses.get("build"),
+      Some(&NodeStatus::Success)
+    );
+  }
+
+  #[tokio::test]
+  async fn rehydration_fails_fast_when_promoted_pending_pod_is_missing() {
+    // Pending in Redis (dispatch ran but persist was lost), S3 has started_at
+    // but no finished_at (Tube didn't get to write completion), and the K8s
+    // pod is gone (deleted/evicted). The rehydrate path must mark the node
+    // PodDeletedUnexpectedly immediately rather than waiting for the runtime
+    // timer to fire.
+    let state_store = InMemoryStateStore::new();
+    let pipeline = make_pipeline();
+    let run_id = "rehydrate-missing-pod";
+
+    let mut statuses = HashMap::new();
+    statuses.insert("build".to_string(), NodeStatus::Pending);
+    let mut deps = HashMap::new();
+    deps.insert("build".to_string(), vec![]);
+    let pre_existing = state_store::RunState {
+      version: 1,
+      statuses,
+      dependencies: deps,
+      pipeline: (*pipeline).clone(),
+    };
+    state_store
+      .save_run(run_id, &pre_existing, 0)
+      .await
+      .unwrap();
+
+    let mut outcomes = std::collections::HashMap::new();
+    outcomes.insert(
+      "build".to_string(),
+      crate::source_manager::ReconcileResult::InProgress {
+        started_at_ms: 1_700_000_000_000,
+      },
+    );
+    let dispatcher = Arc::new(RehydrateDispatcher::new(outcomes).with_missing_pod("build"));
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+
+    let handle = start_coordinator(
+      run_id.to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store: state_store.clone(),
+        backplane,
+        run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(
+      summary.node_statuses.get("build"),
+      Some(&NodeStatus::Failed)
     );
   }
 
@@ -1614,7 +1841,7 @@ nodes:
         finished_at_ms: 1_700_000_010_000,
       },
     );
-    let dispatcher = Arc::new(RehydrateDispatcher { outcomes });
+    let dispatcher = Arc::new(RehydrateDispatcher::new(outcomes));
     let backplane = InMemoryBackplane::new();
     let config = make_config();
 

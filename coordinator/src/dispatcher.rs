@@ -88,6 +88,10 @@ pub trait Dispatcher: Send + Sync {
     Ok(None)
   }
 
+  async fn node_pod_exists(&self, _run_id: &str, _node_name: &str) -> Result<bool, DispatchError> {
+    Ok(true)
+  }
+
   async fn start_pod_watcher(
     &self,
     _run_id: &str,
