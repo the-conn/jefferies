@@ -825,6 +825,9 @@ impl Coordinator {
         error!(run_id = %self.run_id, node_name = %node_name, "Node info not found in pipeline");
         self.run.mark_dispatch_failed(&node_name);
         self
+          .persist_state_after_dispatch_transition(&node_name)
+          .await;
+        self
           .record_dispatch_failed(&node_name, "Node info not found in pipeline")
           .await;
         continue;
@@ -844,6 +847,9 @@ impl Coordinator {
             warn!(run_id = %self.run_id, node_name = %node_name, "Unexpected state transition: node was not Pending");
           } else {
             info!(run_id = %self.run_id, node_name = %node_name, "Node dispatched");
+            self
+              .persist_state_after_dispatch_transition(&node_name)
+              .await;
             self.record_node_dispatched(&node_name, &node).await;
             let handle = self.spawn_startup_timeout(&node_name, startup_secs);
             self.node_phase_handles.insert(
@@ -859,9 +865,23 @@ impl Coordinator {
           let err_message = e.to_string();
           error!(run_id = %self.run_id, node_name = %node_name, error = %err_message, "Failed to dispatch node");
           self.run.mark_dispatch_failed(&node_name);
+          self
+            .persist_state_after_dispatch_transition(&node_name)
+            .await;
           self.record_dispatch_failed(&node_name, &err_message).await;
         }
       }
+    }
+  }
+
+  async fn persist_state_after_dispatch_transition(&mut self, node_name: &str) {
+    if let Err(e) = self.persist_state().await {
+      warn!(
+        run_id = %self.run_id,
+        node_name,
+        error = %e,
+        "Failed to persist state after dispatch transition; resiliency paths will recover"
+      );
     }
   }
 
@@ -2067,6 +2087,62 @@ nodes:
       build_record.failure_reason.is_none(),
       "the OOM signal should have been dropped because build was already Success"
     );
+  }
+
+  #[tokio::test]
+  async fn dispatch_persists_running_state_to_redis() {
+    // Regression: previously dispatch_ready_nodes mutated only in-memory state,
+    // leaving Redis showing Pending for a node that had been Running for minutes.
+    // After the fix, Redis must reflect the Running transition immediately.
+    let state_store = InMemoryStateStore::new();
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+    let pipeline = make_pipeline();
+    let dispatcher = Arc::new(InjectableDispatcher::new());
+    let dispatch_called = dispatcher.dispatch_called_notify();
+    let dispatch_done = dispatcher.dispatch_done_flag();
+    let watcher_started = dispatcher.watcher_started_notify();
+    let signal_slot = dispatcher.signal_tx_slot();
+    let backplane_for_test = backplane.clone();
+    let state_store_for_test = state_store.clone();
+
+    let handle = start_coordinator(
+      "test-persist-running".to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store,
+        backplane,
+        run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let _ = wait_for_signal_tx(watcher_started, signal_slot).await;
+    wait_for_dispatch(dispatch_called, dispatch_done).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let persisted = state_store_for_test
+      .load_run("test-persist-running")
+      .await
+      .expect("load_run ok")
+      .expect("state present");
+    assert_eq!(
+      persisted.statuses.get("build"),
+      Some(&NodeStatus::Running),
+      "Redis must show build=Running after dispatch (was stale Pending before fix)"
+    );
+
+    backplane_for_test
+      .publish_node_completed("test-persist-running", "build", true)
+      .await
+      .expect("publish completion");
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Success);
   }
 
   fn make_pipeline_with_timeouts(startup_secs: u64, runtime_secs: u64) -> Arc<Pipeline> {
