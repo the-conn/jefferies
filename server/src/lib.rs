@@ -274,6 +274,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     state.dispatcher.clone(),
     state.state_store.clone(),
     state.backplane.clone(),
+    state.run_history.clone(),
   );
 
   let auth_state = auth::build_auth_state(&shared_config)
@@ -318,6 +319,13 @@ async fn health_ready(State(state): State<Arc<ProviderState>>) -> StatusCode {
   }
 }
 
+fn validate_poke_outcome(outcome: &coordinator::NodeOutcome) -> Option<bool> {
+  match (outcome.success, outcome.finished_at) {
+    (Some(success), Some(_)) => Some(success),
+    _ => None,
+  }
+}
+
 async fn handle_node_poke(
   State(state): State<Arc<ProviderState>>,
   Path((run_id, node_name)): Path<(String, String)>,
@@ -337,9 +345,22 @@ async fn handle_node_poke(
       return StatusCode::INTERNAL_SERVER_ERROR;
     }
   };
+  let success = match validate_poke_outcome(&outcome) {
+    Some(s) => s,
+    None => {
+      warn!(
+        run_id,
+        node_name,
+        success_present = outcome.success.is_some(),
+        finished_at_present = outcome.finished_at.is_some(),
+        "Poke received with incomplete status.json; rejecting"
+      );
+      return StatusCode::BAD_REQUEST;
+    }
+  };
   match state
     .backplane
-    .publish_node_completed(&run_id, &node_name, outcome.success.unwrap_or(false))
+    .publish_node_completed(&run_id, &node_name, success)
     .await
   {
     Ok(()) => StatusCode::OK,
@@ -616,7 +637,7 @@ mod tests {
   use auth::AuthSession;
   use axum::{body::Body, http::Request};
   use backplane::InMemoryBackplane;
-  use coordinator::LogDispatcher;
+  use coordinator::{LogDispatcher, NodeOutcome};
   use http_body_util::BodyExt;
   use run_history::NoOpRunHistory;
   use serde_json::Value;
@@ -1260,5 +1281,45 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[test]
+  fn validate_poke_outcome_accepts_complete_success() {
+    let outcome = NodeOutcome {
+      success: Some(true),
+      started_at: Some(1_000),
+      finished_at: Some(2_000),
+    };
+    assert_eq!(super::validate_poke_outcome(&outcome), Some(true));
+  }
+
+  #[test]
+  fn validate_poke_outcome_accepts_complete_failure() {
+    let outcome = NodeOutcome {
+      success: Some(false),
+      started_at: Some(1_000),
+      finished_at: Some(2_000),
+    };
+    assert_eq!(super::validate_poke_outcome(&outcome), Some(false));
+  }
+
+  #[test]
+  fn validate_poke_outcome_rejects_missing_success() {
+    let outcome = NodeOutcome {
+      success: None,
+      started_at: Some(1_000),
+      finished_at: Some(2_000),
+    };
+    assert_eq!(super::validate_poke_outcome(&outcome), None);
+  }
+
+  #[test]
+  fn validate_poke_outcome_rejects_missing_finished_at() {
+    let outcome = NodeOutcome {
+      success: Some(true),
+      started_at: Some(1_000),
+      finished_at: None,
+    };
+    assert_eq!(super::validate_poke_outcome(&outcome), None);
   }
 }

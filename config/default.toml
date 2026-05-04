@@ -10,6 +10,7 @@ default_pipeline_timeout_secs = 3600
 default_node_timeout_secs = 600
 default_node_startup_timeout_secs = 300
 fail_fast = true
+s3_reconcile_interval_secs = 60
 
 [redis]
 url = "redis://localhost:6379"

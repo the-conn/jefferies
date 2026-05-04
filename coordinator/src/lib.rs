@@ -16,4 +16,4 @@ pub use message::CoordinatorMessage;
 pub use pod_watcher::{InfraFailureReason, PodSignal, PodWatcher, WatcherCommand};
 pub use reaper::start_reaper;
 pub use run::{NodeStatus, PipelineRun};
-pub use source_manager::{NodeOutcome, SourceError, SourceManager};
+pub use source_manager::{NodeOutcome, ReconcileResult, SourceError, SourceManager};

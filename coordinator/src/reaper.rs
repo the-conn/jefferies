@@ -2,8 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use app_config::AppConfig;
 use backplane::Backplane;
-use chrono::Utc;
-use run_history::NoOpRunHistory;
+use run_history::{PipelineRunRow, RunHistory};
 use state_store::StateStore;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -18,8 +17,19 @@ pub fn start_reaper(
   dispatcher: Arc<dyn Dispatcher>,
   state_store: Arc<dyn StateStore>,
   backplane: Arc<dyn Backplane>,
+  run_history: Arc<dyn RunHistory>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
+    reclaim_orphaned_runs(
+      config.clone(),
+      dispatcher.clone(),
+      state_store.clone(),
+      backplane.clone(),
+      run_history.clone(),
+    )
+    .await;
+    sweep_stranded_resources(dispatcher.clone(), state_store.clone()).await;
+
     let mut lease_tick = tokio::time::interval(Duration::from_secs(LEASE_RECLAIM_INTERVAL_SECS));
     let mut sweep_tick = tokio::time::interval(Duration::from_secs(RESOURCE_SWEEP_INTERVAL_SECS));
     lease_tick.tick().await;
@@ -32,6 +42,7 @@ pub fn start_reaper(
             dispatcher.clone(),
             state_store.clone(),
             backplane.clone(),
+            run_history.clone(),
           )
           .await;
         }
@@ -48,6 +59,7 @@ async fn reclaim_orphaned_runs(
   dispatcher: Arc<dyn Dispatcher>,
   state_store: Arc<dyn StateStore>,
   backplane: Arc<dyn Backplane>,
+  run_history: Arc<dyn RunHistory>,
 ) {
   let orphaned = match state_store.get_orphaned_runs().await {
     Ok(runs) => runs,
@@ -59,6 +71,27 @@ async fn reclaim_orphaned_runs(
 
   for run_id in orphaned {
     info!(run_id, "Reclaiming orphaned run");
+
+    if state_store.load_run(&run_id).await.ok().flatten().is_none() {
+      warn!(run_id, "Orphaned run state disappeared before reclaim");
+      continue;
+    }
+
+    let pipeline_row = match run_history.get_pipeline_run(&run_id).await {
+      Ok(Some(row)) => row,
+      Ok(None) => {
+        error!(
+          run_id,
+          "No pipeline_runs row in Postgres for orphaned run; finalizing as Failure"
+        );
+        finalize_unrecoverable_orphan(&run_id, &dispatcher, &state_store).await;
+        continue;
+      }
+      Err(e) => {
+        error!(run_id, error = %e, "Failed to query pipeline_runs for orphaned run; skipping");
+        continue;
+      }
+    };
 
     let run_state = match state_store.load_run(&run_id).await {
       Ok(Some(state)) => state,
@@ -73,6 +106,7 @@ async fn reclaim_orphaned_runs(
     };
 
     let pipeline = std::sync::Arc::new(run_state.pipeline.clone());
+    let run_context = run_context_from_row(pipeline_row);
 
     match start_coordinator(
       run_id.clone(),
@@ -82,23 +116,10 @@ async fn reclaim_orphaned_runs(
         dispatcher: dispatcher.clone(),
         state_store: state_store.clone(),
         backplane: backplane.clone(),
-        run_history: Arc::new(NoOpRunHistory),
+        run_history: run_history.clone(),
         status_reporter: None,
       },
-      RunContext {
-        owner: String::new(),
-        repo: String::new(),
-        sha: String::new(),
-        branch: None,
-        target_branch: None,
-        tag: None,
-        pr_number: None,
-        trigger: String::new(),
-        pipeline_yaml: String::new(),
-        created_at: Utc::now(),
-        retry_of: None,
-        tenant_slug: None,
-      },
+      run_context,
     )
     .await
     {
@@ -123,6 +144,39 @@ async fn reclaim_orphaned_runs(
         info!(run_id, "Another server acquired lease for orphaned run");
       }
     }
+  }
+}
+
+fn run_context_from_row(row: PipelineRunRow) -> RunContext {
+  RunContext {
+    owner: row.owner,
+    repo: row.repo,
+    sha: row.sha,
+    branch: row.branch,
+    target_branch: row.target_branch,
+    tag: row.tag,
+    pr_number: row.pr_number,
+    trigger: row.trigger,
+    pipeline_yaml: row.pipeline_definition,
+    created_at: row.created_at,
+    retry_of: row.retry_of.map(|u| u.to_string()),
+    tenant_slug: row.tenant_slug,
+  }
+}
+
+async fn finalize_unrecoverable_orphan(
+  run_id: &str,
+  dispatcher: &Arc<dyn Dispatcher>,
+  state_store: &Arc<dyn StateStore>,
+) {
+  if let Err(e) = dispatcher.cleanup_run(run_id).await {
+    warn!(run_id, error = %e, "Failed to cleanup dispatcher resources for unrecoverable orphan");
+  }
+  if let Err(e) = state_store.release_lease(run_id).await {
+    warn!(run_id, error = %e, "Failed to release lease for unrecoverable orphan");
+  }
+  if let Err(e) = state_store.delete_run(run_id).await {
+    warn!(run_id, error = %e, "Failed to delete state for unrecoverable orphan");
   }
 }
 
@@ -297,6 +351,69 @@ nodes:
     assert_eq!(calls, vec!["done-run".to_string()]);
     assert!(state_store.load_run("done-run").await.unwrap().is_none());
     assert!(state_store.load_run("active-run").await.unwrap().is_some());
+  }
+
+  fn make_pipeline_run_row(run_id_str: &str, owner: &str, repo: &str) -> PipelineRunRow {
+    PipelineRunRow {
+      run_id: uuid::Uuid::parse_str(run_id_str).unwrap(),
+      pipeline_name: "test-pipeline".to_string(),
+      owner: owner.to_string(),
+      repo: repo.to_string(),
+      sha: "deadbeef".to_string(),
+      branch: Some("main".to_string()),
+      target_branch: None,
+      tag: None,
+      pr_number: None,
+      trigger: "push".to_string(),
+      pipeline_definition: "name: test-pipeline\nnodes: []".to_string(),
+      status: run_history::RunStatus::InProgress,
+      created_at: chrono::Utc::now(),
+      completed_at: None,
+      retry_of: None,
+      tenant_slug: Some("the-conn".to_string()),
+    }
+  }
+
+  #[test]
+  fn run_context_from_row_populates_all_fields() {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let row = make_pipeline_run_row(&run_id, "the-conn", "jefferies");
+    let ctx = run_context_from_row(row);
+    assert_eq!(ctx.owner, "the-conn");
+    assert_eq!(ctx.repo, "jefferies");
+    assert_eq!(ctx.sha, "deadbeef");
+    assert_eq!(ctx.branch.as_deref(), Some("main"));
+    assert_eq!(ctx.trigger, "push");
+    assert_eq!(ctx.tenant_slug.as_deref(), Some("the-conn"));
+    assert!(!ctx.pipeline_yaml.is_empty());
+  }
+
+  #[tokio::test]
+  async fn reclaim_orphan_with_no_postgres_row_finalizes_run() {
+    let state_store = InMemoryStateStore::new();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    state_store
+      .save_run(&run_id, &make_state(NodeStatus::Running), 0)
+      .await
+      .unwrap();
+
+    let dispatcher = Arc::new(TrackingDispatcher::new(vec![]));
+    let backplane: Arc<dyn Backplane> = backplane::InMemoryBackplane::new();
+    let run_history: Arc<dyn RunHistory> = Arc::new(run_history::NoOpRunHistory);
+    let config = Arc::new(AppConfig::load().expect("test config"));
+
+    reclaim_orphaned_runs(
+      config,
+      dispatcher.clone(),
+      state_store.clone(),
+      backplane,
+      run_history,
+    )
+    .await;
+
+    let cleanup_calls = dispatcher.cleanup_calls.lock().unwrap().clone();
+    assert_eq!(cleanup_calls, vec![run_id.clone()]);
+    assert!(state_store.load_run(&run_id).await.unwrap().is_none());
   }
 
   #[tokio::test]

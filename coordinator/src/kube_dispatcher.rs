@@ -540,6 +540,17 @@ impl Dispatcher for KubeDispatcher {
     }
   }
 
+  async fn read_outcomes_for_running_nodes(
+    &self,
+    run_id: &str,
+    nodes: &[String],
+  ) -> std::collections::HashMap<String, crate::source_manager::ReconcileResult> {
+    self
+      .source_manager
+      .read_outcomes_for_running_nodes(run_id, nodes)
+      .await
+  }
+
   async fn get_node_log(
     &self,
     run_id: &str,
@@ -557,6 +568,7 @@ impl Dispatcher for KubeDispatcher {
     run_id: &str,
     signal_tx: mpsc::Sender<PodSignal>,
     cmd_rx: mpsc::Receiver<WatcherCommand>,
+    seed_running: std::collections::HashSet<String>,
   ) -> Option<JoinHandle<()>> {
     let watcher = PodWatcher::new(
       self.client.clone(),
@@ -564,6 +576,7 @@ impl Dispatcher for KubeDispatcher {
       run_id.to_string(),
       signal_tx,
       cmd_rx,
+      seed_running,
     );
     Some(tokio::spawn(watcher.run()))
   }

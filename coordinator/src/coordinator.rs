@@ -101,6 +101,7 @@ struct Coordinator {
   pod_watcher_handle: Option<JoinHandle<()>>,
   signal_relay_handle: Option<JoinHandle<()>>,
   watcher_cmd_tx: Option<mpsc::Sender<WatcherCommand>>,
+  is_rehydrate: bool,
 }
 
 pub async fn start_coordinator(
@@ -130,13 +131,25 @@ pub async fn start_coordinator(
     }
   };
 
+  if let Err(e) = services
+    .run_history
+    .record_pipeline_started(build_pipeline_start_record(
+      &run_id,
+      &pipeline,
+      &run_context,
+    ))
+    .await
+  {
+    warn!(run_id, error = %e, "Failed to record pipeline start");
+  }
+
   let node_infos = pipeline.node_info();
   let node_info_cache = node_infos
     .iter()
     .map(|n| (n.name.clone(), n.clone()))
     .collect();
 
-  let (run, state_version) = initialize_run_state(
+  let (run, state_version, is_rehydrate) = initialize_run_state(
     &run_id,
     &node_infos,
     &pipeline,
@@ -146,8 +159,25 @@ pub async fn start_coordinator(
 
   let (internal_tx, internal_rx) = mpsc::channel(128);
 
-  let (pod_watcher_handle, signal_relay_handle, watcher_cmd_tx) =
-    spawn_pod_watcher(&run_id, &services.dispatcher, internal_tx.clone()).await;
+  let seed_running: std::collections::HashSet<String> = run
+    .statuses()
+    .iter()
+    .filter_map(|(name, status)| {
+      if matches!(status, NodeStatus::Running) {
+        Some(name.clone())
+      } else {
+        None
+      }
+    })
+    .collect();
+
+  let (pod_watcher_handle, signal_relay_handle, watcher_cmd_tx) = spawn_pod_watcher(
+    &run_id,
+    &services.dispatcher,
+    internal_tx.clone(),
+    seed_running,
+  )
+  .await;
 
   let coordinator = Coordinator {
     run_id,
@@ -170,6 +200,7 @@ pub async fn start_coordinator(
     pod_watcher_handle,
     signal_relay_handle,
     watcher_cmd_tx,
+    is_rehydrate,
   };
 
   Some(tokio::spawn(coordinator.run()))
@@ -179,6 +210,7 @@ async fn spawn_pod_watcher(
   run_id: &str,
   dispatcher: &Arc<dyn Dispatcher>,
   internal_tx: mpsc::Sender<CoordinatorMessage>,
+  seed_running: std::collections::HashSet<String>,
 ) -> (
   Option<JoinHandle<()>>,
   Option<JoinHandle<()>>,
@@ -188,7 +220,7 @@ async fn spawn_pod_watcher(
   let (cmd_tx, cmd_rx) = mpsc::channel::<WatcherCommand>(32);
 
   let Some(watcher_handle) = dispatcher
-    .start_pod_watcher(run_id, signal_tx, cmd_rx)
+    .start_pod_watcher(run_id, signal_tx, cmd_rx, seed_running)
     .await
   else {
     return (None, None, None);
@@ -218,7 +250,7 @@ async fn initialize_run_state(
   node_infos: &[NodeInfo],
   pipeline: &Arc<Pipeline>,
   state_store: &dyn StateStore,
-) -> (PipelineRun, u64) {
+) -> (PipelineRun, u64, bool) {
   match state_store.load_run(run_id).await {
     Ok(Some(existing)) => {
       info!(
@@ -227,7 +259,7 @@ async fn initialize_run_state(
         "Resuming existing run state"
       );
       let run = PipelineRun::from_run_state(&existing);
-      (run, existing.version)
+      (run, existing.version, true)
     }
     Ok(None) => {
       let run = PipelineRun::new(node_infos);
@@ -235,12 +267,12 @@ async fn initialize_run_state(
       if let Err(e) = state_store.save_run(run_id, &state, 0).await {
         error!(run_id, error = %e, "Failed to save initial run state");
       }
-      (run, 0)
+      (run, 0, false)
     }
     Err(e) => {
       error!(run_id, error = %e, "Failed to load run state; starting fresh");
       let run = PipelineRun::new(node_infos);
-      (run, 0)
+      (run, 0, false)
     }
   }
 }
@@ -249,10 +281,32 @@ fn ms_to_datetime(ms: u128) -> Option<DateTime<Utc>> {
   DateTime::from_timestamp((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as u32)
 }
 
+fn build_pipeline_start_record(
+  run_id: &str,
+  pipeline: &Pipeline,
+  run_context: &RunContext,
+) -> PipelineStartRecord {
+  PipelineStartRecord {
+    run_id: run_id.to_string(),
+    pipeline_name: pipeline.name().to_string(),
+    owner: run_context.owner.clone(),
+    repo: run_context.repo.clone(),
+    sha: run_context.sha.clone(),
+    branch: run_context.branch.clone(),
+    target_branch: run_context.target_branch.clone(),
+    tag: run_context.tag.clone(),
+    pr_number: run_context.pr_number,
+    trigger: run_context.trigger.clone(),
+    pipeline_definition: run_context.pipeline_yaml.clone(),
+    created_at: run_context.created_at,
+    retry_of: run_context.retry_of.clone(),
+    tenant_slug: run_context.tenant_slug.clone(),
+  }
+}
+
 impl Coordinator {
   async fn run(mut self) -> RunSummary {
     info!(run_id = %self.run_id, server_id = %self.server_id, "Coordinator starting");
-    self.record_pipeline_started().await;
 
     let pipeline_timeout_secs = self
       .pipeline
@@ -260,6 +314,25 @@ impl Coordinator {
       .unwrap_or_else(|| self.config.default_pipeline_timeout_secs());
     let pipeline_deadline = tokio::time::sleep(Duration::from_secs(pipeline_timeout_secs));
     tokio::pin!(pipeline_deadline);
+
+    if self.is_rehydrate {
+      let outcomes = self.read_outcomes_for_running().await;
+      if self
+        .fold_completions_from_outcomes(&outcomes, "rehydrate")
+        .await
+      {
+        self.finalize_run(RunStatus::Failure).await;
+        self.cleanup().await;
+        return self.terminate_running_nodes(RunStatus::Failure).await;
+      }
+      self.rehydrate_phase_timers(&outcomes).await;
+      if self.run.is_complete() {
+        let status = self.outcome_status();
+        self.finalize_run(status).await;
+        self.cleanup().await;
+        return self.build_summary(status).await;
+      }
+    }
 
     let mut subscription = match self.backplane.subscribe_run(&self.run_id).await {
       Ok(sub) => sub,
@@ -272,7 +345,13 @@ impl Coordinator {
     let mut heartbeat = interval(Duration::from_secs(15));
     heartbeat.tick().await;
 
-    self.dispatch_ready_nodes().await;
+    let reconcile_secs = self.config.s3_reconcile_interval_secs();
+    let mut s3_reconcile = interval(Duration::from_secs(reconcile_secs));
+    s3_reconcile.tick().await;
+
+    if !self.is_rehydrate {
+      self.dispatch_ready_nodes().await;
+    }
 
     if self.run.is_complete() {
       let status = self.outcome_status();
@@ -301,6 +380,16 @@ impl Coordinator {
           if !renewed {
             warn!(run_id = %self.run_id, "Lease renewal failed; another server took over");
             return self.build_summary(RunStatus::Failure).await;
+          }
+        }
+        _ = s3_reconcile.tick() => {
+          if self.reconcile_running_against_s3("periodic").await {
+            self.finalize_run(RunStatus::Failure).await;
+            self.cleanup().await;
+            return self.terminate_running_nodes(RunStatus::Failure).await;
+          }
+          if self.run.is_complete() {
+            break;
           }
         }
         msg = self.internal_rx.recv() => {
@@ -557,6 +646,73 @@ impl Coordinator {
     }
   }
 
+  async fn read_outcomes_for_running(
+    &self,
+  ) -> std::collections::HashMap<String, crate::source_manager::ReconcileResult> {
+    let running_nodes: Vec<String> = self
+      .run
+      .statuses()
+      .iter()
+      .filter_map(|(name, status)| {
+        if matches!(status, NodeStatus::Running) {
+          Some(name.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+    if running_nodes.is_empty() {
+      return std::collections::HashMap::new();
+    }
+    let budget = Duration::from_secs(7);
+    match tokio::time::timeout(
+      budget,
+      self
+        .dispatcher
+        .read_outcomes_for_running_nodes(&self.run_id, &running_nodes),
+    )
+    .await
+    {
+      Ok(o) => o,
+      Err(_) => {
+        warn!(
+          run_id = %self.run_id,
+          running = running_nodes.len(),
+          "S3 reconcile exceeded per-tick budget; skipping this tick"
+        );
+        std::collections::HashMap::new()
+      }
+    }
+  }
+
+  async fn fold_completions_from_outcomes(
+    &mut self,
+    outcomes: &std::collections::HashMap<String, crate::source_manager::ReconcileResult>,
+    branch: &'static str,
+  ) -> bool {
+    for (node_name, result) in outcomes {
+      if let crate::source_manager::ReconcileResult::Completed { success, .. } = *result {
+        info!(
+          run_id = %self.run_id,
+          node_name,
+          success,
+          branch,
+          "Folding S3-observed completion via reconcile"
+        );
+        self.cancel_node_timeout(node_name);
+        if self.handle_node_completed(node_name, success).await {
+          return true;
+        }
+      }
+    }
+    false
+  }
+
+  async fn reconcile_running_against_s3(&mut self, branch: &'static str) -> bool {
+    let outcomes = self.read_outcomes_for_running().await;
+    self.fold_completions_from_outcomes(&outcomes, branch).await
+  }
+
   async fn handle_node_timed_out(&mut self, node_name: &str) -> bool {
     if !self.run.mark_failed(node_name) {
       return false;
@@ -664,6 +820,109 @@ impl Coordinator {
     }
   }
 
+  async fn rehydrate_phase_timers(
+    &mut self,
+    outcomes: &std::collections::HashMap<String, crate::source_manager::ReconcileResult>,
+  ) {
+    let now_ms = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0);
+
+    let running_nodes: Vec<String> = self
+      .run
+      .statuses()
+      .iter()
+      .filter_map(|(n, s)| {
+        if matches!(s, NodeStatus::Running) {
+          Some(n.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+
+    for node_name in running_nodes {
+      let node = self.node_info_cache.get(&node_name).cloned();
+      let runtime_secs = node
+        .as_ref()
+        .and_then(|n| n.timeout_secs)
+        .unwrap_or_else(|| self.config.default_node_timeout_secs());
+      let startup_secs = node
+        .as_ref()
+        .and_then(|n| n.startup_timeout_secs)
+        .unwrap_or_else(|| self.config.default_node_startup_timeout_secs());
+
+      if let Some(crate::source_manager::ReconcileResult::InProgress { started_at_ms }) =
+        outcomes.get(&node_name)
+      {
+        let elapsed_secs = (now_ms.saturating_sub(*started_at_ms) / 1000) as u64;
+        let remaining = runtime_secs.saturating_sub(elapsed_secs);
+        info!(
+          run_id = %self.run_id,
+          node_name,
+          phase = "runtime",
+          remaining_secs = remaining,
+          "Re-arming phase timer from S3 started_at"
+        );
+        let handle = self.spawn_runtime_timeout(&node_name, Some(remaining));
+        self.node_phase_handles.insert(
+          node_name,
+          PhaseTimer {
+            phase: TimerPhase::Runtime,
+            handle,
+          },
+        );
+        continue;
+      }
+
+      let created_at = match self
+        .run_history
+        .get_node_run(&self.run_id, &node_name)
+        .await
+      {
+        Ok(Some(row)) => Some(row.created_at),
+        _ => None,
+      };
+
+      if let Some(dispatched_at) = created_at {
+        let elapsed_secs = (Utc::now() - dispatched_at).num_seconds().max(0) as u64;
+        let remaining = startup_secs.saturating_sub(elapsed_secs);
+        info!(
+          run_id = %self.run_id,
+          node_name,
+          phase = "startup",
+          remaining_secs = remaining,
+          "Re-arming phase timer from Postgres node_runs.created_at"
+        );
+        let handle = self.spawn_startup_timeout(&node_name, remaining);
+        self.node_phase_handles.insert(
+          node_name,
+          PhaseTimer {
+            phase: TimerPhase::Startup,
+            handle,
+          },
+        );
+      } else {
+        warn!(
+          run_id = %self.run_id,
+          node_name,
+          phase = "fallback",
+          fallback_secs = runtime_secs,
+          "No timing anchor in S3 or Postgres; arming runtime timer with full budget"
+        );
+        let handle = self.spawn_runtime_timeout(&node_name, Some(runtime_secs));
+        self.node_phase_handles.insert(
+          node_name,
+          PhaseTimer {
+            phase: TimerPhase::Runtime,
+            handle,
+          },
+        );
+      }
+    }
+  }
+
   fn spawn_startup_timeout(&self, node_name: &str, timeout_secs: u64) -> JoinHandle<()> {
     let tx = self.internal_tx.clone();
     let name = node_name.to_string();
@@ -731,28 +990,6 @@ impl Coordinator {
     }
     if let Some(handle) = self.pod_watcher_handle.take() {
       handle.abort();
-    }
-  }
-
-  async fn record_pipeline_started(&self) {
-    let record = PipelineStartRecord {
-      run_id: self.run_id.clone(),
-      pipeline_name: self.pipeline.name().to_string(),
-      owner: self.run_context.owner.clone(),
-      repo: self.run_context.repo.clone(),
-      sha: self.run_context.sha.clone(),
-      branch: self.run_context.branch.clone(),
-      target_branch: self.run_context.target_branch.clone(),
-      tag: self.run_context.tag.clone(),
-      pr_number: self.run_context.pr_number,
-      trigger: self.run_context.trigger.clone(),
-      pipeline_definition: self.run_context.pipeline_yaml.clone(),
-      created_at: self.run_context.created_at,
-      retry_of: self.run_context.retry_of.clone(),
-      tenant_slug: self.run_context.tenant_slug.clone(),
-    };
-    if let Err(e) = self.run_history.record_pipeline_started(record).await {
-      warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline start");
     }
   }
 
@@ -1095,6 +1332,7 @@ mod tests {
       _run_id: &str,
       signal_tx: mpsc::Sender<PodSignal>,
       mut cmd_rx: mpsc::Receiver<WatcherCommand>,
+      _seed_running: std::collections::HashSet<String>,
     ) -> Option<JoinHandle<()>> {
       *self.signal_tx_slot.lock().unwrap() = Some(signal_tx);
       self.watcher_started.notify_waiters();
@@ -1246,6 +1484,162 @@ nodes:
       )
       .unwrap(),
     )
+  }
+
+  struct RehydrateDispatcher {
+    outcomes: std::collections::HashMap<String, crate::source_manager::ReconcileResult>,
+  }
+
+  #[async_trait::async_trait]
+  impl Dispatcher for RehydrateDispatcher {
+    async fn dispatch(
+      &self,
+      _: &str,
+      _: &RunMetadata,
+      _: &NodeInfo,
+      _: &Pipeline,
+      _: &AppConfig,
+    ) -> Result<(), DispatchError> {
+      Ok(())
+    }
+    async fn cancel_node(&self, _: &str, _: &str, _: &AppConfig) -> Result<(), DispatchError> {
+      Ok(())
+    }
+    async fn cleanup_run(&self, _: &str) -> Result<(), DispatchError> {
+      Ok(())
+    }
+    async fn read_outcomes_for_running_nodes(
+      &self,
+      _: &str,
+      nodes: &[String],
+    ) -> std::collections::HashMap<String, crate::source_manager::ReconcileResult> {
+      let mut out = std::collections::HashMap::new();
+      for n in nodes {
+        let r = self
+          .outcomes
+          .get(n)
+          .cloned()
+          .unwrap_or(crate::source_manager::ReconcileResult::StillRunning);
+        out.insert(n.clone(), r);
+      }
+      out
+    }
+  }
+
+  #[tokio::test]
+  async fn rehydration_folds_completed_nodes_from_s3() {
+    let state_store = InMemoryStateStore::new();
+    let pipeline = make_pipeline();
+    let run_id = "rehydrate-success-run";
+
+    let mut statuses = HashMap::new();
+    statuses.insert("build".to_string(), NodeStatus::Running);
+    let mut deps = HashMap::new();
+    deps.insert("build".to_string(), vec![]);
+    let pre_existing = state_store::RunState {
+      version: 1,
+      statuses,
+      dependencies: deps,
+      pipeline: (*pipeline).clone(),
+    };
+    state_store
+      .save_run(run_id, &pre_existing, 0)
+      .await
+      .unwrap();
+
+    let mut outcomes = std::collections::HashMap::new();
+    outcomes.insert(
+      "build".to_string(),
+      crate::source_manager::ReconcileResult::Completed {
+        success: true,
+        started_at_ms: Some(1_700_000_000_000),
+        finished_at_ms: 1_700_000_010_000,
+      },
+    );
+    let dispatcher = Arc::new(RehydrateDispatcher { outcomes });
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+
+    let handle = start_coordinator(
+      run_id.to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store: state_store.clone(),
+        backplane,
+        run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Success);
+    assert_eq!(
+      summary.node_statuses.get("build"),
+      Some(&NodeStatus::Success)
+    );
+  }
+
+  #[tokio::test]
+  async fn rehydration_marks_failed_when_s3_shows_failure() {
+    let state_store = InMemoryStateStore::new();
+    let pipeline = make_pipeline();
+    let run_id = "rehydrate-failure-run";
+
+    let mut statuses = HashMap::new();
+    statuses.insert("build".to_string(), NodeStatus::Running);
+    let mut deps = HashMap::new();
+    deps.insert("build".to_string(), vec![]);
+    let pre_existing = state_store::RunState {
+      version: 1,
+      statuses,
+      dependencies: deps,
+      pipeline: (*pipeline).clone(),
+    };
+    state_store
+      .save_run(run_id, &pre_existing, 0)
+      .await
+      .unwrap();
+
+    let mut outcomes = std::collections::HashMap::new();
+    outcomes.insert(
+      "build".to_string(),
+      crate::source_manager::ReconcileResult::Completed {
+        success: false,
+        started_at_ms: Some(1_700_000_000_000),
+        finished_at_ms: 1_700_000_010_000,
+      },
+    );
+    let dispatcher = Arc::new(RehydrateDispatcher { outcomes });
+    let backplane = InMemoryBackplane::new();
+    let config = make_config();
+
+    let handle = start_coordinator(
+      run_id.to_string(),
+      pipeline,
+      CoordinatorServices {
+        config,
+        dispatcher,
+        state_store: state_store.clone(),
+        backplane,
+        run_history: Arc::new(NoOpRunHistory),
+        status_reporter: None,
+      },
+      make_run_context(),
+    )
+    .await
+    .expect("Should acquire lease");
+
+    let summary = handle.await.expect("Coordinator should complete");
+    assert_eq!(summary.status, RunStatus::Failure);
+    assert_eq!(
+      summary.node_statuses.get("build"),
+      Some(&NodeStatus::Failed)
+    );
   }
 
   #[tokio::test]
