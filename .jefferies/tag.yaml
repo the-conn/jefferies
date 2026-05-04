@@ -1,0 +1,24 @@
+name: Jefferies Tag Pipeline
+
+on:
+  push:
+    tags:
+
+nodes:
+  - name: Build Jefferies Image
+    image: quay.io/buildah/stable:latest
+    checkout: true
+    privileged: true
+    cpu: "4"
+    memory: 8Gi
+    timeout_secs: 1200
+    env:
+      STORAGE_DRIVER: vfs
+    secrets:
+      env:
+        - QUAY_USERNAME
+        - QUAY_PASSWORD
+    steps:
+      - buildah login -u $QUAY_USERNAME -p $QUAY_PASSWORD quay.io
+      - buildah bud -f Containerfile -t quay.io/the-conn/jefferies:$JEFFERIES_TAG .
+      - buildah push quay.io/the-conn/jefferies:$JEFFERIES_TAG

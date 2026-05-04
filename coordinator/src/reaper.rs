@@ -208,7 +208,7 @@ mod tests {
   use state_store::{InMemoryStateStore, NodeStatus, RunState};
 
   use super::*;
-  use crate::dispatcher::{DispatchError, Dispatcher};
+  use crate::dispatcher::{DispatchError, Dispatcher, RunMetadata};
 
   struct TrackingDispatcher {
     managed_run_ids: Mutex<Vec<String>>,
@@ -229,8 +229,7 @@ mod tests {
     async fn dispatch(
       &self,
       _: &str,
-      _: &str,
-      _: &str,
+      _: &RunMetadata,
       _: &NodeInfo,
       _: &Pipeline,
       _: &AppConfig,

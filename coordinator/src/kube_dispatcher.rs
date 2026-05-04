@@ -18,7 +18,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{info, warn};
 
 use crate::{
-  dispatcher::{DispatchError, Dispatcher},
+  dispatcher::{DispatchError, Dispatcher, RunMetadata},
   pod_watcher::{NODE_NAME_ANNOTATION, PodSignal, PodWatcher, WatcherCommand},
   source_manager::{NodeOutcome, SourceError, SourceManager},
 };
@@ -309,6 +309,27 @@ fn build_env_vars(
   ]
 }
 
+fn jefferies_env_vars(run_id: &str, metadata: &RunMetadata) -> Vec<EnvVar> {
+  let pr_number = metadata
+    .pr_number
+    .map(|n| n.to_string())
+    .unwrap_or_default();
+  vec![
+    env_var("JEFFERIES_RUN_ID", run_id),
+    env_var("JEFFERIES_TRIGGER", &metadata.trigger),
+    env_var("JEFFERIES_OWNER", &metadata.owner),
+    env_var("JEFFERIES_REPO", &metadata.repo),
+    env_var("JEFFERIES_SHA", &metadata.sha),
+    env_var("JEFFERIES_BRANCH", metadata.branch.as_deref().unwrap_or("")),
+    env_var(
+      "JEFFERIES_TARGET_BRANCH",
+      metadata.target_branch.as_deref().unwrap_or(""),
+    ),
+    env_var("JEFFERIES_TAG", metadata.tag.as_deref().unwrap_or("")),
+    env_var("JEFFERIES_PR_NUMBER", &pr_number),
+  ]
+}
+
 const SAFETY_DEADLINE_BUFFER_SECS: u64 = 60;
 
 struct JobContext<'a> {
@@ -375,12 +396,13 @@ impl Dispatcher for KubeDispatcher {
   async fn dispatch(
     &self,
     run_id: &str,
-    owner: &str,
-    repo: &str,
+    metadata: &RunMetadata,
     node: &NodeInfo,
     _pipeline: &Pipeline,
     config: &AppConfig,
   ) -> Result<(), DispatchError> {
+    let owner = metadata.owner.as_str();
+    let repo = metadata.repo.as_str();
     let has_secrets = !node.env_secrets.is_empty() || !node.file_secrets.is_empty();
     if has_secrets && (owner.is_empty() || repo.is_empty()) {
       tracing::error!(
@@ -432,6 +454,7 @@ impl Dispatcher for KubeDispatcher {
       &get_url,
       &poke_url,
     );
+    env_vars.extend(jefferies_env_vars(run_id, metadata));
     env_vars.extend(node.env.iter().map(|(k, v)| env_var(k, v)));
 
     let safety_deadline_secs = compute_safety_deadline_secs(node, config);
@@ -916,6 +939,88 @@ mod tests {
 
   const TEST_POKE_URL: &str =
     "http://jefferies.test.svc.cluster.local./api/v1/runs/run/nodes/node/poke";
+
+  fn metadata_for(
+    branch: Option<&str>,
+    target_branch: Option<&str>,
+    tag: Option<&str>,
+    pr_number: Option<i64>,
+    trigger: &str,
+  ) -> RunMetadata {
+    RunMetadata {
+      owner: "the-conn".to_string(),
+      repo: "jefferies".to_string(),
+      sha: "abc123".to_string(),
+      branch: branch.map(String::from),
+      target_branch: target_branch.map(String::from),
+      tag: tag.map(String::from),
+      pr_number,
+      trigger: trigger.to_string(),
+    }
+  }
+
+  fn env_value<'a>(vars: &'a [EnvVar], name: &str) -> Option<&'a str> {
+    vars
+      .iter()
+      .find(|v| v.name == name)
+      .and_then(|v| v.value.as_deref())
+  }
+
+  #[test]
+  fn jefferies_env_vars_emits_full_set_for_tag_push() {
+    let metadata = metadata_for(None, None, Some("v0.1.0-alpha"), None, "push");
+    let vars = jefferies_env_vars("run-1", &metadata);
+
+    assert_eq!(env_value(&vars, "JEFFERIES_RUN_ID"), Some("run-1"));
+    assert_eq!(env_value(&vars, "JEFFERIES_TRIGGER"), Some("push"));
+    assert_eq!(env_value(&vars, "JEFFERIES_OWNER"), Some("the-conn"));
+    assert_eq!(env_value(&vars, "JEFFERIES_REPO"), Some("jefferies"));
+    assert_eq!(env_value(&vars, "JEFFERIES_SHA"), Some("abc123"));
+    assert_eq!(env_value(&vars, "JEFFERIES_BRANCH"), Some(""));
+    assert_eq!(env_value(&vars, "JEFFERIES_TARGET_BRANCH"), Some(""));
+    assert_eq!(env_value(&vars, "JEFFERIES_TAG"), Some("v0.1.0-alpha"));
+    assert_eq!(env_value(&vars, "JEFFERIES_PR_NUMBER"), Some(""));
+  }
+
+  #[test]
+  fn jefferies_env_vars_pull_request_carries_branches_and_pr_number() {
+    let metadata = metadata_for(
+      Some("feature"),
+      Some("main"),
+      None,
+      Some(42),
+      "pull_request",
+    );
+    let vars = jefferies_env_vars("run-2", &metadata);
+
+    assert_eq!(env_value(&vars, "JEFFERIES_TRIGGER"), Some("pull_request"));
+    assert_eq!(env_value(&vars, "JEFFERIES_BRANCH"), Some("feature"));
+    assert_eq!(env_value(&vars, "JEFFERIES_TARGET_BRANCH"), Some("main"));
+    assert_eq!(env_value(&vars, "JEFFERIES_TAG"), Some(""));
+    assert_eq!(env_value(&vars, "JEFFERIES_PR_NUMBER"), Some("42"));
+  }
+
+  #[test]
+  fn jefferies_env_vars_always_present_so_bash_u_scripts_dont_break() {
+    let metadata = metadata_for(None, None, None, None, "");
+    let vars = jefferies_env_vars("", &metadata);
+    for name in [
+      "JEFFERIES_RUN_ID",
+      "JEFFERIES_TRIGGER",
+      "JEFFERIES_OWNER",
+      "JEFFERIES_REPO",
+      "JEFFERIES_SHA",
+      "JEFFERIES_BRANCH",
+      "JEFFERIES_TARGET_BRANCH",
+      "JEFFERIES_TAG",
+      "JEFFERIES_PR_NUMBER",
+    ] {
+      assert!(
+        vars.iter().any(|v| v.name == name),
+        "{name} must always be emitted, even when empty, so user scripts can rely on it being defined"
+      );
+    }
+  }
 
   #[test]
   fn build_env_vars_get_url_is_empty_string_when_no_source() {

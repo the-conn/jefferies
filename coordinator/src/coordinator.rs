@@ -13,7 +13,7 @@ use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 use tracing::{error, info, warn};
 
 use crate::{
-  dispatcher::Dispatcher,
+  dispatcher::{Dispatcher, RunMetadata},
   message::CoordinatorMessage,
   pod_watcher::{InfraFailureReason, PodSignal, WatcherCommand},
   run::PipelineRun,
@@ -32,6 +32,21 @@ pub struct RunContext {
   pub created_at: DateTime<Utc>,
   pub retry_of: Option<String>,
   pub tenant_slug: Option<String>,
+}
+
+impl RunContext {
+  fn run_metadata(&self) -> RunMetadata {
+    RunMetadata {
+      owner: self.owner.clone(),
+      repo: self.repo.clone(),
+      sha: self.sha.clone(),
+      branch: self.branch.clone(),
+      target_branch: self.target_branch.clone(),
+      tag: self.tag.clone(),
+      pr_number: self.pr_number,
+      trigger: self.trigger.clone(),
+    }
+  }
 }
 
 pub struct CoordinatorServices {
@@ -590,16 +605,10 @@ impl Coordinator {
       let startup_secs = node
         .startup_timeout_secs
         .unwrap_or_else(|| self.config.default_node_startup_timeout_secs());
+      let metadata = self.run_context.run_metadata();
       match self
         .dispatcher
-        .dispatch(
-          &self.run_id,
-          &self.run_context.owner,
-          &self.run_context.repo,
-          &node,
-          &self.pipeline,
-          &self.config,
-        )
+        .dispatch(&self.run_id, &metadata, &node, &self.pipeline, &self.config)
         .await
       {
         Ok(()) => {
@@ -963,7 +972,7 @@ mod tests {
   use state_store::InMemoryStateStore;
 
   use super::*;
-  use crate::dispatcher::{DispatchError, Dispatcher};
+  use crate::dispatcher::{DispatchError, Dispatcher, RunMetadata};
 
   struct AlwaysSuccessDispatcher {
     backplane: Arc<dyn Backplane>,
@@ -974,8 +983,7 @@ mod tests {
     async fn dispatch(
       &self,
       run_id: &str,
-      _owner: &str,
-      _repo: &str,
+      _metadata: &RunMetadata,
       node: &NodeInfo,
       _pipeline: &Pipeline,
       _config: &AppConfig,
@@ -1052,8 +1060,7 @@ mod tests {
     async fn dispatch(
       &self,
       _run_id: &str,
-      _owner: &str,
-      _repo: &str,
+      _metadata: &RunMetadata,
       _node: &NodeInfo,
       _pipeline: &Pipeline,
       _config: &AppConfig,
@@ -1630,8 +1637,7 @@ nodes:
     async fn dispatch(
       &self,
       _run_id: &str,
-      _owner: &str,
-      _repo: &str,
+      _metadata: &RunMetadata,
       _node: &NodeInfo,
       _pipeline: &Pipeline,
       _config: &AppConfig,

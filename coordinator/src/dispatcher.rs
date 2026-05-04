@@ -23,13 +23,24 @@ pub enum DispatchError {
   Kube(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct RunMetadata {
+  pub owner: String,
+  pub repo: String,
+  pub sha: String,
+  pub branch: Option<String>,
+  pub target_branch: Option<String>,
+  pub tag: Option<String>,
+  pub pr_number: Option<i64>,
+  pub trigger: String,
+}
+
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
   async fn dispatch(
     &self,
     run_id: &str,
-    owner: &str,
-    repo: &str,
+    metadata: &RunMetadata,
     node: &NodeInfo,
     pipeline: &Pipeline,
     config: &AppConfig,
@@ -93,8 +104,7 @@ impl Dispatcher for LogDispatcher {
   async fn dispatch(
     &self,
     run_id: &str,
-    _owner: &str,
-    _repo: &str,
+    _metadata: &RunMetadata,
     node: &NodeInfo,
     _pipeline: &Pipeline,
     _config: &AppConfig,
