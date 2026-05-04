@@ -8,7 +8,7 @@ use axum::{
   http::{HeaderMap, StatusCode},
 };
 use chrono::Utc;
-use coordinator::{RunContext, RunStatusReporter};
+use coordinator::{RunContext, RunStatusReporter, RunStatusReporterFactory};
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::EncodingKey;
 use octocrab::{
@@ -245,6 +245,7 @@ async fn retry_pipeline_run(
     created_at: Utc::now(),
     retry_of: Some(run_id.to_string()),
     tenant_slug: Some(tenant_slug),
+    github_check_run_id: None,
   };
 
   launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone())
@@ -521,6 +522,7 @@ async fn start_push_pipelines(
       created_at: Utc::now(),
       retry_of: None,
       tenant_slug: Some(tenant.slug.clone()),
+      github_check_run_id: None,
     };
     launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
@@ -570,6 +572,7 @@ async fn start_pr_pipelines(
       created_at: Utc::now(),
       retry_of: None,
       tenant_slug: Some(tenant.slug.clone()),
+      github_check_run_id: None,
     };
     launch_coordinator_for_pipeline(&pipeline, run_context, &install_crab, state.clone()).await;
   }
@@ -579,7 +582,7 @@ async fn start_pr_pipelines(
 
 async fn launch_coordinator_for_pipeline(
   pipeline: &Pipeline,
-  run_context: RunContext,
+  mut run_context: RunContext,
   install_crab: &Octocrab,
   state: Arc<ProviderState>,
 ) -> Option<String> {
@@ -607,7 +610,7 @@ async fn launch_coordinator_for_pipeline(
     return None;
   }
 
-  let status_reporter = create_check_run_reporter(
+  let (status_reporter, check_run_id) = create_check_run_reporter(
     install_crab,
     &run_context.owner,
     &run_context.repo,
@@ -616,6 +619,7 @@ async fn launch_coordinator_for_pipeline(
     pipeline.name(),
   )
   .await;
+  run_context.github_check_run_id = check_run_id;
 
   let pipeline_arc = Arc::new(pipeline.clone());
   let handle = coordinator::start_coordinator(
@@ -731,7 +735,7 @@ async fn create_check_run_reporter(
   sha: &str,
   run_id: &str,
   pipeline_name: &str,
-) -> Option<Arc<dyn RunStatusReporter>> {
+) -> (Option<Arc<dyn RunStatusReporter>>, Option<i64>) {
   match crab
     .checks(owner, repo)
     .create_check_run(pipeline_name, sha)
@@ -740,12 +744,16 @@ async fn create_check_run_reporter(
     .send()
     .await
   {
-    Ok(check_run) => Some(Arc::new(GithubCheckRunReporter {
-      crab: crab.clone(),
-      owner: owner.to_string(),
-      repo: repo.to_string(),
-      check_run_id: check_run.id,
-    })),
+    Ok(check_run) => {
+      let id = check_run.id;
+      let reporter: Arc<dyn RunStatusReporter> = Arc::new(GithubCheckRunReporter {
+        crab: crab.clone(),
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        check_run_id: id,
+      });
+      (Some(reporter), Some(id.0 as i64))
+    }
     Err(e) => {
       warn!(
         owner,
@@ -756,7 +764,7 @@ async fn create_check_run_reporter(
         "Failed to create GitHub check run; continuing without check reporting \
          (does this tenant's GH App have checks:write?)"
       );
-      None
+      (None, None)
     }
   }
 }
@@ -967,6 +975,47 @@ fn resolve_app_for_tenant(
 ) -> Option<Arc<GithubAppConfig>> {
   let TenantProvider::Github(binding) = &tenant.provider;
   state.github_apps.by_id(&binding.app_ref)
+}
+
+pub struct GithubCheckRunReporterFactory {
+  state: Arc<ProviderState>,
+}
+
+impl GithubCheckRunReporterFactory {
+  pub fn new(state: Arc<ProviderState>) -> Self {
+    Self { state }
+  }
+}
+
+#[async_trait]
+impl RunStatusReporterFactory for GithubCheckRunReporterFactory {
+  async fn for_run(&self, run_context: &RunContext) -> Option<Arc<dyn RunStatusReporter>> {
+    let check_run_id = run_context.github_check_run_id?;
+    let tenant_slug = run_context.tenant_slug.as_deref()?;
+    let tenant = self.state.tenants.by_slug(tenant_slug)?;
+    let app = resolve_app_for_tenant(&self.state, &tenant)?;
+    let install_crab = match build_installation_client(&run_context.owner, &run_context.repo, &app)
+      .await
+    {
+      Ok(c) => c,
+      Err(e) => {
+        warn!(
+          owner = %run_context.owner,
+          repo = %run_context.repo,
+          tenant_slug,
+          error = %e,
+          "Failed to build GitHub installation client for reclaimed run; check run will not be updated"
+        );
+        return None;
+      }
+    };
+    Some(Arc::new(GithubCheckRunReporter {
+      crab: install_crab,
+      owner: run_context.owner.clone(),
+      repo: run_context.repo.clone(),
+      check_run_id: CheckRunId(check_run_id as u64),
+    }))
+  }
 }
 
 fn identify_signing_app(

@@ -269,12 +269,17 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
 
   verify_connections(&state, true).await?;
 
+  let status_reporter_factory: Option<Arc<dyn coordinator::RunStatusReporterFactory>> = Some(
+    Arc::new(providers::GithubCheckRunReporterFactory::new(state.clone())),
+  );
+
   let _reaper = start_reaper(
     shared_config.clone(),
     state.dispatcher.clone(),
     state.state_store.clone(),
     state.backplane.clone(),
     state.run_history.clone(),
+    status_reporter_factory,
   );
 
   let auth_state = auth::build_auth_state(&shared_config)

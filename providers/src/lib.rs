@@ -6,7 +6,7 @@ use app_config::AppConfig;
 use axum::http::HeaderMap;
 use backplane::Backplane;
 use coordinator::{Dispatcher, SourceManager};
-pub use github::GithubProvider;
+pub use github::{GithubCheckRunReporterFactory, GithubProvider};
 use run_history::RunHistory;
 use state_store::StateStore;
 use tenancy::{GithubAppRegistry, TenancyRegistry, TenantRegistry};

@@ -11,7 +11,9 @@ use state_store::StateStore;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::{CoordinatorServices, Dispatcher, RunContext, start_coordinator};
+use crate::{
+  CoordinatorServices, Dispatcher, RunContext, RunStatusReporterFactory, start_coordinator,
+};
 
 const LEASE_RECLAIM_INTERVAL_SECS: u64 = 60;
 const RESOURCE_SWEEP_INTERVAL_SECS: u64 = 300;
@@ -22,6 +24,7 @@ pub fn start_reaper(
   state_store: Arc<dyn StateStore>,
   backplane: Arc<dyn Backplane>,
   run_history: Arc<dyn RunHistory>,
+  status_reporter_factory: Option<Arc<dyn RunStatusReporterFactory>>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
     info!("Reaper: eager startup sweep beginning");
@@ -31,6 +34,7 @@ pub fn start_reaper(
       state_store.clone(),
       backplane.clone(),
       run_history.clone(),
+      status_reporter_factory.clone(),
     )
     .await;
     sweep_stranded_resources(
@@ -39,6 +43,7 @@ pub fn start_reaper(
       state_store.clone(),
       backplane.clone(),
       run_history.clone(),
+      status_reporter_factory.clone(),
     )
     .await;
     info!("Reaper: eager startup sweep complete; entering periodic loop");
@@ -56,6 +61,7 @@ pub fn start_reaper(
             state_store.clone(),
             backplane.clone(),
             run_history.clone(),
+            status_reporter_factory.clone(),
           )
           .await;
         }
@@ -66,6 +72,7 @@ pub fn start_reaper(
             state_store.clone(),
             backplane.clone(),
             run_history.clone(),
+            status_reporter_factory.clone(),
           )
           .await;
         }
@@ -80,6 +87,7 @@ async fn reclaim_orphaned_runs(
   state_store: Arc<dyn StateStore>,
   backplane: Arc<dyn Backplane>,
   run_history: Arc<dyn RunHistory>,
+  status_reporter_factory: Option<Arc<dyn RunStatusReporterFactory>>,
 ) {
   let orphaned = match state_store.get_orphaned_runs().await {
     Ok(runs) => runs,
@@ -127,6 +135,10 @@ async fn reclaim_orphaned_runs(
 
     let pipeline = std::sync::Arc::new(run_state.pipeline.clone());
     let run_context = run_context_from_row(pipeline_row);
+    let status_reporter = match status_reporter_factory.as_ref() {
+      Some(factory) => factory.for_run(&run_context).await,
+      None => None,
+    };
 
     match start_coordinator(
       run_id.clone(),
@@ -137,7 +149,7 @@ async fn reclaim_orphaned_runs(
         state_store: state_store.clone(),
         backplane: backplane.clone(),
         run_history: run_history.clone(),
-        status_reporter: None,
+        status_reporter,
       },
       run_context,
     )
@@ -181,6 +193,7 @@ fn run_context_from_row(row: PipelineRunRow) -> RunContext {
     created_at: row.created_at,
     retry_of: row.retry_of.map(|u| u.to_string()),
     tenant_slug: row.tenant_slug,
+    github_check_run_id: row.github_check_run_id,
   }
 }
 
@@ -206,6 +219,7 @@ async fn sweep_stranded_resources(
   state_store: Arc<dyn StateStore>,
   backplane: Arc<dyn Backplane>,
   run_history: Arc<dyn RunHistory>,
+  status_reporter_factory: Option<Arc<dyn RunStatusReporterFactory>>,
 ) {
   sweep_terminal_redis_runs(dispatcher.clone(), state_store.clone(), run_history.clone()).await;
   sweep_postgres_in_progress_runs(
@@ -214,6 +228,7 @@ async fn sweep_stranded_resources(
     state_store.clone(),
     backplane,
     run_history,
+    status_reporter_factory,
   )
   .await;
   sweep_orphan_kube_resources(dispatcher, state_store).await;
@@ -225,6 +240,7 @@ async fn sweep_postgres_in_progress_runs(
   state_store: Arc<dyn StateStore>,
   backplane: Arc<dyn Backplane>,
   run_history: Arc<dyn RunHistory>,
+  status_reporter_factory: Option<Arc<dyn RunStatusReporterFactory>>,
 ) {
   let in_progress = match run_history.list_in_progress_runs().await {
     Ok(rows) => rows,
@@ -271,6 +287,7 @@ async fn sweep_postgres_in_progress_runs(
       state_store.clone(),
       backplane.clone(),
       run_history.clone(),
+      status_reporter_factory.clone(),
     )
     .await
     {
@@ -291,6 +308,7 @@ struct SweepStats {
   errors: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_postgres_in_progress_run(
   run_id: &str,
   row: &PipelineRunRow,
@@ -299,6 +317,7 @@ async fn reconcile_postgres_in_progress_run(
   state_store: Arc<dyn StateStore>,
   backplane: Arc<dyn Backplane>,
   run_history: Arc<dyn RunHistory>,
+  status_reporter_factory: Option<Arc<dyn RunStatusReporterFactory>>,
 ) -> Result<(), RunHistoryError> {
   let pipeline = match Pipeline::from_yaml(&row.pipeline_definition) {
     Ok(p) => p,
@@ -423,13 +442,17 @@ async fn reconcile_postgres_in_progress_run(
   }
 
   let run_context = run_context_from_row(row.clone());
+  let status_reporter = match status_reporter_factory.as_ref() {
+    Some(factory) => factory.for_run(&run_context).await,
+    None => None,
+  };
   let services = CoordinatorServices {
     config,
     dispatcher,
     state_store,
     backplane,
     run_history,
-    status_reporter: None,
+    status_reporter,
   };
   let pipeline_arc = Arc::new(pipeline);
   match start_coordinator(run_id.to_string(), pipeline_arc, services, run_context).await {
@@ -929,6 +952,7 @@ nodes:
       completed_at: None,
       retry_of: None,
       tenant_slug: Some("the-conn".to_string()),
+      github_check_run_id: None,
     };
 
     let node_row = NodeRunRow {
@@ -955,6 +979,7 @@ nodes:
       state_store.clone(),
       backplane,
       history.clone(),
+      None,
     )
     .await;
 
@@ -994,13 +1019,21 @@ nodes:
       completed_at: None,
       retry_of: None,
       tenant_slug: None,
+      github_check_run_id: None,
     };
     let history = CapturingRunHistory::with_in_progress(vec![row], Default::default());
 
     let config = Arc::new(AppConfig::load().expect("test config"));
     let backplane: Arc<dyn Backplane> = backplane::InMemoryBackplane::new();
-    sweep_postgres_in_progress_runs(config, dispatcher, state_store, backplane, history.clone())
-      .await;
+    sweep_postgres_in_progress_runs(
+      config,
+      dispatcher,
+      state_store,
+      backplane,
+      history.clone(),
+      None,
+    )
+    .await;
     assert!(history.finalize_calls().is_empty());
   }
 
@@ -1107,6 +1140,7 @@ nodes:
       completed_at: None,
       retry_of: None,
       tenant_slug: Some("the-conn".to_string()),
+      github_check_run_id: None,
     }
   }
 
@@ -1144,6 +1178,7 @@ nodes:
       state_store.clone(),
       backplane,
       run_history,
+      None,
     )
     .await;
 

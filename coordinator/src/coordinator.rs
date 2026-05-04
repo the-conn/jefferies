@@ -32,6 +32,7 @@ pub struct RunContext {
   pub created_at: DateTime<Utc>,
   pub retry_of: Option<String>,
   pub tenant_slug: Option<String>,
+  pub github_check_run_id: Option<i64>,
 }
 
 impl RunContext {
@@ -61,6 +62,11 @@ pub struct CoordinatorServices {
 #[async_trait]
 pub trait RunStatusReporter: Send + Sync {
   async fn report_completed(&self, status: RunStatus);
+}
+
+#[async_trait]
+pub trait RunStatusReporterFactory: Send + Sync {
+  async fn for_run(&self, run_context: &RunContext) -> Option<Arc<dyn RunStatusReporter>>;
 }
 
 pub struct RunSummary {
@@ -301,6 +307,7 @@ fn build_pipeline_start_record(
     created_at: run_context.created_at,
     retry_of: run_context.retry_of.clone(),
     tenant_slug: run_context.tenant_slug.clone(),
+    github_check_run_id: run_context.github_check_run_id,
   }
 }
 
@@ -1193,6 +1200,7 @@ impl Coordinator {
       completed_at: Some(completed_at),
       retry_of: self.run_context.retry_of.clone(),
       tenant_slug: self.run_context.tenant_slug.clone(),
+      github_check_run_id: self.run_context.github_check_run_id,
     };
     if let Err(e) = self.run_history.record_pipeline_run(pipeline_record).await {
       warn!(run_id = %self.run_id, error = %e, "Failed to record pipeline run history");
@@ -1544,6 +1552,7 @@ mod tests {
       created_at: Utc::now(),
       retry_of: None,
       tenant_slug: None,
+      github_check_run_id: None,
     }
   }
 
@@ -1924,6 +1933,7 @@ nodes:
         created_at: Utc::now(),
         retry_of: None,
         tenant_slug: None,
+        github_check_run_id: None,
       },
     )
     .await
@@ -2527,6 +2537,7 @@ nodes:
         created_at: Utc::now(),
         retry_of: None,
         tenant_slug: None,
+        github_check_run_id: None,
       },
     )
     .await;
