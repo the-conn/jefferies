@@ -492,9 +492,8 @@ async fn start_push_pipelines(
     .ok_or_else(|| GithubError::TenantBindingMissing(tenant.slug.clone()))?;
   let install_crab = build_installation_client(owner, repo, &app).await?;
   let (branch, tag) = parse_push_ref(git_ref);
-  let match_ref = branch.as_deref().unwrap_or(git_ref);
   let matching = find_matching_pipelines(&install_crab, owner, repo, sha, |pipeline| {
-    pipeline.triggered_by_push(match_ref)
+    pipeline.triggered_by_push(branch.as_deref(), tag.as_deref())
   })
   .await?;
 

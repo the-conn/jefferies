@@ -77,10 +77,26 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Refs {
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  branches: Vec<String>,
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  tags: Vec<String>,
+  #[serde(
+    default,
+    deserialize_with = "deserialize_ref_filter",
+    skip_serializing_if = "Option::is_none"
+  )]
+  branches: Option<Vec<String>>,
+  #[serde(
+    default,
+    deserialize_with = "deserialize_ref_filter",
+    skip_serializing_if = "Option::is_none"
+  )]
+  tags: Option<Vec<String>>,
+}
+
+fn deserialize_ref_filter<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+  D: Deserializer<'de>,
+{
+  let opt = Option::<Vec<String>>::deserialize(deserializer)?;
+  Ok(Some(opt.unwrap_or_default()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,14 +235,14 @@ impl Pipeline {
   pub fn fail_fast_override(&self) -> Option<bool> {
     self.fail_fast
   }
-  pub fn triggered_by_push(&self, branch: &str) -> bool {
+  pub fn triggered_by_push(&self, branch: Option<&str>, tag: Option<&str>) -> bool {
     let Some(triggers) = &self.on else {
       return false;
     };
     let Some(push_trigger) = &triggers.push else {
       return false;
     };
-    refs_match_branch(push_trigger, branch)
+    refs_match_push(push_trigger, branch, tag)
   }
 
   pub fn node_info(&self) -> Vec<NodeInfo> {
@@ -266,7 +282,7 @@ impl Pipeline {
     let Some(pr_trigger) = &triggers.pull_request else {
       return false;
     };
-    refs_match_branch(pr_trigger, branch)
+    refs_match_branch_filter(pr_trigger.branches.as_deref(), branch)
   }
 }
 
@@ -566,9 +582,28 @@ fn step_command(step: &PipelineStep) -> String {
   }
 }
 
-fn refs_match_branch(refs: &Refs, branch: &str) -> bool {
-  let no_branch_filter = refs.branches.is_empty();
-  no_branch_filter || refs.branches.iter().any(|b| b == branch)
+fn refs_match_push(refs: &Refs, branch: Option<&str>, tag: Option<&str>) -> bool {
+  if refs.branches.is_none() && refs.tags.is_none() {
+    return true;
+  }
+  match (branch, tag) {
+    (Some(b), _) => {
+      matches!(refs.branches.as_deref(), Some(allowed) if ref_filter_matches(allowed, b))
+    }
+    (_, Some(t)) => matches!(refs.tags.as_deref(), Some(allowed) if ref_filter_matches(allowed, t)),
+    _ => false,
+  }
+}
+
+fn refs_match_branch_filter(filter: Option<&[String]>, branch: &str) -> bool {
+  match filter {
+    None => true,
+    Some(allowed) => ref_filter_matches(allowed, branch),
+  }
+}
+
+fn ref_filter_matches(allowed: &[String], candidate: &str) -> bool {
+  allowed.is_empty() || allowed.iter().any(|a| a == candidate)
 }
 
 #[cfg(test)]
@@ -625,12 +660,12 @@ nodes:
       - cargo build
 "#;
     let pipeline = Pipeline::from_yaml(yaml).unwrap();
-    assert!(pipeline.triggered_by_push("main"));
-    assert!(!pipeline.triggered_by_push("feature-branch"));
+    assert!(pipeline.triggered_by_push(Some("main"), None));
+    assert!(!pipeline.triggered_by_push(Some("feature-branch"), None));
   }
 
   #[test]
-  fn test_triggered_by_push_no_branch_filter() {
+  fn test_triggered_by_push_no_filter_matches_anything() {
     let yaml = r#"
 name: Test Pipeline
 on:
@@ -642,8 +677,96 @@ nodes:
       - cargo build
 "#;
     let pipeline = Pipeline::from_yaml(yaml).unwrap();
-    assert!(pipeline.triggered_by_push("main"));
-    assert!(pipeline.triggered_by_push("any-branch"));
+    assert!(pipeline.triggered_by_push(Some("main"), None));
+    assert!(pipeline.triggered_by_push(Some("any-branch"), None));
+    assert!(pipeline.triggered_by_push(None, Some("v1.0.0")));
+  }
+
+  #[test]
+  fn test_branch_only_pipeline_does_not_match_tag_pushes() {
+    let yaml = r#"
+name: Push Pipeline
+on:
+  push:
+    branches:
+      - main
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    assert!(
+      !pipeline.triggered_by_push(None, Some("alpha")),
+      "a pipeline configured with branches: only must not run on tag pushes"
+    );
+  }
+
+  #[test]
+  fn test_tag_only_pipeline_does_not_match_branch_pushes() {
+    let yaml = r#"
+name: Tag Pipeline
+on:
+  push:
+    tags:
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - buildah bud .
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    assert!(
+      pipeline.triggered_by_push(None, Some("alpha")),
+      "a tags-only pipeline must run on any tag push"
+    );
+    assert!(
+      !pipeline.triggered_by_push(Some("main"), None),
+      "a tags-only pipeline must not run on branch pushes \
+       (this was the bug: tag.yaml fired on every main push and tagged the image with empty $JEFFERIES_TAG)"
+    );
+  }
+
+  #[test]
+  fn test_pipeline_with_both_filters_matches_branch_and_tag_pushes() {
+    let yaml = r#"
+name: Mixed Pipeline
+on:
+  push:
+    branches:
+      - main
+    tags:
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    assert!(pipeline.triggered_by_push(Some("main"), None));
+    assert!(!pipeline.triggered_by_push(Some("feature"), None));
+    assert!(pipeline.triggered_by_push(None, Some("v1.0.0")));
+  }
+
+  #[test]
+  fn test_specific_tag_filter_excludes_other_tags() {
+    let yaml = r#"
+name: Release Pipeline
+on:
+  push:
+    tags:
+      - alpha
+nodes:
+  - name: Build
+    image: rust:latest
+    steps:
+      - cargo build
+"#;
+    let pipeline = Pipeline::from_yaml(yaml).unwrap();
+    assert!(pipeline.triggered_by_push(None, Some("alpha")));
+    assert!(!pipeline.triggered_by_push(None, Some("beta")));
+    assert!(!pipeline.triggered_by_push(Some("main"), None));
   }
 
   #[test]
@@ -694,7 +817,7 @@ nodes:
       - cargo build
 "#;
     let pipeline = Pipeline::from_yaml(yaml).unwrap();
-    assert!(!pipeline.triggered_by_push("main"));
+    assert!(!pipeline.triggered_by_push(Some("main"), None));
     assert!(!pipeline.triggered_by_pull_request("main"));
   }
 
