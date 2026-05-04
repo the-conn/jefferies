@@ -28,6 +28,12 @@ struct PipelineConfig {
   default_node_timeout_secs: u64,
   default_node_startup_timeout_secs: u64,
   fail_fast: bool,
+  #[serde(default = "default_s3_reconcile_interval_secs")]
+  s3_reconcile_interval_secs: u64,
+}
+
+fn default_s3_reconcile_interval_secs() -> u64 {
+  60
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +160,10 @@ impl AppConfig {
 
   pub fn default_fail_fast(&self) -> bool {
     self.pipeline.fail_fast
+  }
+
+  pub fn s3_reconcile_interval_secs(&self) -> u64 {
+    self.pipeline.s3_reconcile_interval_secs
   }
 
   pub fn redis_url(&self) -> &str {

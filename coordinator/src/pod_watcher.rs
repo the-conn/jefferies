@@ -18,10 +18,21 @@ pub const NODE_NAME_ANNOTATION: &str = "the-conn.com/node-name";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InfraFailureReason {
-  ImagePullFailed { image: String, message: String },
+  ImagePullFailed {
+    image: String,
+    message: String,
+  },
   OOMKilled,
-  InitContainerFailed { name: String, message: String },
+  InitContainerFailed {
+    name: String,
+    message: String,
+  },
   ContainerCreateError(String),
+  ContainerTerminated {
+    exit_code: i32,
+    reason: String,
+    message: String,
+  },
   PodStartTimeout,
   PodDeletedUnexpectedly,
   NodeLost,
@@ -35,6 +46,7 @@ impl InfraFailureReason {
       Self::OOMKilled => "OOMKilled",
       Self::InitContainerFailed { .. } => "InitContainerFailed",
       Self::ContainerCreateError(_) => "ContainerCreateError",
+      Self::ContainerTerminated { .. } => "ContainerTerminated",
       Self::PodStartTimeout => "PodStartTimeout",
       Self::PodDeletedUnexpectedly => "PodDeletedUnexpectedly",
       Self::NodeLost => "NodeLost",
@@ -54,6 +66,23 @@ impl InfraFailureReason {
         format!("Init container '{name}' failed: {message}")
       }
       Self::ContainerCreateError(msg) => format!("Container could not be created: {msg}"),
+      Self::ContainerTerminated {
+        exit_code,
+        reason,
+        message,
+      } => {
+        let reason_part = if reason.is_empty() {
+          String::new()
+        } else {
+          format!(" ({reason})")
+        };
+        let message_part = if message.is_empty() {
+          String::new()
+        } else {
+          format!(": {message}")
+        };
+        format!("Container exited with code {exit_code}{reason_part}{message_part}")
+      }
       Self::PodStartTimeout => {
         "Pod did not enter the Running phase within the configured startup timeout".to_string()
       }
@@ -75,6 +104,10 @@ impl InfraFailureReason {
       Self::OOMKilled | Self::ContainerCreateError(_) | Self::PodStartTimeout => {
         Self::user_message_from_code(self.stable_code())
       }
+      Self::ContainerTerminated { exit_code, .. } => Some(format!(
+        "The container exited unexpectedly with code {exit_code} before reporting completion. \
+         Check the container's logs for the failure cause."
+      )),
       Self::InitContainerFailed { .. } | Self::PodDeletedUnexpectedly | Self::NodeLost => None,
     }
   }
@@ -91,6 +124,10 @@ impl InfraFailureReason {
       ),
       "ContainerCreateError" => Some(
         "The container could not be created. Check the pod configuration for invalid mounts, environment variables, or security settings."
+          .to_string(),
+      ),
+      "ContainerTerminated" => Some(
+        "The container exited unexpectedly before reporting completion. Check the container's logs for the failure cause."
           .to_string(),
       ),
       "PodStartTimeout" => Some(
@@ -139,9 +176,17 @@ pub enum WatcherCommand {
   Shutdown,
 }
 
+fn node_name_for(pod: &Pod) -> Option<String> {
+  pod
+    .metadata
+    .annotations
+    .as_ref()
+    .and_then(|a| a.get(NODE_NAME_ANNOTATION))
+    .cloned()
+}
+
 pub fn classify_pod(pod: &Pod) -> Option<PodSignal> {
-  let annotations = pod.metadata.annotations.as_ref()?;
-  let node_name = annotations.get(NODE_NAME_ANNOTATION)?.clone();
+  let node_name = node_name_for(pod)?;
   let pod_uid = pod.metadata.uid.clone()?;
   let status = pod.status.as_ref()?;
 
@@ -218,14 +263,25 @@ fn classify_main_container_statuses(
         });
       }
     }
-    if let Some(terminated) = state.terminated.as_ref()
-      && terminated.reason.as_deref() == Some("OOMKilled")
-    {
-      return Some(PodSignal::InfraFailure {
-        node_name: node_name.to_string(),
-        pod_uid: pod_uid.to_string(),
-        reason: InfraFailureReason::OOMKilled,
-      });
+    if let Some(terminated) = state.terminated.as_ref() {
+      if terminated.reason.as_deref() == Some("OOMKilled") {
+        return Some(PodSignal::InfraFailure {
+          node_name: node_name.to_string(),
+          pod_uid: pod_uid.to_string(),
+          reason: InfraFailureReason::OOMKilled,
+        });
+      }
+      if terminated.exit_code != 0 {
+        return Some(PodSignal::InfraFailure {
+          node_name: node_name.to_string(),
+          pod_uid: pod_uid.to_string(),
+          reason: InfraFailureReason::ContainerTerminated {
+            exit_code: terminated.exit_code,
+            reason: terminated.reason.clone().unwrap_or_default(),
+            message: terminated.message.clone().unwrap_or_default(),
+          },
+        });
+      }
     }
     if state.running.is_some() {
       return Some(PodSignal::PodRunning {
@@ -237,14 +293,36 @@ fn classify_main_container_statuses(
   None
 }
 
+const REHYDRATION_SENTINEL_UID: &str = "__rehydrated__";
+
 #[derive(Default)]
 struct WatcherState {
   reported_failure_uids: HashMap<String, HashSet<String>>,
   reported_running_uids: HashMap<String, HashSet<String>>,
   expected_deletions: HashSet<String>,
+  seed_running: HashSet<String>,
+  observed_during_init: HashSet<String>,
+  presence_diff_emitted: bool,
 }
 
 impl WatcherState {
+  fn seeded(running: &HashSet<String>) -> Self {
+    let mut reported_running_uids: HashMap<String, HashSet<String>> = HashMap::new();
+    for node in running {
+      let mut uids = HashSet::new();
+      uids.insert(REHYDRATION_SENTINEL_UID.to_string());
+      reported_running_uids.insert(node.clone(), uids);
+    }
+    Self {
+      reported_failure_uids: HashMap::new(),
+      reported_running_uids,
+      expected_deletions: HashSet::new(),
+      seed_running: running.clone(),
+      observed_during_init: HashSet::new(),
+      presence_diff_emitted: false,
+    }
+  }
+
   fn should_emit(&mut self, signal: &PodSignal) -> bool {
     match signal {
       PodSignal::PodRunning { node_name, pod_uid } => self
@@ -276,6 +354,24 @@ impl WatcherState {
   fn deletion_was_expected(&self, node_name: &str) -> bool {
     self.expected_deletions.contains(node_name)
   }
+
+  fn record_init_observation(&mut self, node_name: &str) {
+    if self.seed_running.contains(node_name) {
+      self.observed_during_init.insert(node_name.to_string());
+    }
+  }
+
+  fn take_missing_after_init(&mut self) -> Vec<String> {
+    if self.presence_diff_emitted {
+      return Vec::new();
+    }
+    self.presence_diff_emitted = true;
+    self
+      .seed_running
+      .difference(&self.observed_during_init)
+      .cloned()
+      .collect()
+  }
 }
 
 pub struct PodWatcher {
@@ -284,6 +380,7 @@ pub struct PodWatcher {
   run_id: String,
   signal_tx: mpsc::Sender<PodSignal>,
   cmd_rx: mpsc::Receiver<WatcherCommand>,
+  seed_running: HashSet<String>,
 }
 
 impl PodWatcher {
@@ -293,6 +390,7 @@ impl PodWatcher {
     run_id: String,
     signal_tx: mpsc::Sender<PodSignal>,
     cmd_rx: mpsc::Receiver<WatcherCommand>,
+    seed_running: HashSet<String>,
   ) -> Self {
     Self {
       client,
@@ -300,6 +398,7 @@ impl PodWatcher {
       run_id,
       signal_tx,
       cmd_rx,
+      seed_running,
     }
   }
 
@@ -314,7 +413,7 @@ impl PodWatcher {
     }
 
     let mut combined = futures_util::stream::select_all(streams);
-    let mut state = WatcherState::default();
+    let mut state = WatcherState::seeded(&self.seed_running);
 
     info!(
       run_id = %self.run_id,
@@ -359,7 +458,17 @@ impl PodWatcher {
 
   async fn handle_event(&self, state: &mut WatcherState, event: Event<Pod>) {
     match event {
-      Event::Apply(pod) | Event::InitApply(pod) => {
+      Event::InitApply(pod) => {
+        if let Some(node_name) = node_name_for(&pod) {
+          state.record_init_observation(&node_name);
+        }
+        if let Some(signal) = classify_pod(&pod)
+          && state.should_emit(&signal)
+        {
+          self.send_signal(signal).await;
+        }
+      }
+      Event::Apply(pod) => {
         if let Some(signal) = classify_pod(&pod)
           && state.should_emit(&signal)
         {
@@ -367,7 +476,26 @@ impl PodWatcher {
         }
       }
       Event::Delete(pod) => self.handle_delete(state, &pod).await,
-      Event::Init | Event::InitDone => {}
+      Event::Init => {}
+      Event::InitDone => self.emit_presence_diff(state).await,
+    }
+  }
+
+  async fn emit_presence_diff(&self, state: &mut WatcherState) {
+    for node_name in state.take_missing_after_init() {
+      info!(
+        run_id = %self.run_id,
+        node_name,
+        "Node was Running per persisted state but no Pod observed at watcher init; emitting PodDeletedUnexpectedly"
+      );
+      let signal = PodSignal::InfraFailure {
+        node_name,
+        pod_uid: REHYDRATION_SENTINEL_UID.to_string(),
+        reason: InfraFailureReason::PodDeletedUnexpectedly,
+      };
+      if state.should_emit(&signal) {
+        self.send_signal(signal).await;
+      }
     }
   }
 
@@ -581,6 +709,38 @@ mod tests {
   }
 
   #[test]
+  fn classify_emits_container_terminated_for_nonzero_exit() {
+    let pod = pod_with(PodStatus {
+      container_statuses: Some(vec![terminated_main_container("Error", 137)]),
+      ..Default::default()
+    });
+    let signal = classify_pod(&pod).expect("should classify");
+    match signal {
+      PodSignal::InfraFailure {
+        node_name,
+        reason: InfraFailureReason::ContainerTerminated {
+          exit_code, reason, ..
+        },
+        ..
+      } => {
+        assert_eq!(node_name, "build");
+        assert_eq!(exit_code, 137);
+        assert_eq!(reason, "Error");
+      }
+      other => panic!("expected ContainerTerminated, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn classify_does_not_emit_for_clean_exit() {
+    let pod = pod_with(PodStatus {
+      container_statuses: Some(vec![terminated_main_container("Completed", 0)]),
+      ..Default::default()
+    });
+    assert!(classify_pod(&pod).is_none());
+  }
+
+  #[test]
   fn classifies_create_container_config_error() {
     let pod = pod_with(PodStatus {
       container_statuses: Some(vec![waiting_main_container(
@@ -658,6 +818,61 @@ mod tests {
     };
     assert!(state.should_emit(&signal));
     assert!(!state.should_emit(&signal));
+  }
+
+  #[test]
+  fn seeded_state_treats_node_as_was_running() {
+    let mut seed = HashSet::new();
+    seed.insert("build".to_string());
+    let state = WatcherState::seeded(&seed);
+    assert!(state.was_running("build"));
+    assert!(!state.was_running("test"));
+  }
+
+  #[test]
+  fn presence_diff_emits_for_missing_pod_at_init_done() {
+    let mut seed = HashSet::new();
+    seed.insert("build".to_string());
+    seed.insert("test".to_string());
+    let mut state = WatcherState::seeded(&seed);
+    state.record_init_observation("build");
+    let missing = state.take_missing_after_init();
+    assert_eq!(missing, vec!["test".to_string()]);
+  }
+
+  #[test]
+  fn presence_diff_is_one_shot() {
+    let mut seed = HashSet::new();
+    seed.insert("build".to_string());
+    let mut state = WatcherState::seeded(&seed);
+    let first = state.take_missing_after_init();
+    assert_eq!(first, vec!["build".to_string()]);
+    let second = state.take_missing_after_init();
+    assert!(second.is_empty());
+  }
+
+  #[test]
+  fn presence_diff_empty_when_all_observed() {
+    let mut seed = HashSet::new();
+    seed.insert("build".to_string());
+    seed.insert("test".to_string());
+    let mut state = WatcherState::seeded(&seed);
+    state.record_init_observation("build");
+    state.record_init_observation("test");
+    assert!(state.take_missing_after_init().is_empty());
+  }
+
+  #[test]
+  fn seeded_state_does_not_suppress_real_running_emission() {
+    let mut seed = HashSet::new();
+    seed.insert("build".to_string());
+    let mut state = WatcherState::seeded(&seed);
+    let real = PodSignal::PodRunning {
+      node_name: "build".into(),
+      pod_uid: "real-uid-1".into(),
+    };
+    assert!(state.should_emit(&real));
+    assert!(!state.should_emit(&real));
   }
 
   #[test]

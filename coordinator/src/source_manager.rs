@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use app_config::AppConfig;
 use aws_sdk_s3::{
@@ -19,6 +19,7 @@ use aws_smithy_runtime_api::{
   },
 };
 use aws_smithy_types::config_bag::ConfigBag;
+use futures_util::stream::{self, StreamExt};
 use http_body_util::BodyExt;
 use octocrab::Octocrab;
 use thiserror::Error;
@@ -67,6 +68,36 @@ pub struct NodeOutcome {
   pub started_at: Option<u128>,
   pub finished_at: Option<u128>,
 }
+
+#[derive(Debug, Clone)]
+pub enum ReconcileResult {
+  Completed {
+    success: bool,
+    started_at_ms: Option<u128>,
+    finished_at_ms: u128,
+  },
+  InProgress {
+    started_at_ms: u128,
+  },
+  StillRunning,
+  TransientReadError(String),
+}
+
+impl From<&NodeOutcome> for ReconcileResult {
+  fn from(outcome: &NodeOutcome) -> Self {
+    match (outcome.success, outcome.finished_at, outcome.started_at) {
+      (Some(success), Some(finished_at_ms), started_at_ms) => Self::Completed {
+        success,
+        started_at_ms,
+        finished_at_ms,
+      },
+      (_, _, Some(started_at_ms)) => Self::InProgress { started_at_ms },
+      _ => Self::StillRunning,
+    }
+  }
+}
+
+const RECONCILE_CONCURRENCY: usize = 8;
 
 pub struct SourceManager {
   s3: Client,
@@ -333,6 +364,26 @@ impl SourceManager {
     Ok(())
   }
 
+  pub async fn read_outcomes_for_running_nodes(
+    &self,
+    run_id: &str,
+    nodes: &[String],
+  ) -> HashMap<String, ReconcileResult> {
+    let results = stream::iter(nodes.iter().cloned())
+      .map(|node_name| async move {
+        let result = match self.get_node_status(run_id, &node_name).await {
+          Ok(outcome) => ReconcileResult::from(&outcome),
+          Err(SourceError::NotFound(_)) => ReconcileResult::StillRunning,
+          Err(e) => ReconcileResult::TransientReadError(e.to_string()),
+        };
+        (node_name, result)
+      })
+      .buffer_unordered(RECONCILE_CONCURRENCY)
+      .collect::<Vec<_>>()
+      .await;
+    results.into_iter().collect()
+  }
+
   pub async fn get_node_status(
     &self,
     run_id: &str,
@@ -494,5 +545,52 @@ mod tests {
       status_key("run-id", "lint-and-test"),
       "runs/run-id/nodes/lint-and-test/status.json"
     );
+  }
+
+  #[test]
+  fn reconcile_result_from_outcome_completed_when_success_and_finished_present() {
+    let outcome = NodeOutcome {
+      success: Some(true),
+      started_at: Some(100),
+      finished_at: Some(200),
+    };
+    match ReconcileResult::from(&outcome) {
+      ReconcileResult::Completed {
+        success,
+        started_at_ms,
+        finished_at_ms,
+      } => {
+        assert!(success);
+        assert_eq!(started_at_ms, Some(100));
+        assert_eq!(finished_at_ms, 200);
+      }
+      other => panic!("expected Completed, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn reconcile_result_from_outcome_in_progress_when_started_only() {
+    let outcome = NodeOutcome {
+      success: None,
+      started_at: Some(100),
+      finished_at: None,
+    };
+    match ReconcileResult::from(&outcome) {
+      ReconcileResult::InProgress { started_at_ms } => assert_eq!(started_at_ms, 100),
+      other => panic!("expected InProgress, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn reconcile_result_from_outcome_still_running_when_empty() {
+    let outcome = NodeOutcome {
+      success: None,
+      started_at: None,
+      finished_at: None,
+    };
+    assert!(matches!(
+      ReconcileResult::from(&outcome),
+      ReconcileResult::StillRunning
+    ));
   }
 }

@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::{
   pod_watcher::{PodSignal, WatcherCommand},
-  source_manager::{NodeOutcome, SourceError},
+  source_manager::{NodeOutcome, ReconcileResult, SourceError},
 };
 
 #[derive(Debug, Error)]
@@ -63,6 +63,23 @@ pub trait Dispatcher: Send + Sync {
     Ok(None)
   }
 
+  async fn read_outcomes_for_running_nodes(
+    &self,
+    run_id: &str,
+    nodes: &[String],
+  ) -> std::collections::HashMap<String, ReconcileResult> {
+    let mut out = std::collections::HashMap::new();
+    for node_name in nodes {
+      let result = match self.get_node_outcome(run_id, node_name).await {
+        Ok(Some(outcome)) => ReconcileResult::from(&outcome),
+        Ok(None) => ReconcileResult::StillRunning,
+        Err(e) => ReconcileResult::TransientReadError(e.to_string()),
+      };
+      out.insert(node_name.clone(), result);
+    }
+    out
+  }
+
   async fn get_node_log(
     &self,
     _run_id: &str,
@@ -71,11 +88,16 @@ pub trait Dispatcher: Send + Sync {
     Ok(None)
   }
 
+  async fn node_pod_exists(&self, _run_id: &str, _node_name: &str) -> Result<bool, DispatchError> {
+    Ok(true)
+  }
+
   async fn start_pod_watcher(
     &self,
     _run_id: &str,
     _signal_tx: mpsc::Sender<PodSignal>,
     _cmd_rx: mpsc::Receiver<WatcherCommand>,
+    _seed_running: std::collections::HashSet<String>,
   ) -> Option<JoinHandle<()>> {
     None
   }

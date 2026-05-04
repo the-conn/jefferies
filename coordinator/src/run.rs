@@ -55,7 +55,11 @@ impl PipelineRun {
   }
 
   pub fn mark_success(&mut self, node: &str) -> bool {
-    if self.statuses.get(node) == Some(&NodeStatus::Running) {
+    let current = self.statuses.get(node);
+    if matches!(
+      current,
+      Some(NodeStatus::Running) | Some(NodeStatus::Pending)
+    ) {
       self.statuses.insert(node.to_string(), NodeStatus::Success);
       true
     } else {
@@ -64,7 +68,11 @@ impl PipelineRun {
   }
 
   pub fn mark_failed(&mut self, node: &str) -> bool {
-    if self.statuses.get(node) == Some(&NodeStatus::Running) {
+    let current = self.statuses.get(node);
+    if matches!(
+      current,
+      Some(NodeStatus::Running) | Some(NodeStatus::Pending)
+    ) {
       self.statuses.insert(node.to_string(), NodeStatus::Failed);
       true
     } else {
@@ -200,6 +208,32 @@ mod tests {
     let mut run = make_run(&[("build", &[])]);
     run.mark_running("build");
     assert!(!run.is_complete());
+  }
+
+  #[test]
+  fn mark_success_accepts_pending_for_rehydrate_with_lost_persist() {
+    // Coordinator dispatched but died before persist_state; Redis state is Pending
+    // even though Tube actually ran. The rehydrate fold reads S3, finds completion,
+    // and folds straight from Pending -> Success (no Running transition needed).
+    let mut run = make_run(&[("build", &[])]);
+    assert!(run.mark_success("build"));
+    assert_eq!(run.statuses().get("build"), Some(&NodeStatus::Success));
+  }
+
+  #[test]
+  fn mark_failed_accepts_pending_for_rehydrate_with_lost_persist() {
+    let mut run = make_run(&[("build", &[])]);
+    assert!(run.mark_failed("build"));
+    assert_eq!(run.statuses().get("build"), Some(&NodeStatus::Failed));
+  }
+
+  #[test]
+  fn mark_success_rejects_already_terminal() {
+    let mut run = make_run(&[("build", &[])]);
+    run.mark_running("build");
+    run.mark_success("build");
+    assert!(!run.mark_success("build"));
+    assert!(!run.mark_failed("build"));
   }
 
   #[test]

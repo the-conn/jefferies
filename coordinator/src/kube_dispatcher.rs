@@ -6,7 +6,7 @@ use k8s_openapi::{
   api::{
     batch::v1::{Job, JobSpec},
     core::v1::{
-      ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, PodSpec,
+      ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec,
       PodTemplateSpec, ResourceRequirements, SecurityContext, Volume, VolumeMount,
     },
   },
@@ -528,6 +528,24 @@ impl Dispatcher for KubeDispatcher {
     Ok(())
   }
 
+  async fn node_pod_exists(&self, run_id: &str, node_name: &str) -> Result<bool, DispatchError> {
+    let api: kube::Api<Pod> = kube::Api::namespaced(self.client.clone(), &self.namespace);
+    let lp = ListParams::default().labels(&format!("the-conn.com/run-id={run_id}"));
+    let pods = api
+      .list(&lp)
+      .await
+      .map_err(|e| DispatchError::Kube(e.to_string()))?;
+    let exists = pods.items.iter().any(|p| {
+      p.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(NODE_NAME_ANNOTATION))
+        .map(|s| s == node_name)
+        .unwrap_or(false)
+    });
+    Ok(exists)
+  }
+
   async fn get_node_outcome(
     &self,
     run_id: &str,
@@ -538,6 +556,17 @@ impl Dispatcher for KubeDispatcher {
       Err(SourceError::NotFound(_)) => Ok(None),
       Err(e) => Err(DispatchError::Source(e)),
     }
+  }
+
+  async fn read_outcomes_for_running_nodes(
+    &self,
+    run_id: &str,
+    nodes: &[String],
+  ) -> std::collections::HashMap<String, crate::source_manager::ReconcileResult> {
+    self
+      .source_manager
+      .read_outcomes_for_running_nodes(run_id, nodes)
+      .await
   }
 
   async fn get_node_log(
@@ -557,6 +586,7 @@ impl Dispatcher for KubeDispatcher {
     run_id: &str,
     signal_tx: mpsc::Sender<PodSignal>,
     cmd_rx: mpsc::Receiver<WatcherCommand>,
+    seed_running: std::collections::HashSet<String>,
   ) -> Option<JoinHandle<()>> {
     let watcher = PodWatcher::new(
       self.client.clone(),
@@ -564,6 +594,7 @@ impl Dispatcher for KubeDispatcher {
       run_id.to_string(),
       signal_tx,
       cmd_rx,
+      seed_running,
     );
     Some(tokio::spawn(watcher.run()))
   }
