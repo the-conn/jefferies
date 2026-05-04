@@ -103,26 +103,34 @@ JEFFERIES__DEX__POST_LOGIN_REDIRECT=/
 
 ### **Tenancy Configuration**
 
-A single backend deployment can serve multiple GitHub Apps (one per tenant/org). Per-tenant credentials live in a YAML file mounted into the pod via the Vault Agent Injector — the same pattern used for pipeline secrets. The default mount path is `/etc/jefferies/tenancy/tenants.yaml`; override with `JEFFERIES__TENANCY__PATH`.
+A single backend deployment can serve multiple GitHub Apps and multiple tenants. GitHub App credentials are declared once at the top of the YAML and referenced by id from each tenant; this lets several tenants share one operator-owned App without duplicating credentials. The file is mounted into the pod via the Vault Agent Injector — the same pattern used for pipeline secrets. The default mount path is `/etc/jefferies/tenancy/tenants.yaml`; override with `JEFFERIES__TENANCY__PATH`.
 
 **File schema:**
 
 ```yaml
-tenants:
-  - slug: the-conn          # required; lowercase a-z, 0-9, '-'; max 63 chars; starts alnum
-    display_name: "..."     # optional; surfaced to operators / UI
-    provider: github        # discriminator (only `github` today)
+github_apps:
+  - id: global              # referenced by tenants below; lowercase a-z, 0-9, '-'; unique
     app_id: "12345"         # GitHub App ID
     webhook_secret: "..."   # GitHub App webhook secret
     private_key: |
       -----BEGIN RSA PRIVATE KEY-----
       ...
       -----END RSA PRIVATE KEY-----
+
+tenants:
+  - slug: the-conn               # required; lowercase a-z, 0-9, '-'; max 63 chars; starts alnum
+    display_name: "..."          # optional; surfaced to operators / UI
+    connector_ids: [github-global] # required; Dex connector ids whose logins this tenant trusts
+    provider: github             # discriminator (only `github` today)
+    org_name: the-conn           # GitHub organization login (need not equal slug)
+    github_app: global           # references github_apps[].id above
 ```
 
-Each tenant's GitHub App points its webhook URL at `https://<backend>/webhooks/github`. The backend resolves the tenant by reading the owner login out of the event payload (`repository.owner.login`, `organization.login`, or `installation.account.login` for installation events) and matching it against `tenant.slug`, so the slug must equal the GitHub organization login. HMAC is then verified using that tenant's `webhook_secret`. Multiple tenants may share a single GitHub App — they will share the same `app_id`, `private_key`, and `webhook_secret` values across their `tenants.yaml` entries.
+Each GitHub App points its webhook URL at `https://<backend>/webhooks/github`. The backend identifies the source App by HMAC-trial against every configured `github_apps[].webhook_secret` — the App whose secret verifies the signature is the source — then resolves the tenant by `(github_app, repository.owner.login)`. A webhook whose signature does not verify under any configured App is rejected with 401; a verified webhook for an org that is not registered as a tenant under that App is dropped with 200.
 
-Only **organization** owners are allowed. A webhook whose `repository.owner.type` (or `installation.account.type`) is `User` is dropped before tenant lookup, even if the login matches a slug. Personal forks of a tenant repo, repos owned by a user account whose login was inadvertently added to `tenants.yaml`, and Apps installed on personal accounts are all rejected by this guard.
+Only **organization** owners are allowed. A webhook whose `repository.owner.type` (or `installation.account.type`) is `User` is dropped after signature verification, even if the login is otherwise registered. Personal forks of a tenant repo, repos owned by a user account whose login was inadvertently added to `tenants.yaml`, and Apps installed on personal accounts are all rejected by this guard.
+
+`connector_ids` binds a tenant to the Dex connectors that are trusted to assert membership in that tenant's `org_name`. A user authenticated through a Dex connector not listed for a tenant is silently filtered out of that tenant's authorized set, even if their GitHub `groups` claim contains the org login — this prevents cross-namespace org collisions (e.g. github.com `acme` vs a GHES `acme`) from granting accidental access.
 
 **Vault mount (deployment annotations):**
 
@@ -151,10 +159,10 @@ The Vault role (`jefferies-backend` above) must be bound in Vault's Kubernetes a
 Operator/UI authentication is delegated to **Dex**, deployed separately and registered as the OIDC provider for Jefferies. The backend is a standard OIDC client.
 
 **Flow:**
-1. The browser hits `GET /api/auth/login` (optionally with `?return_to=/some/path` — relative paths only). The backend generates state + PKCE + nonce, stores them in a server-side session record, and 302-redirects to Dex's authorize URL with scopes `openid profile email groups`.
+1. The browser hits `GET /api/auth/login` (optionally with `?return_to=/some/path` — relative paths only). The backend generates state + PKCE + nonce, stores them in a server-side session record, and 302-redirects to Dex's authorize URL with scopes `openid profile email groups federated:id` (the last is required for Dex to include `federated_claims.connector_id` in the ID token).
 2. Dex authenticates the user against GitHub (using its own GitHub OAuth credentials), receives the user's org memberships from the GitHub API, and 302-redirects back to `GET /api/auth/callback` with `code` and `state`.
-3. The backend verifies state, exchanges the code for tokens (with PKCE), validates the ID token (signature, issuer, audience, nonce, exp), and reads the `groups` claim — a list of GitHub org logins.
-4. The backend intersects `groups` with the registered tenants in `tenants.yaml`. If empty → 403 with `{ "error": "no_authorized_tenants" }`. Otherwise the user gets a session with `authorized_slugs` populated and `active_tenant_context` defaulted to the first match. Browser is 302'd to `return_to` (validated relative path) or `JEFFERIES__DEX__POST_LOGIN_REDIRECT`.
+3. The backend verifies state, exchanges the code for tokens (with PKCE), validates the ID token (signature, issuer, audience, nonce, exp), and reads two claims: `groups` (GitHub org logins, optionally with a `:team` suffix) and `federated_claims.connector_id` (the Dex connector that vouched for this login).
+4. For each org in `groups`, the backend looks up a tenant by `(connector_id, org_name)`. A tenant is authorized only if its `connector_ids` list contains the JWT's `connector_id`; otherwise it is silently filtered out. If no tenant matches → 403 with `{ "error": "no_authorized_tenants" }`. Otherwise the user gets a session with `authorized_slugs` populated and `active_tenant_context` defaulted to the first match. Browser is 302'd to `return_to` (validated relative path) or `JEFFERIES__DEX__POST_LOGIN_REDIRECT`.
 
 **Endpoints:**
 - `GET /api/auth/login` — initiates the OIDC flow.

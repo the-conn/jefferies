@@ -9,7 +9,7 @@ use coordinator::{Dispatcher, SourceManager};
 pub use github::GithubProvider;
 use run_history::RunHistory;
 use state_store::StateStore;
-use tenancy::TenantRegistry;
+use tenancy::{GithubAppRegistry, TenancyRegistry, TenantRegistry};
 
 pub(crate) fn get_header(headers: &HeaderMap, key: &str) -> String {
   headers
@@ -28,6 +28,7 @@ pub struct ProviderState {
   pub source_manager: Arc<SourceManager>,
   pub run_history: Arc<dyn RunHistory>,
   pub tenants: Arc<TenantRegistry>,
+  pub github_apps: Arc<GithubAppRegistry>,
 }
 
 impl ProviderState {
@@ -38,7 +39,7 @@ impl ProviderState {
     dispatcher: Arc<dyn Dispatcher>,
     source_manager: Arc<SourceManager>,
     run_history: Arc<dyn RunHistory>,
-    tenants: Arc<TenantRegistry>,
+    tenancy: TenancyRegistry,
   ) -> Self {
     Self {
       config,
@@ -47,7 +48,8 @@ impl ProviderState {
       dispatcher,
       source_manager,
       run_history,
-      tenants,
+      tenants: tenancy.tenants,
+      github_apps: tenancy.apps,
     }
   }
 }

@@ -249,8 +249,13 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     .await
     .map_err(|e| ServerError::ConnectionFailed(format!("PostgreSQL migration: {e}")))?;
 
-  let tenants = Arc::new(tenancy::TenantRegistry::load_from_env()?);
-  info!(tenant_count = tenants.len(), "Loaded tenancy registry");
+  let tenancy = tenancy::TenancyRegistry::load_from_env()?;
+  info!(
+    tenant_count = tenancy.tenants.len(),
+    app_count = tenancy.apps.len(),
+    "Loaded tenancy registry"
+  );
+  let tenants = tenancy.tenants.clone();
 
   let state = Arc::new(ProviderState::new(
     shared_config.clone(),
@@ -259,7 +264,7 @@ pub async fn serve(config: AppConfig) -> Result<(), ServerError> {
     dispatcher,
     source_manager,
     run_history,
-    tenants.clone(),
+    tenancy,
   ));
 
   verify_connections(&state, true).await?;
@@ -678,10 +683,13 @@ mod tests {
   }
 
   fn make_test_state() -> Arc<ProviderState> {
-    make_test_state_with_tenants(vec![])
+    make_test_state_with_apps_and_tenants(vec![], vec![])
   }
 
-  fn make_test_state_with_tenants(tenants: Vec<tenancy::TenantConfig>) -> Arc<ProviderState> {
+  fn make_test_state_with_apps_and_tenants(
+    apps: Vec<tenancy::GithubAppConfig>,
+    tenants: Vec<tenancy::TenantConfig>,
+  ) -> Arc<ProviderState> {
     let config = Arc::new(AppConfig::load().expect("test config"));
     let state_store = InMemoryStateStore::new();
     let backplane = InMemoryBackplane::new();
@@ -691,10 +699,11 @@ mod tests {
       source_manager.clone(),
     ));
     let run_history = Arc::new(NoOpRunHistory);
-    let tenants = Arc::new(
-      tenancy::TenantRegistry::from_document(tenancy::TenancyDocument { tenants })
-        .expect("test registry"),
-    );
+    let tenancy = tenancy::TenancyRegistry::from_document(tenancy::TenancyDocument {
+      github_apps: apps,
+      tenants,
+    })
+    .expect("test registry");
     Arc::new(ProviderState::new(
       config,
       state_store,
@@ -702,19 +711,40 @@ mod tests {
       dispatcher,
       source_manager,
       run_history,
-      tenants,
+      tenancy,
     ))
   }
 
-  fn sample_github_tenant(slug: &str, webhook_secret: &str) -> tenancy::TenantConfig {
+  fn single_tenant_state(slug: &str, webhook_secret: &str) -> Arc<ProviderState> {
+    make_test_state_with_apps_and_tenants(
+      vec![sample_github_app(slug, webhook_secret)],
+      vec![sample_github_tenant(slug, slug, slug, &["c"])],
+    )
+  }
+
+  fn sample_github_app(id: &str, webhook_secret: &str) -> tenancy::GithubAppConfig {
+    tenancy::GithubAppConfig {
+      id: id.to_string(),
+      app_id: "12345".to_string(),
+      webhook_secret: webhook_secret.to_string(),
+      private_key: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+        .to_string(),
+    }
+  }
+
+  fn sample_github_tenant(
+    slug: &str,
+    org_name: &str,
+    app_ref: &str,
+    connector_ids: &[&str],
+  ) -> tenancy::TenantConfig {
     tenancy::TenantConfig {
       slug: slug.to_string(),
       display_name: None,
-      provider: tenancy::TenantProvider::Github(tenancy::GithubTenantConfig {
-        app_id: "12345".to_string(),
-        webhook_secret: webhook_secret.to_string(),
-        private_key: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
-          .to_string(),
+      connector_ids: connector_ids.iter().map(|s| s.to_string()).collect(),
+      provider: tenancy::TenantProvider::Github(tenancy::GithubTenantBinding {
+        org_name: org_name.to_string(),
+        app_ref: app_ref.to_string(),
       }),
     }
   }
@@ -931,7 +961,7 @@ mod tests {
 
   #[tokio::test]
   async fn webhook_for_unregistered_org_returns_200_and_drops() {
-    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let state = single_tenant_state("the-conn", "shh");
     let app = router_for_tests(state);
     let body = org_repo_body("outsider");
     let response = app
@@ -951,7 +981,7 @@ mod tests {
 
   #[tokio::test]
   async fn webhook_for_user_owner_returns_200_and_drops() {
-    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let state = single_tenant_state("the-conn", "shh");
     let app = router_for_tests(state);
     let body = serde_json::to_vec(&serde_json::json!({
       "repository": {
@@ -977,7 +1007,7 @@ mod tests {
 
   #[tokio::test]
   async fn webhook_for_owner_with_missing_type_returns_200_and_drops() {
-    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let state = single_tenant_state("the-conn", "shh");
     let app = router_for_tests(state);
     let body = serde_json::to_vec(&serde_json::json!({
       "repository": { "owner": { "login": "the-conn" }, "name": "repo" }
@@ -1000,7 +1030,7 @@ mod tests {
 
   #[tokio::test]
   async fn webhook_bad_signature_returns_401() {
-    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let state = single_tenant_state("the-conn", "shh");
     let app = router_for_tests(state);
     let body = org_repo_body("the-conn");
     let response = app
@@ -1019,11 +1049,17 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn webhook_other_tenants_secret_returns_401() {
-    let state = make_test_state_with_tenants(vec![
-      sample_github_tenant("alpha", "alpha-secret"),
-      sample_github_tenant("beta", "beta-secret"),
-    ]);
+  async fn webhook_signed_by_app_for_unrelated_org_drops_with_200() {
+    let state = make_test_state_with_apps_and_tenants(
+      vec![
+        sample_github_app("alpha", "alpha-secret"),
+        sample_github_app("beta", "beta-secret"),
+      ],
+      vec![
+        sample_github_tenant("alpha", "alpha", "alpha", &["c-alpha"]),
+        sample_github_tenant("beta", "beta", "beta", &["c-beta"]),
+      ],
+    );
     let app = router_for_tests(state);
     let body = org_repo_body("beta");
     let signature_with_alpha_secret = hmac_sha256_hex("alpha-secret", &body);
@@ -1039,12 +1075,72 @@ mod tests {
       )
       .await
       .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn webhook_hmac_trial_picks_correct_app() {
+    let state = make_test_state_with_apps_and_tenants(
+      vec![
+        sample_github_app("alpha", "alpha-secret"),
+        sample_github_app("beta", "beta-secret"),
+      ],
+      vec![
+        sample_github_tenant("alpha", "alpha", "alpha", &["c-alpha"]),
+        sample_github_tenant("beta", "beta", "beta", &["c-beta"]),
+      ],
+    );
+    let app = router_for_tests(state);
+    let body = org_repo_body("beta");
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github")
+          .header("X-GitHub-Event", "ping")
+          .header("X-Hub-Signature-256", hmac_sha256_hex("beta-secret", &body))
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+  }
+
+  #[tokio::test]
+  async fn webhook_signed_by_unconfigured_secret_returns_401() {
+    let state = make_test_state_with_apps_and_tenants(
+      vec![sample_github_app("alpha", "alpha-secret")],
+      vec![sample_github_tenant(
+        "alpha",
+        "alpha",
+        "alpha",
+        &["c-alpha"],
+      )],
+    );
+    let app = router_for_tests(state);
+    let body = org_repo_body("alpha");
+    let response = app
+      .oneshot(
+        Request::builder()
+          .method("POST")
+          .uri("/webhooks/github")
+          .header("X-GitHub-Event", "push")
+          .header(
+            "X-Hub-Signature-256",
+            hmac_sha256_hex("rogue-secret", &body),
+          )
+          .body(Body::from(body))
+          .unwrap(),
+      )
+      .await
+      .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
   }
 
   #[tokio::test]
   async fn webhook_unhandled_event_acks_with_200() {
-    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let state = single_tenant_state("the-conn", "shh");
     let app = router_for_tests(state);
     let body = org_repo_body("the-conn");
     let response = app
@@ -1064,7 +1160,7 @@ mod tests {
 
   #[tokio::test]
   async fn webhook_without_owner_acks_with_200() {
-    let state = make_test_state_with_tenants(vec![sample_github_tenant("the-conn", "shh")]);
+    let state = single_tenant_state("the-conn", "shh");
     let app = router_for_tests(state);
     let body = b"{}".to_vec();
     let response = app

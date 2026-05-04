@@ -64,6 +64,7 @@ async fn login(
     .add_scope(Scope::new("profile".to_string()))
     .add_scope(Scope::new("email".to_string()))
     .add_scope(Scope::new("groups".to_string()))
+    .add_scope(Scope::new("federated:id".to_string()))
     .set_pkce_challenge(pkce_challenge)
     .url();
 
@@ -172,11 +173,12 @@ async fn callback(
     .name()
     .and_then(|n| n.get(None).map(|v| v.as_str().to_string()));
 
-  let groups = extract_groups(&id_token.to_string());
-  let authorized_slugs = resolve_authorized_slugs(&groups, &state.tenants);
+  let extras = extract_oidc_extras(&id_token.to_string());
+  let authorized_slugs = resolve_authorized_slugs(&extras, &state.tenants);
   info!(
     user_id,
-    ?groups,
+    groups = ?extras.groups,
+    connector_id = ?extras.connector_id,
     ?authorized_slugs,
     "Resolved OIDC groups to authorized tenant slugs"
   );
@@ -273,34 +275,44 @@ fn org_from_group(group: &str) -> &str {
   group.split_once(':').map(|(org, _)| org).unwrap_or(group)
 }
 
-fn resolve_authorized_slugs(groups: &[String], tenants: &TenantRegistry) -> Vec<String> {
+#[derive(Debug, Default)]
+struct OidcExtras {
+  groups: Vec<String>,
+  connector_id: Option<String>,
+}
+
+fn resolve_authorized_slugs(extras: &OidcExtras, tenants: &TenantRegistry) -> Vec<String> {
+  let Some(connector_id) = extras.connector_id.as_deref() else {
+    return Vec::new();
+  };
   let mut authorized: Vec<String> = Vec::new();
   let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-  for group in groups {
+  for group in &extras.groups {
     let org = org_from_group(group);
-    if tenants.by_slug(org).is_some() && seen.insert(org.to_string()) {
-      authorized.push(org.to_string());
+    if let Some(tenant) = tenants.find_for_connector_and_org(connector_id, org)
+      && seen.insert(tenant.slug.clone())
+    {
+      authorized.push(tenant.slug.clone());
     }
   }
   authorized
 }
 
-fn extract_groups(jwt: &str) -> Vec<String> {
+fn extract_oidc_extras(jwt: &str) -> OidcExtras {
   let mut parts = jwt.split('.');
   let _ = parts.next();
-  let payload_b64 = match parts.next() {
-    Some(p) => p,
-    None => return Vec::new(),
+  let Some(payload_b64) = parts.next() else {
+    return OidcExtras::default();
   };
-  let payload_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
-    Ok(b) => b,
-    Err(_) => return Vec::new(),
+  let Ok(payload_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
+  else {
+    return OidcExtras::default();
   };
-  let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
-    Ok(v) => v,
-    Err(_) => return Vec::new(),
+  let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) else {
+    return OidcExtras::default();
   };
-  payload
+
+  let groups = payload
     .get("groups")
     .and_then(|v| v.as_array())
     .map(|arr| {
@@ -309,36 +321,77 @@ fn extract_groups(jwt: &str) -> Vec<String> {
         .filter_map(|v| v.as_str().map(String::from))
         .collect()
     })
-    .unwrap_or_default()
+    .unwrap_or_default();
+  let connector_id = payload
+    .pointer("/federated_claims/connector_id")
+    .and_then(|v| v.as_str())
+    .map(String::from);
+
+  OidcExtras {
+    groups,
+    connector_id,
+  }
 }
 
 #[cfg(test)]
 mod tests {
   use tenancy::{
-    GithubTenantConfig, TenancyDocument, TenantConfig, TenantProvider, TenantRegistry,
+    GithubAppConfig, GithubTenantBinding, TenancyDocument, TenancyRegistry, TenantConfig,
+    TenantProvider, TenantRegistry,
   };
 
   use super::*;
 
-  fn registry_with(slugs: &[&str]) -> TenantRegistry {
-    let tenants = slugs
+  struct TenantSpec {
+    slug: &'static str,
+    org_name: &'static str,
+    connector_ids: &'static [&'static str],
+    app_ref: &'static str,
+  }
+
+  fn registry_with(specs: &[TenantSpec]) -> Arc<TenantRegistry> {
+    let mut app_ids: Vec<&'static str> = specs.iter().map(|s| s.app_ref).collect();
+    app_ids.sort();
+    app_ids.dedup();
+    let github_apps = app_ids
+      .into_iter()
+      .map(|id| GithubAppConfig {
+        id: id.to_string(),
+        app_id: "1".to_string(),
+        webhook_secret: "shh".to_string(),
+        private_key: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+          .to_string(),
+      })
+      .collect();
+    let tenants = specs
       .iter()
-      .map(|slug| TenantConfig {
-        slug: (*slug).to_string(),
+      .map(|spec| TenantConfig {
+        slug: spec.slug.to_string(),
         display_name: None,
-        provider: TenantProvider::Github(GithubTenantConfig {
-          app_id: "1".to_string(),
-          webhook_secret: "shh".to_string(),
-          private_key: "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
-            .to_string(),
+        connector_ids: spec.connector_ids.iter().map(|s| s.to_string()).collect(),
+        provider: TenantProvider::Github(GithubTenantBinding {
+          org_name: spec.org_name.to_string(),
+          app_ref: spec.app_ref.to_string(),
         }),
       })
       .collect();
-    TenantRegistry::from_document(TenancyDocument { tenants }).expect("valid registry")
+    let registry = TenancyRegistry::from_document(TenancyDocument {
+      github_apps,
+      tenants,
+    })
+    .expect("valid registry");
+    registry.tenants
   }
 
   fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| (*s).to_string()).collect()
+  }
+
+  fn extras(groups: &[&str], connector_id: Option<&str>) -> OidcExtras {
+    OidcExtras {
+      groups: strings(groups),
+      connector_id: connector_id.map(String::from),
+    }
   }
 
   #[test]
@@ -363,35 +416,108 @@ mod tests {
 
   #[test]
   fn resolve_authorized_slugs_matches_team_prefixed_groups() {
-    let tenants = registry_with(&["the-conn"]);
-    let groups = strings(&["the-conn:eng", "the-conn:ops"]);
-    assert_eq!(
-      resolve_authorized_slugs(&groups, &tenants),
-      vec!["the-conn"]
-    );
+    let tenants = registry_with(&[TenantSpec {
+      slug: "the-conn",
+      org_name: "the-conn",
+      connector_ids: &["github-global"],
+      app_ref: "global",
+    }]);
+    let e = extras(&["the-conn:eng", "the-conn:ops"], Some("github-global"));
+    assert_eq!(resolve_authorized_slugs(&e, &tenants), vec!["the-conn"]);
   }
 
   #[test]
   fn resolve_authorized_slugs_dedupes_repeat_orgs() {
-    let tenants = registry_with(&["the-conn"]);
-    let groups = strings(&["the-conn", "the-conn:eng", "the-conn:ops"]);
-    assert_eq!(
-      resolve_authorized_slugs(&groups, &tenants),
-      vec!["the-conn"]
+    let tenants = registry_with(&[TenantSpec {
+      slug: "the-conn",
+      org_name: "the-conn",
+      connector_ids: &["github-global"],
+      app_ref: "global",
+    }]);
+    let e = extras(
+      &["the-conn", "the-conn:eng", "the-conn:ops"],
+      Some("github-global"),
     );
+    assert_eq!(resolve_authorized_slugs(&e, &tenants), vec!["the-conn"]);
   }
 
   #[test]
   fn resolve_authorized_slugs_drops_unregistered_orgs() {
-    let tenants = registry_with(&["alpha"]);
-    let groups = strings(&["beta:eng", "alpha:ops", "gamma"]);
-    assert_eq!(resolve_authorized_slugs(&groups, &tenants), vec!["alpha"]);
+    let tenants = registry_with(&[TenantSpec {
+      slug: "alpha",
+      org_name: "alpha",
+      connector_ids: &["c"],
+      app_ref: "a",
+    }]);
+    let e = extras(&["beta:eng", "alpha:ops", "gamma"], Some("c"));
+    assert_eq!(resolve_authorized_slugs(&e, &tenants), vec!["alpha"]);
   }
 
   #[test]
   fn resolve_authorized_slugs_returns_empty_when_no_match() {
-    let tenants = registry_with(&["alpha"]);
-    let groups = strings(&["beta:eng"]);
-    assert!(resolve_authorized_slugs(&groups, &tenants).is_empty());
+    let tenants = registry_with(&[TenantSpec {
+      slug: "alpha",
+      org_name: "alpha",
+      connector_ids: &["c"],
+      app_ref: "a",
+    }]);
+    let e = extras(&["beta:eng"], Some("c"));
+    assert!(resolve_authorized_slugs(&e, &tenants).is_empty());
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_filters_when_connector_mismatches() {
+    let tenants = registry_with(&[TenantSpec {
+      slug: "acme-corp",
+      org_name: "acme-corp",
+      connector_ids: &["github-acme"],
+      app_ref: "acme",
+    }]);
+    let e = extras(&["acme-corp:eng"], Some("github-global"));
+    assert!(resolve_authorized_slugs(&e, &tenants).is_empty());
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_returns_slug_not_org_name() {
+    let tenants = registry_with(&[TenantSpec {
+      slug: "acme-corp",
+      org_name: "acme",
+      connector_ids: &["github-acme"],
+      app_ref: "acme",
+    }]);
+    let e = extras(&["acme:eng"], Some("github-acme"));
+    assert_eq!(resolve_authorized_slugs(&e, &tenants), vec!["acme-corp"]);
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_returns_empty_without_connector_claim() {
+    let tenants = registry_with(&[TenantSpec {
+      slug: "the-conn",
+      org_name: "the-conn",
+      connector_ids: &["github-global"],
+      app_ref: "global",
+    }]);
+    let e = extras(&["the-conn:eng"], None);
+    assert!(resolve_authorized_slugs(&e, &tenants).is_empty());
+  }
+
+  #[test]
+  fn resolve_authorized_slugs_picks_correct_tenant_across_connectors() {
+    let tenants = registry_with(&[
+      TenantSpec {
+        slug: "the-conn",
+        org_name: "the-conn",
+        connector_ids: &["github-global"],
+        app_ref: "global",
+      },
+      TenantSpec {
+        slug: "acme-corp",
+        org_name: "acme-corp",
+        connector_ids: &["github-acme"],
+        app_ref: "acme",
+      },
+    ]);
+    let e = extras(&["the-conn:eng", "acme-corp:eng"], Some("github-acme"));
+    assert_eq!(resolve_authorized_slugs(&e, &tenants), vec!["acme-corp"]);
   }
 }

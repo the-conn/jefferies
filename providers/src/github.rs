@@ -28,7 +28,7 @@ use pipelines::Pipeline;
 use run_history::RunStatus;
 use serde::{Serialize, de::Error};
 use sha2::Sha256;
-use tenancy::{GithubTenantConfig, TenantConfig, TenantProvider};
+use tenancy::{GithubAppConfig, GithubAppRegistry, TenantConfig, TenantProvider};
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -58,6 +58,8 @@ pub enum GithubError {
   InvalidPrivateKey(#[from] jsonwebtoken::errors::Error),
   #[error("Invalid webhook event payload: {0}")]
   InvalidPayload(#[from] serde_json::Error),
+  #[error("Tenant '{0}' references unknown github_app")]
+  TenantBindingMissing(String),
 }
 
 pub struct GithubProvider;
@@ -74,9 +76,19 @@ impl GithubProvider {
       return handle_installation(&body, &state);
     }
 
+    let signature = get_header(&headers, "X-Hub-Signature-256");
+    let Some(matched_app) = identify_signing_app(&state.github_apps, &body, &signature) else {
+      warn!(
+        event_type,
+        "Unauthorized webhook attempt: signature did not match any configured GitHub App"
+      );
+      return StatusCode::UNAUTHORIZED;
+    };
+
     let Some(owner_info) = extract_owner_info(&body) else {
       info!(
         event_type,
+        app_id = %matched_app.id,
         "Webhook received without an extractable owner login; ignoring"
       );
       return StatusCode::OK;
@@ -87,29 +99,22 @@ impl GithubProvider {
         owner = %owner_info.login,
         kind = ?owner_info.kind,
         event_type,
+        app_id = %matched_app.id,
         "Webhook owner is not a GitHub organization; dropping"
       );
       return StatusCode::OK;
     }
 
     let owner = owner_info.login;
-    let Some(tenant) = state.tenants.by_slug(&owner) else {
+    let Some(tenant) = state.tenants.by_app_and_org(&matched_app.id, &owner) else {
       info!(
         owner,
-        event_type, "Webhook received for org that is not a registered tenant; dropping"
+        app_id = %matched_app.id,
+        event_type,
+        "Webhook received for org that is not a registered tenant under that app; dropping"
       );
       return StatusCode::OK;
     };
-    let TenantProvider::Github(gh) = &tenant.provider;
-
-    let signature = get_header(&headers, "X-Hub-Signature-256");
-    if !signature_matches(&body, &signature, &gh.webhook_secret) {
-      warn!(
-        tenant_slug = %tenant.slug,
-        "Unauthorized webhook attempt: Signature mismatch"
-      );
-      return StatusCode::UNAUTHORIZED;
-    }
 
     let tenant_slug = tenant.slug.clone();
     match event_type.as_str() {
@@ -207,14 +212,20 @@ async fn retry_pipeline_run(
     );
     return Err(RetryError::Backend("tenant unregistered".into()));
   };
-  let TenantProvider::Github(gh) = &tenant.provider;
+  let app = resolve_app_for_tenant(&state, &tenant).ok_or_else(|| {
+    warn!(
+      run_id,
+      tenant_slug, "Retry requested for tenant whose github_app is no longer registered"
+    );
+    RetryError::Backend("tenant binding missing".into())
+  })?;
 
   let pipeline = Pipeline::from_yaml(&original.pipeline_definition).map_err(|e| {
     warn!(run_id, error = %e, "Stored pipeline YAML failed to parse during retry");
     RetryError::Backend(format!("pipeline parse: {e}"))
   })?;
 
-  let install_crab = build_installation_client(&original.owner, &original.repo, gh)
+  let install_crab = build_installation_client(&original.owner, &original.repo, &app)
     .await
     .map_err(|e| {
       warn!(run_id, error = %e, "Failed to build GitHub installation client for retry");
@@ -477,8 +488,9 @@ async fn start_push_pipelines(
   tenant: Arc<TenantConfig>,
   state: Arc<ProviderState>,
 ) -> Result<(), GithubError> {
-  let TenantProvider::Github(gh) = &tenant.provider;
-  let install_crab = build_installation_client(owner, repo, gh).await?;
+  let app = resolve_app_for_tenant(&state, &tenant)
+    .ok_or_else(|| GithubError::TenantBindingMissing(tenant.slug.clone()))?;
+  let install_crab = build_installation_client(owner, repo, &app).await?;
   let (branch, tag) = parse_push_ref(git_ref);
   let match_ref = branch.as_deref().unwrap_or(git_ref);
   let matching = find_matching_pipelines(&install_crab, owner, repo, sha, |pipeline| {
@@ -522,8 +534,9 @@ async fn start_pr_pipelines(
   tenant: Arc<TenantConfig>,
   state: Arc<ProviderState>,
 ) -> Result<(), GithubError> {
-  let TenantProvider::Github(gh) = &tenant.provider;
-  let install_crab = build_installation_client(&event.owner, &event.repo, gh).await?;
+  let app = resolve_app_for_tenant(&state, &tenant)
+    .ok_or_else(|| GithubError::TenantBindingMissing(tenant.slug.clone()))?;
+  let install_crab = build_installation_client(&event.owner, &event.repo, &app).await?;
   let matching = find_matching_pipelines(
     &install_crab,
     &event.owner,
@@ -658,12 +671,12 @@ async fn launch_coordinator_for_pipeline(
 async fn build_installation_client(
   owner: &str,
   repo: &str,
-  github: &GithubTenantConfig,
+  app: &GithubAppConfig,
 ) -> Result<Octocrab, GithubError> {
   let app_crab = Octocrab::builder()
     .app(
-      github.app_id.parse::<u64>()?.into(),
-      EncodingKey::from_rsa_pem(github.private_key.as_bytes())?,
+      app.app_id.parse::<u64>()?.into(),
+      EncodingKey::from_rsa_pem(app.private_key.as_bytes())?,
     )
     .build()?;
 
@@ -934,7 +947,10 @@ fn handle_installation(body: &[u8], state: &Arc<ProviderState>) -> StatusCode {
       .pointer("/installation/account/type")
       .and_then(|v| v.as_str()),
   );
-  let registered = state.tenants.by_slug(account).is_some();
+  let registered = state.tenants.iter().any(|tenant| {
+    let TenantProvider::Github(binding) = &tenant.provider;
+    binding.org_name == account
+  });
 
   info!(
     action,
@@ -944,6 +960,25 @@ fn handle_installation(body: &[u8], state: &Arc<ProviderState>) -> StatusCode {
     "Received GitHub App installation event"
   );
   StatusCode::OK
+}
+
+fn resolve_app_for_tenant(
+  state: &ProviderState,
+  tenant: &TenantConfig,
+) -> Option<Arc<GithubAppConfig>> {
+  let TenantProvider::Github(binding) = &tenant.provider;
+  state.github_apps.by_id(&binding.app_ref)
+}
+
+fn identify_signing_app(
+  apps: &GithubAppRegistry,
+  body: &[u8],
+  signature_header: &str,
+) -> Option<Arc<GithubAppConfig>> {
+  apps
+    .iter()
+    .find(|app| signature_matches(body, signature_header, &app.webhook_secret))
+    .cloned()
 }
 
 fn signature_matches(payload: &[u8], signature_header: &str, secret: &str) -> bool {
